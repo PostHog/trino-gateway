@@ -117,3 +117,12 @@ protocol and routing behavior, not real Trino authorization or Duckgres catalog
 provisioning. Validate the integrated control plane and real Trino separately
 before enabling this feature in a customer environment. Keep runtime reports
 and deployment outcomes outside this public repository.
+
+For an already configured candidate Gateway and real coordinator, the bounded
+`probe_real_principal_routing.py` client performs only read-only SQL. Supply
+`REAL_GATEWAY_URLS` (comma-separated candidate URLs), `REAL_TRINO_PRINCIPAL`,
+`REAL_TRINO_CATALOG` and the optional `TX_CA_FILE` trust bundle. It prompts for
+the password without saving it. The probe follows advertised result URLs
+without rewriting them and checks that they remain on the candidate Gateway.
+It also checks an ignored client group and a read-only transaction followed by
+rollback. Use only an explicitly authorized test warehouse.
