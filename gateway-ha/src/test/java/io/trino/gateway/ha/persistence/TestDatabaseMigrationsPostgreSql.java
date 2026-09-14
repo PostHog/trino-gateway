@@ -63,12 +63,14 @@ final class TestDatabaseMigrationsPostgreSql
         verifyResultSetCount("SELECT query_id FROM transaction_query_capability", 0);
         verifyResultSetCount("SELECT admission_id FROM transaction_admission", 0);
         verifyResultSetCount("SELECT routing_group FROM transaction_route", 0);
+        verifyResultSetCount("SELECT operation_id FROM transaction_rollout", 0);
     }
 
     @Override
     protected void dropAllTables()
     {
         jdbi.useHandle(handle -> {
+            handle.execute("DROP TABLE transaction_rollout");
             handle.execute("DROP TABLE transaction_route");
             handle.execute("DROP TABLE transaction_admission");
             handle.execute("DROP TABLE transaction_query_capability");

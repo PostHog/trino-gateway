@@ -91,7 +91,7 @@ class TestTransactionStore
         admin.useHandle(handle -> handle.execute("CREATE SCHEMA " + schema));
         schemaCreated = true;
         database = Jdbi.create(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema, username, password);
-        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql", "V8__drain_obligation_indexes.sql"}) {
+        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql", "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
                 database.useHandle(handle -> handle.createScript(sql).execute());
@@ -119,9 +119,151 @@ class TestTransactionStore
     @BeforeEach
     void resetLedger()
     {
-        database.useHandle(handle -> handle.execute("TRUNCATE transaction_route, transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend"));
+        database.useHandle(handle -> handle.execute("TRUNCATE transaction_rollout, transaction_route, transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend"));
         first.ensureBackend("blue", "http://blue.example.test", "http://blue.example.test", "group", "blue-node", "blue-process");
         first.ensureBackend("green", "http://green.example.test", "http://green.example.test", "group", "green-node", "green-process");
+    }
+
+    @Test
+    void unfinishedRolloutNeverExpiresAndConcurrentAcquisitionHasOneOwner()
+            throws Exception
+    {
+        var blue = first.getBackend("blue").orElseThrow();
+        var green = first.getBackend("green").orElseThrow();
+        first.setRoute("group", "blue");
+        var plan = new RolloutStore.Plan("a".repeat(64), 1, "blue", blue.incarnation(), "green", green.incarnation());
+        var operations = new RolloutStore(database);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var barrier = new CountDownLatch(1);
+            var attempts = List.of("one", "two").stream().map(id -> executor.submit(() -> {
+                barrier.await();
+                try {
+                    operations.acquire("group", id, plan);
+                    return true;
+                }
+                catch (StoreException e) {
+                    assertThat(e.code()).isEqualTo(CONFLICT);
+                    return false;
+                }
+            })).toList();
+            barrier.countDown();
+            int winners = 0;
+            for (var attempt : attempts) {
+                winners += attempt.get(10, TimeUnit.SECONDS) ? 1 : 0;
+            }
+            assertThat(winners).isEqualTo(1);
+        }
+        database.useHandle(handle -> handle.execute("UPDATE transaction_rollout SET created_at = clock_timestamp() - INTERVAL '100 days'"));
+        expect(CONFLICT, () -> operations.acquire("group", "later", plan));
+        assertThat(operations.current("group").orElseThrow().phase()).isEqualTo("CLAIMED");
+    }
+
+    @Test
+    void durableRolloutOwnershipFencesManualAndStaleOperations()
+    {
+        var blue = first.getBackend("blue").orElseThrow();
+        var green = first.getBackend("green").orElseThrow();
+        first.setRoute("group", "blue");
+        var operations = new RolloutStore(database);
+        var plan = new RolloutStore.Plan("a".repeat(64), 1, "blue", blue.incarnation(), "green", green.incarnation());
+        var claimed = operations.acquire("group", "promotion-one", plan);
+        assertThat(operations.acquire("group", "promotion-one", plan)).isEqualTo(claimed);
+        expect(CONFLICT, () -> operations.acquire("group", "promotion-two", plan));
+        expect(CONFLICT, () -> first.beginDrain("blue"));
+        expect(CONFLICT, () -> first.setRoute("group", "green"));
+        expect(CONFLICT, () -> first.clearRoute("group"));
+        expect(CONFLICT, () -> first.resume("green", first.drainStatus("green").generation()));
+        var guarded = second.withOperation(new RolloutStore.Guard("promotion-one", 0));
+        var drained = guarded.beginDrain("green", green.incarnation(), 0L);
+        assertThat(drained.state()).isEqualTo("DRAINING");
+        var publication = operations.claimPublication("group", "warm", new RolloutStore.Guard("promotion-one", 0), plan.planHash());
+        assertThat(publication.version()).isEqualTo(1);
+        expect(CONFLICT, () -> operations.claimPublication("group", "warm", new RolloutStore.Guard("promotion-one", 1), plan.planHash()));
+        String evidence = "{\"warmPublication\":{\"branch\":\"rollout-one-warm\",\"baseSha\":\"" + "b".repeat(40) + "\",\"headSha\":\"" + "c".repeat(40) + "\",\"pullRequest\":1}}";
+        var warmed = operations.checkpoint("group", "promotion-one", 1, "WARMED", evidence);
+        assertThat(warmed.version()).isEqualTo(2);
+        expect(STALE_GENERATION, () -> guarded.resume("green", drained.generation()));
+        expect(STALE_GENERATION, () -> operations.checkpoint("group", "promotion-one", 0, "WARMED", "{}"));
+        expect(CONFLICT, () -> operations.checkpoint("group", "promotion-one", 2, "COMPLETE", "{}"));
+        expect(CONFLICT, () -> operations.checkpoint("group", "promotion-one", 2, "WARMED", "{\"warmPublication\":{}}"));
+        assertThat(first.admitNew("blue", "owner", "group").backend()).isEqualTo(blue);
+        assertThat(new RolloutStore(database).current("group").orElseThrow()).isEqualTo(warmed);
+    }
+
+    @Test
+    void routeCompareAndSetRejectsLostResponseRetriesAndAba()
+    {
+        var blue = first.getBackend("blue").orElseThrow();
+        var green = first.getBackend("green").orElseThrow();
+        var absent = first.routeStatus("group");
+        assertThat(absent.generation()).isZero();
+        assertThat(absent.backendName()).isNull();
+        var initial = first.compareAndSetRoute("group", 0, null, "blue", blue.incarnation());
+        assertThat(second.routeStatus("group")).isEqualTo(initial);
+        expect(STALE_GENERATION, () -> second.compareAndSetRoute("group", 0, null, "green", green.incarnation()));
+        var moved = second.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation());
+        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation()));
+        var returned = first.compareAndSetRoute("group", moved.generation(), "green", "blue", blue.incarnation());
+        assertThat(returned.generation()).isGreaterThan(initial.generation());
+        expect(STALE_GENERATION, () -> second.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation()));
+        assertThat(first.routeStatus("group")).isEqualTo(returned);
+    }
+
+    @Test
+    void routeCompareAndSetRequiresExactDestinationAndActiveState()
+    {
+        var green = first.getBackend("green").orElseThrow();
+        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", 0, null, "green", UUID.randomUUID()));
+        assertThat(first.routeStatus("group").generation()).isZero();
+        first.beginDrain("green");
+        expect(NOT_ACTIVE, () -> first.compareAndSetRoute("group", 0, null, "green", green.incarnation()));
+        first.resume("green", first.drainStatus("green").generation());
+        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", 0, "blue", "green", green.incarnation()));
+        first.ensureBackend("other", "http://other.example.test", null, "other-group", "other-node", "other-process");
+        expect(CONFLICT, () -> first.compareAndSetRoute("group", 0, null, "other", first.getBackend("other").orElseThrow().incarnation()));
+    }
+
+    @Test
+    void concurrentRouteCompareAndSetHasExactlyOneWinner()
+            throws Exception
+    {
+        var blue = first.getBackend("blue").orElseThrow();
+        var green = first.getBackend("green").orElseThrow();
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var start = new CountDownLatch(1);
+            var attempts = List.of(blue, green).stream().map(backend -> executor.submit(() -> {
+                start.await();
+                try {
+                    second.compareAndSetRoute("group", 0, null, backend.name(), backend.incarnation());
+                    return true;
+                }
+                catch (StoreException e) {
+                    assertThat(e.code()).isEqualTo(STALE_GENERATION);
+                    return false;
+                }
+            })).toList();
+            start.countDown();
+            int winners = 0;
+            for (var attempt : attempts) {
+                winners += attempt.get(10, TimeUnit.SECONDS) ? 1 : 0;
+            }
+            assertThat(winners).isEqualTo(1);
+            assertThat(first.routeStatus("group").generation()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void preconditionedDrainCannotAffectResumedOrReplacedGeneration()
+    {
+        var initial = first.drainStatus("blue");
+        assertThat(initial.nodeId()).isEqualTo("blue-node");
+        assertThat(initial.coordinatorId()).isEqualTo("blue-process");
+        var drained = first.beginDrain("blue", initial.incarnation(), initial.generation());
+        expect(STALE_GENERATION, () -> second.beginDrain("blue", initial.incarnation(), initial.generation()));
+        var resumed = second.resume("blue", drained.generation());
+        expect(STALE_GENERATION, () -> first.beginDrain("blue", initial.incarnation(), drained.generation()));
+        expect(STALE_GENERATION, () -> first.beginDrain("blue", UUID.randomUUID(), resumed.generation()));
+        assertThat(first.drainStatus("blue").state()).isEqualTo("ACTIVE");
     }
 
     @Test
@@ -840,7 +982,7 @@ class TestTransactionStore
                 while (System.nanoTime() < deadline) {
                     waiters = database.withHandle(handle -> handle.createQuery(
                                     "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' " +
-                                            "AND query LIKE 'SELECT * FROM transaction_backend WHERE current_name%'")
+                                            "AND (query LIKE '%transaction_backend%' OR query LIKE '%transaction_route%')")
                             .mapTo(Long.class).one());
                     if (waiters == 2) {
                         break;

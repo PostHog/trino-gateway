@@ -84,6 +84,7 @@ public class TransactionAwarenessService
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private final TransactionAwarenessConfiguration config;
     private final TransactionStore store;
+    private final RolloutStore rollouts;
     private final TransactionIdentity identity;
     private final GatewayBackendManager backendManager;
     private final HttpClient httpClient;
@@ -98,6 +99,7 @@ public class TransactionAwarenessService
         config = configuration.getTransactionAwareness();
         config.validate(configuration.getDataStore());
         store = new TransactionStore(jdbi);
+        rollouts = new RolloutStore(jdbi);
         identity = config.isEnabled() ? new TransactionIdentity(config.getIdentityKey()) : null;
         this.backendManager = backendManager;
         this.httpClient = httpClient;
@@ -448,8 +450,11 @@ public class TransactionAwarenessService
             throw error(404, "Transaction awareness is disabled");
         }
         String authorization = TransactionIdentity.singleHeader(request, "Authorization").orElse("");
-        if (!MessageDigest.isEqual(authorization.getBytes(UTF_8), ("Bearer " + config.getAdminToken()).getBytes(UTF_8))) {
-            throw error(403, "Transaction administration requires its configured bearer token");
+        Optional<String> separateToken = TransactionIdentity.singleHeader(request, "X-Gateway-Transaction-Admin-Token");
+        String supplied = separateToken.orElse(authorization);
+        String expected = separateToken.isPresent() ? config.getAdminToken() : "Bearer " + config.getAdminToken();
+        if (!MessageDigest.isEqual(supplied.getBytes(UTF_8), expected.getBytes(UTF_8))) {
+            throw error(403, "Transaction administration requires its configured token");
         }
     }
 
@@ -464,54 +469,127 @@ public class TransactionAwarenessService
 
     public Map<String, Object> drain(String name, boolean begin)
     {
+        return drain(name, begin, null);
+    }
+
+    public Map<String, Object> drain(String name, boolean begin, RolloutStore.Guard operation)
+    {
         return guarded(() -> {
             if (begin && store.getBackend(name).isEmpty()) {
                 ensureBackend(name);
             }
-            return status(begin ? store.beginDrain(name) : store.drainStatus(name));
+            return status(begin ? administration(operation).beginDrain(name) : store.drainStatus(name));
         });
     }
 
     public Map<String, Object> seal(String name, long generation)
     {
+        return seal(name, generation, null);
+    }
+
+    public Map<String, Object> seal(String name, long generation, RolloutStore.Guard operation)
+    {
         return guarded(() -> {
             verifyProcess(store.getBackend(name).orElseThrow(() -> error(404, "Unknown backend")));
-            return status(store.seal(name, generation));
+            return status(administration(operation).seal(name, generation));
+        });
+    }
+
+    public Map<String, Object> drain(String name, UUID expectedIncarnation, long expectedGeneration, RolloutStore.Guard operation)
+    {
+        return guarded(() -> status(administration(operation).beginDrain(name, expectedIncarnation, expectedGeneration)));
+    }
+
+    public TransactionStore.RouteStatus routeStatus(String routingGroup)
+    {
+        return guarded(() -> store.routeStatus(routingGroup));
+    }
+
+    public TransactionStore.RouteStatus compareAndSetRoute(String routingGroup, long expectedGeneration, String expectedBackendName, String backendName, UUID backendIncarnation, RolloutStore.Guard operation)
+    {
+        return guarded(() -> {
+            ensureBackend(backendName);
+            return administration(operation).compareAndSetRoute(routingGroup, expectedGeneration, expectedBackendName, backendName, backendIncarnation);
         });
     }
 
     public Map<String, Object> resume(String name, long generation)
     {
+        return resume(name, generation, null);
+    }
+
+    public Map<String, Object> resume(String name, long generation, RolloutStore.Guard operation)
+    {
         return guarded(() -> {
             ensureBackend(name);
-            return status(store.resume(name, generation));
+            return status(administration(operation).resume(name, generation));
         });
     }
 
     public Map<String, Object> cutover(String routingGroup, String backendName)
+    {
+        return cutover(routingGroup, backendName, null);
+    }
+
+    public Map<String, Object> cutover(String routingGroup, String backendName, RolloutStore.Guard operation)
     {
         return guarded(() -> {
             BackendRef backend = ensureBackend(backendName);
             if (!backend.routingGroup().equals(routingGroup)) {
                 throw error(409, "Destination does not belong to the routing group");
             }
-            return Map.of("generation", store.setRoute(routingGroup, backendName), "backendName", backendName, "routingGroup", routingGroup);
+            return Map.of("generation", administration(operation).setRoute(routingGroup, backendName), "backendName", backendName, "routingGroup", routingGroup);
         });
     }
 
     public Map<String, Object> reincarnate(String name, UUID incarnation, long generation)
     {
+        return reincarnate(name, incarnation, generation, null);
+    }
+
+    public Map<String, Object> reincarnate(String name, UUID incarnation, long generation, RolloutStore.Guard operation)
+    {
         return guarded(() -> {
             ProxyBackendConfiguration backend = backendManager.getBackendByName(name).orElseThrow(() -> error(404, "Unknown backend"));
             JsonNode info = processInfo(backend.getProxyTo());
             BackendRef proposed = new BackendRef(name, UUID.randomUUID(), backend.getProxyTo(), backend.getExternalUrl() == null ? backend.getProxyTo() : backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
-            return status(store.reincarnate(name, incarnation, generation, proposed));
+            return status(administration(operation).reincarnate(name, incarnation, generation, proposed));
         });
     }
 
     public Map<String, Object> clearRoute(String routingGroup)
     {
-        return guarded(() -> Map.of("generation", store.clearRoute(routingGroup)));
+        return clearRoute(routingGroup, null);
+    }
+
+    public Map<String, Object> clearRoute(String routingGroup, RolloutStore.Guard operation)
+    {
+        return guarded(() -> Map.of("generation", administration(operation).clearRoute(routingGroup)));
+    }
+
+    private TransactionStore administration(RolloutStore.Guard operation)
+    {
+        return operation == null ? store : store.withOperation(operation);
+    }
+
+    public RolloutStore.Operation acquireRollout(String group, String operationId, RolloutStore.Plan plan)
+    {
+        return guarded(() -> rollouts.acquire(group, operationId, plan));
+    }
+
+    public RolloutStore.Operation currentRollout(String group)
+    {
+        return guarded(() -> rollouts.current(group).orElseThrow(() -> error(404, "Unknown rollout")));
+    }
+
+    public RolloutStore.Operation checkpointRollout(String group, String operationId, long version, String phase, String evidence)
+    {
+        return guarded(() -> rollouts.checkpoint(group, operationId, version, phase, evidence));
+    }
+
+    public RolloutStore.Operation claimPublication(String group, String kind, String operationId, long version, String planHash)
+    {
+        return guarded(() -> rollouts.claimPublication(group, kind, new RolloutStore.Guard(operationId, version), planHash));
     }
 
     private BackendRef ensureBackend(String name)
@@ -567,6 +645,8 @@ public class TransactionAwarenessService
                 Map.entry("incarnation", status.incarnation()),
                 Map.entry("state", status.state()),
                 Map.entry("generation", status.generation()),
+                Map.entry("nodeId", status.nodeId() == null ? "" : status.nodeId()),
+                Map.entry("coordinatorId", status.coordinatorId() == null ? "" : status.coordinatorId()),
                 Map.entry("pendingRequests", status.pendingRequests()),
                 Map.entry("openTransactions", status.openTransactions()),
                 Map.entry("activeQueries", status.activeQueries()),
