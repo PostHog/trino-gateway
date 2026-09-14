@@ -14,4 +14,7 @@ backend draining. See the [design](docs/design/transaction-awareness.md),
 [repeatable test suite](testing/transaction-awareness/README.md). This work does
 not constitute a production deployment or transaction replication.
 
+The [fenced rollout administration API](docs/rollout-administration.md) provides
+durable operation ownership for a separately verified deployment workflow.
+
 <img src="./docs/assets/logos/trino-gateway-v.png"/>

@@ -15,7 +15,9 @@ package io.trino.gateway.ha.security;
 
 import io.trino.gateway.ha.domain.Result;
 import jakarta.ws.rs.ForbiddenException;
+import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import jakarta.ws.rs.ext.ExceptionMapper;
 import jakarta.ws.rs.ext.Provider;
 import org.glassfish.jersey.server.internal.LocalizationMessages;
@@ -24,10 +26,16 @@ import org.glassfish.jersey.server.internal.LocalizationMessages;
 public class AuthorizedExceptionMapper
         implements ExceptionMapper<ForbiddenException>
 {
+    @Context
+    private UriInfo uriInfo;
+
     @Override
     public Response toResponse(ForbiddenException exception)
     {
         if (exception.getMessage().equals(LocalizationMessages.USER_NOT_AUTHORIZED())) {
+            if (uriInfo != null && (uriInfo.getPath().equals("gateway/transactions") || uriInfo.getPath().startsWith("gateway/transactions/"))) {
+                return Response.status(Response.Status.FORBIDDEN).entity(Result.fail(Response.Status.FORBIDDEN)).build();
+            }
             return Response.ok(Result.fail(Response.Status.UNAUTHORIZED)).build();
         }
         return exception.getResponse();
