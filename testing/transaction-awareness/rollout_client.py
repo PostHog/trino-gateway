@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import time
 import uuid
@@ -93,6 +94,19 @@ def recovery_report(error, directory=None):
         except (OSError, ValueError):
             report["recovery_save_failed"] = True
     return report
+
+
+def request_failure(error):
+    if not isinstance(error, socket.gaierror):
+        return "request_error:" + type(error).__name__
+    number = error.errno
+    if type(number) is not int or not -(2 ** 31) <= number < 2 ** 31:
+        number = None
+    allowed = ("EAI_AGAIN", "EAI_BADFLAGS", "EAI_FAIL", "EAI_FAMILY", "EAI_MEMORY", "EAI_NONAME",
+               "EAI_SERVICE", "EAI_SOCKTYPE", "EAI_SYSTEM", "EAI_ADDRFAMILY", "EAI_NODATA",
+               "EAI_BADHINTS", "EAI_OVERFLOW", "EAI_PROTOCOL")
+    code = next((name for name in allowed if number is not None and getattr(socket, name, None) == number), "UNKNOWN")
+    return "request_error:gaierror:" + json.dumps({"errno": number, "code": code}, sort_keys=True)
 
 
 def http_failure(result, method, page):
@@ -191,7 +205,7 @@ class RolloutClient:
                 result = request(url, method, body, headers=self.headers + [
                     ("X-Trino-Transaction-Id", self.transaction)], timeout=min(30, remaining))
             except Exception as error:
-                raise RolloutFailure("request_error:" + type(error).__name__, self.pending_continuation) from None
+                raise RolloutFailure(request_failure(error), self.pending_continuation) from None
             if result.status != 200:
                 raise RolloutFailure(http_failure(result, method, page), self.pending_continuation)
             payload = result.json()

@@ -141,6 +141,12 @@ opaque recovery identifier and bounded HTTP classifications, not response bodies
 credentials, SQL, or continuation capabilities. An unsuccessful initial POST has
 no recovery handle unless the client actually received and validated a next URI.
 
+DNS-resolution failures retain the `request_error:gaierror` prefix and include a
+bounded numeric errno plus an allowlisted `EAI_*` name. Unknown codes use `UNKNOWN`;
+malformed or oversized errno values use `null`. Exception messages and hostnames
+are never included. The diagnostic does not retry the request or establish the
+underlying cause of a resolver failure.
+
 Handles disappear when the process exits unless the operator explicitly passes
 `--recovery-directory` to either rollout script. Create an owned mode-0700 directory
 outside this repository first. The scripts create unique mode-0600 JSON files

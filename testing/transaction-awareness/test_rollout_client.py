@@ -1,8 +1,10 @@
 """Protocol and reporting checks for a credential-safe rollout client."""
 
 import unittest
+import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 from unittest.mock import patch
@@ -21,6 +23,47 @@ def response(body, headers=(), status=200):
 class RolloutClientTest(unittest.TestCase):
     def client(self):
         return RolloutClient("https://gateway.example", "reader", "catalog", "password", "group")
+
+    @patch("rollout_client.request")
+    def test_dns_failure_reports_numeric_code_without_retry_or_message(self, request):
+        request.side_effect = socket.gaierror(socket.EAI_AGAIN, "private-host password https://private.example/token")
+        with self.assertRaises(RuntimeError) as failed:
+            self.client().query("SELECT 1")
+        self.assertTrue(str(failed.exception).startswith("request_error:gaierror:{"))
+        diagnostic = str(failed.exception).split(":", 2)[2]
+        self.assertEqual(json.loads(diagnostic), {"errno": socket.EAI_AGAIN, "code": "EAI_AGAIN"})
+        self.assertNotIn("private", str(failed.exception))
+        self.assertNotIn("password", str(failed.exception))
+        self.assertIsNone(failed.exception.recovery)
+        self.assertEqual(request.call_count, 1)
+
+    @patch("rollout_client.request")
+    def test_dns_failure_keeps_original_continuation_and_does_not_retry(self, request):
+        continuation = "https://gateway.example/private-token"
+        request.side_effect = [response({"id": "q_owner", "nextUri": continuation}),
+                               socket.gaierror(socket.EAI_NONAME, "private diagnostic")]
+        with self.assertRaises(RuntimeError) as failed:
+            self.client().query("SELECT 1")
+        self.assertEqual(failed.exception.recovery.next_uri, continuation)
+        self.assertTrue(str(failed.exception).startswith("request_error:gaierror:{"))
+        self.assertEqual(json.loads(str(failed.exception).split(":", 2)[2])["errno"], socket.EAI_NONAME)
+        self.assertNotIn("private", str(failed.exception))
+        self.assertEqual(request.call_count, 2)
+
+    @patch("rollout_client.request")
+    def test_dns_unknown_and_malformed_codes_are_bounded(self, request):
+        for code, expected in ((123456, 123456), ("private-host", None), (True, None), (10 ** 100, None)):
+            with self.subTest(code=code):
+                request.reset_mock()
+                request.side_effect = socket.gaierror(code, "private diagnostic")
+                with self.assertRaises(RuntimeError) as failed:
+                    self.client().query("SELECT 1")
+                self.assertTrue(str(failed.exception).startswith("request_error:gaierror:{"))
+                self.assertEqual(json.loads(str(failed.exception).split(":", 2)[2]),
+                                 {"errno": expected, "code": "UNKNOWN"})
+                self.assertLess(len(str(failed.exception)), 120)
+                self.assertNotIn("private", str(failed.exception))
+                self.assertEqual(request.call_count, 1)
 
     @patch("rollout_client.request")
     def test_pages_keep_credentials_and_collect_actual_rows(self, request):
