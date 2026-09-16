@@ -19,12 +19,17 @@ class GracefulShutdownContract(unittest.TestCase):
             self.assertEqual(started.status, 200, started.body)
             transaction = started.values("X-Trino-Started-Transaction-Id")
             self.assertEqual(len(transaction), 1)
-            for page in finish(started, gateways[0]):
+            start_pages = finish(started, gateways[0])
+            for page in start_pages:
                 self.assertEqual(page.status, 200, page.body)
+                self.assertNotIn("error", page.json())
+            self.assertEqual(start_pages[-1].json()["stats"]["state"], "FINISHED")
             submitted = request(gateways[0] + "/v1/statement", "POST", "SELECT 1", headers)
             self.assertEqual(submitted.status, 200, submitted.body)
             continuation = submitted.json()["nextUri"]
             path = urlsplit(continuation).path
+            owner = next(backend.state.identity for backend in backends
+                         if submitted.json()["id"].endswith("_" + backend.state.coordinator_id))
             for backend in backends:
                 with backend.state.lock:
                     backend.state.config["hold_poll"] = True
@@ -48,10 +53,16 @@ class GracefulShutdownContract(unittest.TestCase):
                 response = pending.result(timeout=10)
                 self.assertEqual(response.status, 200, response.body)
                 self.assertEqual(response.json()["id"], submitted.json()["id"])
+                self.assertNotIn("error", response.json())
+                self.assertEqual(response.json()["stats"]["state"], "FINISHED")
+                self.assertEqual(response.json()["data"], [[owner]])
                 processes[0].wait(timeout=15)
                 replay = request(through_gateway(continuation, gateways[1]))
                 self.assertEqual(replay.status, 200, replay.body)
                 self.assertEqual(replay.json()["id"], submitted.json()["id"])
+                self.assertNotIn("error", replay.json())
+                self.assertEqual(replay.json()["stats"], response.json()["stats"])
+                self.assertEqual(replay.json()["data"], response.json()["data"])
                 committed = request(gateways[1] + "/v1/statement", "POST", "COMMIT",
                                     headers + [("X-Trino-Transaction-Id", transaction[0])])
                 self.assertEqual(committed.status, 200, committed.body)
