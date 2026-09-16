@@ -16,6 +16,35 @@ import uuid
 from rollout_client import RolloutClient, RolloutFailure, recovery_report, validate_recovery_directory
 
 
+class OperationStopped(RuntimeError):
+    pass
+
+
+class StopController:
+    def __init__(self, event):
+        self.event, self.lock, self.stopped = event, threading.Lock(), threading.Event()
+
+    def request(self, reason, operation_id=None):
+        with self.lock:
+            if self.stopped.is_set():
+                return
+            self.stopped.set()
+        self.event("workload_stop_requested", reason=reason, operation_id=operation_id)
+
+    def is_set(self):
+        return self.stopped.is_set()
+
+    def wait(self, seconds):
+        return self.stopped.wait(seconds)
+
+    def begin_operation(self, submit):
+        with self.lock:
+            if self.stopped.is_set():
+                return False
+            submit()
+            return True
+
+
 class OperationLedger:
     KINDS = {"autocommit", "transaction_begin", "transaction_read", "transaction_commit",
              "transaction_rollback", "transaction_cleanup", "retained", "continuation_resume"}
@@ -57,14 +86,21 @@ class OperationLedger:
             raise ValueError("invalid_operation_outcome")
         self.transition(operation_id, "unresolved", outcome, metadata)
 
-    def run(self, kind, operation, validate=None, operation_id=None, parent_operation_id=None, include_query_metadata=False):
+    def run(self, kind, operation, validate=None, operation_id=None, parent_operation_id=None,
+            include_query_metadata=False, stop=None):
         if operation_id is None:
             operation_id = self.offer(kind, parent_operation_id)
         else:
             with self.lock:
                 if self.operations.get(operation_id, {}).get("kind") != kind:
                     raise ValueError("operation_kind_changed")
-        self.submit(operation_id)
+        if stop is not None and not stop.begin_operation(lambda: self.submit(operation_id)):
+            self.transition(operation_id, "offered", "not_submitted_stopped")
+            error = OperationStopped("workload_stopped")
+            error.operation_id = operation_id
+            raise error
+        if stop is None:
+            self.submit(operation_id)
         try:
             result = operation()
             if validate is not None:
@@ -83,12 +119,12 @@ class OperationLedger:
         states = Counter(record["state"] for record in records)
         submitted = sum(states[state] for state in ("succeeded", "failed", "unresolved"))
         counts = {"offered": len(records), "submitted": submitted,
-                  **{state: states[state] for state in ("succeeded", "failed", "unresolved", "not_submitted_capacity")},
+                  **{state: states[state] for state in ("succeeded", "failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped")},
                   "not_submitted_pending": states["offered"]}
         counts["accounting_valid"] = (counts["submitted"] == counts["succeeded"] + counts["failed"] + counts["unresolved"] and
-                                      counts["offered"] == counts["submitted"] + counts["not_submitted_capacity"] + counts["not_submitted_pending"])
+                                      counts["offered"] == counts["submitted"] + counts["not_submitted_capacity"] + counts["not_submitted_stopped"] + counts["not_submitted_pending"])
         counts["zero_error_acceptance"] = (counts["accounting_valid"] and counts["submitted"] > 0 and
-                                           not any(counts[key] for key in ("failed", "unresolved", "not_submitted_capacity", "not_submitted_pending")))
+                                           not any(counts[key] for key in ("failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped", "not_submitted_pending")))
         counts["by_kind"] = {kind: dict(Counter(record["state"] for record in records if record["kind"] == kind))
                              for kind in sorted({record["kind"] for record in records})}
         return counts
@@ -137,8 +173,10 @@ def main():
                               "utc": datetime.now(timezone.utc).isoformat(), **fields}), flush=True)
 
     ledger = OperationLedger(event)
+    stop = StopController(event)
 
     def failure_fields(error):
+        stop.request("first_failure", getattr(error, "operation_id", None))
         handle = getattr(error, "recovery", None)
         if handle is not None:
             with lock:
@@ -147,14 +185,14 @@ def main():
                 "detail": str(error) if isinstance(error, RolloutFailure) else "client_error:" + type(error).__name__,
                 **recovery_report(error, args.recovery_directory)}
 
-    def checked(connection, sql, kind, expected=None, validate=None, operation_id=None, **kwargs):
+    def checked(connection, sql, kind, expected=None, validate=None, operation_id=None, allow_when_stopped=False, **kwargs):
         def validate_result(result):
             if expected is not None and result["rows"] != expected:
                 raise RuntimeError("result_mismatch")
             if validate is not None:
                 validate(result)
         result = ledger.run(kind, lambda: connection.query(sql, **kwargs), validate_result,
-                            operation_id=operation_id, include_query_metadata=True)
+                            operation_id=operation_id, include_query_metadata=True, stop=None if allow_when_stopped else stop)
         with lock:
             owners.add(result["query_id"].rsplit("_", 1)[-1])
             counts["statements_completed"] += 1
@@ -163,7 +201,7 @@ def main():
 
     def readiness():
         with lock:
-            ready = len(open_transactions) == 3 and retained_ready.is_set() and not ready_reported.is_set()
+            ready = len(open_transactions) == 3 and retained_ready.is_set() and not ready_reported.is_set() and not stop.is_set()
             if ready:
                 ready_reported.set()
         if ready:
@@ -175,6 +213,10 @@ def main():
             with lock:
                 counts["small_completed"] += 1
                 durations.append(result["duration_seconds"])
+        except OperationStopped as error:
+            with lock:
+                counts["small_not_submitted_stopped"] += 1
+            event("small_stopped_before_submission", operation_id=error.operation_id)
         except Exception as error:
             with lock:
                 counts["small_failed"] += 1
@@ -206,15 +248,24 @@ def main():
             event("transaction_open", index=index, owner=transaction_owner)
             readiness()
             until = time.monotonic() + args.transaction_seconds
-            while time.monotonic() < until:
+            while time.monotonic() < until and not stop.is_set():
                 result = checked(connection, "SELECT count(*) >= 0 FROM information_schema.tables", "transaction_read",
                                  [[True]], validate=validate_read)
-                time.sleep(min(5, max(0, until - time.monotonic())))
+                stop.wait(min(5, max(0, until - time.monotonic())))
+            if stop.is_set():
+                with lock:
+                    counts["transactions_aborted"] += 1
+                event("transaction_aborted", index=index)
+                return
             action = "ROLLBACK" if index == 2 else "COMMIT"
             result = checked(connection, action, "transaction_" + action.lower(), validate=validate_terminal)
             with lock:
                 counts["transactions_completed"] += 1
             event("transaction_finished", index=index, terminal=action)
+        except OperationStopped as error:
+            with lock:
+                counts["transactions_aborted"] += 1
+            event("transaction_aborted", index=index, operation_id=error.operation_id)
         except Exception as error:
             with lock:
                 counts["transactions_failed"] += 1
@@ -222,7 +273,7 @@ def main():
         finally:
             if connection.transaction != "NONE":
                 try:
-                    checked(connection, "ROLLBACK", "transaction_cleanup", validate=validate_terminal)
+                    checked(connection, "ROLLBACK", "transaction_cleanup", validate=validate_terminal, allow_when_stopped=True)
                     event("transaction_cleanup_rollback", index=index)
                 except Exception as error:
                     with lock:
@@ -243,10 +294,14 @@ def main():
             result = checked(client(), "SELECT n FROM UNNEST(sequence(1, 10000)) AS t(n) ORDER BY n",
                              "retained", [[n] for n in range(1, 10001)], validate=validate_retained,
                              deadline_seconds=args.retained_seconds + 60,
-                             first_page_pause=args.retained_seconds, first_page_callback=first_page)
+                             first_page_pause=args.retained_seconds, first_page_callback=first_page, first_page_release=stop)
             with lock:
                 counts["retained_query_completed"] += 1
             event("retained_query_finished", duration_seconds=result["duration_seconds"], pages=result["pages"])
+        except OperationStopped as error:
+            with lock:
+                counts["retained_not_submitted_stopped"] += 1
+            event("retained_stopped_before_submission", operation_id=error.operation_id)
         except Exception as error:
             with lock:
                 counts["retained_query_failed"] += 1
@@ -256,11 +311,14 @@ def main():
           transaction_seconds=args.transaction_seconds, concurrency_cap=16, client_retries=0)
     extra = [threading.Thread(target=transaction, args=(index,)) for index in range(3)]
     extra.append(threading.Thread(target=retained))
-    for thread in extra:
-        thread.start()
-    with ThreadPoolExecutor(max_workers=16) as executor:
-        for index in range(math.ceil(args.seconds * args.rate)):
-            time.sleep(max(0, started + index / args.rate - time.monotonic()))
+    planned = math.ceil(args.seconds * args.rate)
+    executor = ThreadPoolExecutor(max_workers=16)
+    try:
+        for thread in extra:
+            thread.start()
+        for index in range(planned):
+            if stop.wait(max(0, started + index / args.rate - time.monotonic())):
+                break
             with lock:
                 counts["small_offered"] += 1
             operation_id = ledger.offer("autocommit")
@@ -270,21 +328,42 @@ def main():
                 ledger.drop_capacity(operation_id)
                 with lock:
                     counts["small_not_submitted_capacity"] += 1
-    for thread in extra:
-        thread.join()
+                stop.request("capacity_drop", operation_id)
+    except KeyboardInterrupt:
+        stop.request("interrupt")
+    except Exception as error:
+        with lock:
+            counts["scheduler_failed"] += 1
+        event("scheduler_failure", **failure_fields(error))
+    finally:
+        while True:
+            try:
+                executor.shutdown(wait=True)
+                for thread in extra:
+                    if thread.ident is not None:
+                        thread.join()
+                break
+            except KeyboardInterrupt:
+                stop.request("interrupt")
     ordered = sorted(durations)
     latency = {"min": min(ordered), "max": max(ordered), "mean": sum(ordered) / len(ordered),
                "p50": ordered[int((len(ordered) - 1) * .50)],
                "p95": ordered[int((len(ordered) - 1) * .95)],
                "p99": ordered[int((len(ordered) - 1) * .99)]} if ordered else {}
     accounting = ledger.snapshot()
+    counts["small_planned"] = planned
+    counts.setdefault("small_offered", 0)
+    counts["small_not_offered"] = planned - counts["small_offered"]
+    counts["transaction_threads_not_started"] = sum(thread.ident is None for thread in extra[:3])
+    counts["retained_thread_not_started"] = int(extra[3].ident is None)
     event("summary", counts=dict(counts), operation_accounting=accounting,
           small_latency_seconds=latency, query_owners=sorted(owners), client_retries=0,
-          failed_continuations=len(failed_continuations), recovery_persistence_requested=bool(args.recovery_directory))
+          failed_continuations=len(failed_continuations), recovery_persistence_requested=bool(args.recovery_directory),
+          stopped_early=stop.is_set())
     failed = any(counts[key] for key in ("small_failed", "small_not_submitted_capacity",
                                         "transactions_failed", "retained_query_failed", "cleanup_failed"))
     failed = failed or counts["transactions_completed"] != 3 or counts["retained_query_completed"] != 1
-    failed = failed or not ready_reported.is_set() or not accounting["zero_error_acceptance"]
+    failed = failed or stop.is_set() or not ready_reported.is_set() or not accounting["zero_error_acceptance"]
     raise SystemExit(1 if failed else 0)
 
 

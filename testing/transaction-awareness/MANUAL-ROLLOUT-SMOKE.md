@@ -31,15 +31,29 @@ deployment window. The readiness event records one observation, not continuous
 overlap. This workload does not yet test a long-running CPU query.
 
 The summary reports `submitted = succeeded + failed + unresolved` and
-`offered = submitted + not_submitted_capacity + not_submitted_pending`.
+`offered = submitted + not_submitted_capacity + not_submitted_stopped + not_submitted_pending`.
 Submitted means the client invoked the logical statement, not that Trino accepted
 or executed it. Failed means the client observed a failure; backend execution can
 still be uncertain. Unresolved means an invoked operation has no recorded client
 outcome. Pending means an offered operation has not reached the client invocation.
 Capacity drops remain explicit failures of workload coverage.
 
+The first failure or capacity drop requests a graceful stop. The workload stops
+offering new autocommit work, skips already offered statements that have not
+started, releases the retained-result pause, and rolls back open transactions.
+Already running requests keep their existing deadlines. Releasing the pause
+continues normal result polling; it does not retry a failed request or replay SQL.
+Cleanup failures retain their ordinary failure and private-recovery reporting.
+
+Ctrl+C requests the same graceful stop. Wait for the final summary before exiting
+the process. The summary separates planned autocommit arrivals that were never
+offered from offered statements stopped before submission. It also reports aborted
+transactions and threads that never started. A stopped run always exits nonzero,
+including a user interruption with no query failure. This procedure does not
+certify that failed queries stopped executing or remove Gateway ledger records.
+
 Zero-error acceptance requires both equations, at least one submitted operation,
-no failures, unresolved operations, capacity drops, or pending offers, and the
+no failures, unresolved operations, capacity drops, stopped or pending offers, and the
 existing transaction, retained-result, and rollout-readiness checks. HTTP page
 counts are separate from logical-statement counts. Operation events contain no
 SQL text, credentials, result rows, or continuation capabilities.
