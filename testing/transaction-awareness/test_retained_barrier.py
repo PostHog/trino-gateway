@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
@@ -155,6 +156,81 @@ class RetainedBarrierTest(unittest.TestCase):
                        {"rows": [[1, "wrong"]] + rows[1:]}):
             with self.subTest(keys=list(update)), self.assertRaises(ValueError):
                 validate_retained_result({**valid, **update})
+
+    def test_runtime_release_marker_rejects_symlink_directory_and_public_file(self):
+        for kind in ("symlink", "directory", "public"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory, "release")
+                marker = ReleaseMarker(str(target))
+                try:
+                    if kind == "symlink":
+                        target.symlink_to(Path(directory, "elsewhere"))
+                    elif kind == "directory":
+                        target.mkdir(mode=0o700)
+                    else:
+                        target.touch(mode=0o644)
+                        target.chmod(0o644)
+                    with self.assertRaises((OSError, ValueError)):
+                        marker.released()
+                finally:
+                    marker.close()
+
+    def test_foreign_next_uri_never_receives_heartbeat_or_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = ReleaseMarker(str(Path(directory) / "release"))
+            hold = ExecutingResultHold(marker, 2, threading.Event(), lambda *args, **kwargs: None,
+                                       lambda: self.fail("must not hold"), expected_rows=2, padding=4)
+            client = RolloutClient("https://gateway.example", "reader", "catalog", "password")
+            try:
+                with patch("rollout_client.request", side_effect=[response(next_uri=EXECUTING),
+                           response(retained_rows(1, 4), NEXT.replace("gateway.example", "foreign.example"))]) as get, \
+                        patch("retained_barrier.request") as head:
+                    with self.assertRaisesRegex(RolloutFailure, "continuation_origin"):
+                        client.query(retained_sql(), executing_page_callback=hold)
+                self.assertEqual(get.call_count, 2)
+                head.assert_not_called()
+            finally:
+                marker.close()
+
+    def test_head_dns_failure_is_bounded_without_retry_and_keeps_get_handle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = ReleaseMarker(str(Path(directory) / "release"))
+            hold = ExecutingResultHold(marker, 2, threading.Event(), lambda *args, **kwargs: None,
+                                       lambda: None, expected_rows=2, padding=4)
+            client = RolloutClient("https://gateway.example", "reader", "catalog", "password")
+            try:
+                with patch("rollout_client.request", side_effect=[response(next_uri=EXECUTING),
+                           response(retained_rows(1, 4), NEXT)]), \
+                        patch("retained_barrier.request", side_effect=socket.gaierror(socket.EAI_AGAIN, "private-host")) as head:
+                    with self.assertRaises(RolloutFailure) as failed:
+                        client.query(retained_sql(), executing_page_callback=hold)
+                self.assertEqual(head.call_count, 1)
+                self.assertIn("EAI_AGAIN", str(failed.exception))
+                self.assertNotIn("private-host", str(failed.exception))
+                self.assertEqual(failed.exception.recovery.next_uri, NEXT)
+            finally:
+                marker.close()
+
+    def test_stop_after_heartbeat_consumes_remaining_rows_without_claiming_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = ReleaseMarker(str(Path(directory) / "release"))
+            stop = threading.Event()
+            hold = ExecutingResultHold(marker, 2, stop, lambda *args, **kwargs: None,
+                                       lambda: None, expected_rows=2, padding=4)
+            client = RolloutClient("https://gateway.example", "reader", "catalog", "password")
+            def heartbeat(*args, **kwargs):
+                stop.set()
+                return Response(200, [], b"")
+            try:
+                with patch("rollout_client.request", side_effect=[response(next_uri=EXECUTING),
+                           response(retained_rows(1, 4), NEXT), response(retained_rows(2, 4)[1:])]), \
+                        patch("retained_barrier.request", side_effect=heartbeat):
+                    result = client.query(retained_sql(), executing_page_callback=hold)
+                self.assertEqual(result["rows"], retained_rows(2, 4))
+                self.assertEqual(result["retained_hold_outcome"], "stopped")
+                self.assertEqual(result["heartbeat_requests"], 1)
+            finally:
+                marker.close()
 
 
 if __name__ == "__main__":

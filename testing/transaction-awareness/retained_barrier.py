@@ -8,7 +8,7 @@ import time
 from urllib.parse import urlsplit
 
 from protocol import request
-from rollout_client import RolloutFailure, http_failure, private_descriptor
+from rollout_client import RolloutFailure, http_failure, private_descriptor, request_failure
 
 
 def retained_sql():
@@ -108,7 +108,7 @@ class ExecutingResultHold:
                     response = request(next_uri, "HEAD", headers=client.headers + [("X-Trino-Transaction-Id", "NONE")],
                                        timeout=min(10, deadline - now))
                 except Exception as error:
-                    raise RolloutFailure("heartbeat_error:" + type(error).__name__, client.pending_continuation) from None
+                    raise RolloutFailure(request_failure(error), client.pending_continuation) from None
                 if response.status != 200:
                     raise RolloutFailure(http_failure(response, "HEAD", 0), client.pending_continuation)
                 if response.values("X-Trino-Started-Transaction-Id") or response.values("X-Trino-Clear-Transaction-Id") or response.body:
