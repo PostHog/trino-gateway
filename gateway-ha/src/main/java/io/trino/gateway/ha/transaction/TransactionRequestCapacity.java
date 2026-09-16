@@ -58,20 +58,26 @@ final class TransactionRequestCapacity
 
     Lease acquire()
     {
-        if (stopping.get() || !permits.tryAcquire()) {
-            throw overloaded();
+        if (stopping.get()) {
+            throw unavailable(true);
+        }
+        if (!permits.tryAcquire()) {
+            throw unavailable(stopping.get());
         }
         if (stopping.get()) {
             release();
-            throw overloaded();
+            throw unavailable(true);
         }
         return new Lease(System.nanoTime() + requestNanos);
     }
 
-    private static WebApplicationException overloaded()
+    private static WebApplicationException unavailable(boolean stopping)
     {
         return new WebApplicationException(Response.status(503).header("Retry-After", "1")
-                .entity("Transaction-aware request capacity is unavailable; no backend request was dispatched").build());
+                .header("X-Trino-Gateway-Error", stopping ? "GATEWAY_STOPPING" : "CAPACITY_EXHAUSTED")
+                .type("text/plain")
+                .entity(stopping ? "Gateway is shutting down; no backend request was dispatched" :
+                        "Transaction-aware request capacity is unavailable; no backend request was dispatched").build());
     }
 
     Executor completions()

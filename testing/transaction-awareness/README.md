@@ -135,6 +135,36 @@ The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields:
 
 ## Limits of this suite
 
+### Gateway process shutdown
+
+`test_graceful_shutdown` starts two real Gateway JVMs and a disposable PostgreSQL
+instance. It holds a continuation response at the protocol fixture, sends
+SIGTERM to the Gateway handling that response, and verifies response completion
+before process exit. The other Gateway must then replay the result and complete
+a transaction opened through the stopped Gateway. CI runs this test alongside
+`test_rollout_api`, using the same `GATEWAY_TEST_JAVA`,
+`GATEWAY_TEST_CLASSPATH`, and `GATEWAY_TEST_PG_BIN` settings.
+
+The fixture explicitly sets `http-server.stop-timeout: 10s` and releases its
+backend response after a one-second shutdown observation. This is a bounded
+HTTP shutdown test, not a load-balancer deregistration test or proof that an
+unlimited request survives process termination. It neither restarts a Trino
+coordinator nor migrates a transaction.
+
+Deployment configuration must provide a positive HTTP stop timeout. Budget for
+the effective request timeout plus transaction completion processing. The
+Kubernetes termination grace period must also include the pre-stop hook and
+shutdown overhead. Load-balancer deregistration must stop new traffic before
+process shutdown. An immediate stop timeout cannot preserve an admitted HTTP
+response, even when a second healthy Gateway shares the database.
+
+Gateway-generated admission failures distinguish `CAPACITY_EXHAUSTED` from
+`GATEWAY_STOPPING` in the `X-Trino-Gateway-Error` response header. Ledger
+rejections and unexpected routing failures use `ROUTING_STATE_*` codes. The
+rollout client retains only allowlisted diagnostic codes, not exception text or
+arbitrary response bodies. These codes support diagnosis; they do not authorize
+replaying a statement or clearing an uncertain admission.
+
 The fake server implements the protocol subset needed for deterministic routing tests. It does not execute SQL, implement connector transactions, enforce backend authentication or reproduce Trino memory loss. It is not a substitute for real-Trino tests using supported clients and transaction-capable catalogs.
 
 Production acceptance also requires real coordinator restart/loss and Gateway restart between database commit and response delivery. The fake-process restart and TCP fault boundary do not replace those process-level experiments. Passing fixture self-tests only validates the test tools; the black-box assertions still need execution against the actual implementation. Never claim that an in-memory transaction survives the loss of its coordinator.

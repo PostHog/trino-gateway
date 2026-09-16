@@ -35,7 +35,7 @@ def stop_process(process):
 
 
 @contextlib.contextmanager
-def local_gateways(form_auth=False):
+def local_gateways(form_auth=False, processes=None, server_config=None):
     pg_bin = Path(os.environ["GATEWAY_TEST_PG_BIN"])
     with tempfile.TemporaryDirectory(prefix="gateway-rollout-api-") as directory, contextlib.ExitStack() as cleanup:
         root = Path(directory)
@@ -64,6 +64,7 @@ def local_gateways(form_auth=False):
                 "routing": {"defaultRoutingGroup": "cell"},
                 "transactionAwareness": {"enabled": True, "identityKey": key, "adminToken": token, "terminalRetentionSeconds": 1},
             }
+            config["serverConfig"].update(server_config or {})
             if form_auth:
                 auth = Path(__file__).resolve().parents[2] / "gateway-ha/src/test/resources/auth"
                 config.update({
@@ -75,6 +76,8 @@ def local_gateways(form_auth=False):
             config_file.write_text(json.dumps(config))
             logfile = cleanup.enter_context((root / f"gateway-{index}.log").open("wb"))
             process = subprocess.Popen([os.environ["GATEWAY_TEST_JAVA"], "-Xmx384m", "-cp", os.environ["GATEWAY_TEST_CLASSPATH"], "io.trino.gateway.ha.HaGatewayLauncher", str(config_file)], stdout=logfile, stderr=subprocess.STDOUT)
+            if processes is not None:
+                processes.append(process)
             cleanup.callback(stop_process, process)
             deadline = time.monotonic() + 60
             while True:
