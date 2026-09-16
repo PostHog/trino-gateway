@@ -11,7 +11,7 @@ import os
 import threading
 import time
 
-from rollout_client import RolloutClient
+from rollout_client import RolloutClient, RolloutFailure, recovery_report, validate_recovery_directory
 
 
 def main():
@@ -24,7 +24,9 @@ def main():
     parser.add_argument("--rate", type=float, default=4)
     parser.add_argument("--transaction-seconds", type=int, default=180)
     parser.add_argument("--retained-seconds", type=int, default=100)
+    parser.add_argument("--recovery-directory", help="Opt in to private capability files in an existing mode-0700 directory")
     args = parser.parse_args()
+    validate_recovery_directory(args.recovery_directory)
     if not 30 <= args.seconds <= 600 or not 0 <= args.rate <= 4:
         raise ValueError("Bound the run to 30-600 seconds and at most four queries per second")
     if not 10 <= args.transaction_seconds < args.seconds:
@@ -34,6 +36,7 @@ def main():
     password = os.environ.get("TX_TRINO_PASSWORD") or getpass.getpass("Trino password: ")
     started, lock, capacity = time.monotonic(), threading.Lock(), threading.Semaphore(16)
     counts, durations, owners = Counter(), [], set()
+    failed_continuations = []
     open_transactions, retained_ready, ready_reported = set(), threading.Event(), threading.Event()
 
     def client():
@@ -43,6 +46,15 @@ def main():
         with lock:
             print(json.dumps({"event": name, "elapsed_seconds": time.monotonic() - started,
                               "utc": datetime.now(timezone.utc).isoformat(), **fields}), flush=True)
+
+    def failure_fields(error):
+        handle = getattr(error, "recovery", None)
+        if handle is not None:
+            with lock:
+                failed_continuations.append(handle)
+        return {"kind": type(error).__name__,
+                "detail": str(error) if isinstance(error, RolloutFailure) else "client_error:" + type(error).__name__,
+                **recovery_report(error, args.recovery_directory)}
 
     def checked(connection, sql, expected=None, **kwargs):
         result = connection.query(sql, **kwargs)
@@ -72,7 +84,7 @@ def main():
             with lock:
                 counts["small_failed"] += 1
                 counts["error_" + type(error).__name__] += 1
-            event("small_failure", kind=type(error).__name__, detail=str(error))
+            event("small_failure", **failure_fields(error))
         finally:
             capacity.release()
 
@@ -106,7 +118,7 @@ def main():
         except Exception as error:
             with lock:
                 counts["transactions_failed"] += 1
-            event("transaction_failure", index=index, kind=type(error).__name__, detail=str(error))
+            event("transaction_failure", index=index, **failure_fields(error))
         finally:
             if connection.transaction != "NONE":
                 try:
@@ -115,7 +127,7 @@ def main():
                 except Exception as error:
                     with lock:
                         counts["cleanup_failed"] += 1
-                    event("transaction_cleanup_failed", index=index, kind=type(error).__name__)
+                    event("transaction_cleanup_failed", index=index, **failure_fields(error))
 
     def retained():
         def first_page():
@@ -134,7 +146,7 @@ def main():
         except Exception as error:
             with lock:
                 counts["retained_query_failed"] += 1
-            event("retained_query_failure", kind=type(error).__name__, detail=str(error))
+            event("retained_query_failure", **failure_fields(error))
 
     event("workload_started", offered_queries_per_second=args.rate, seconds=args.seconds,
           transaction_seconds=args.transaction_seconds, concurrency_cap=16, client_retries=0)
@@ -159,7 +171,8 @@ def main():
                "p50": ordered[int((len(ordered) - 1) * .50)],
                "p95": ordered[int((len(ordered) - 1) * .95)],
                "p99": ordered[int((len(ordered) - 1) * .99)]} if ordered else {}
-    event("summary", counts=dict(counts), small_latency_seconds=latency, query_owners=sorted(owners), client_retries=0)
+    event("summary", counts=dict(counts), small_latency_seconds=latency, query_owners=sorted(owners), client_retries=0,
+          failed_continuations=len(failed_continuations), recovery_persistence_requested=bool(args.recovery_directory))
     failed = any(counts[key] for key in ("small_failed", "small_not_submitted_capacity",
                                         "transactions_failed", "retained_query_failed", "cleanup_failed"))
     failed = failed or counts["transactions_completed"] != 3 or counts["retained_query_completed"] != 1
