@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 
-from rollout_client import RolloutClient, RolloutFailure, recovery_report, save_recovery, validate_recovery_directory
+from rollout_client import RolloutClient, RolloutFailure, client_failure, recovery_report, save_recovery, validate_recovery_directory
 from retained_barrier import ExecutingResultHold, ReleaseMarker, retained_sql, validate_retained_result
 
 
@@ -268,7 +268,7 @@ def main():
             with lock:
                 failed_continuations.append(handle)
         return {"kind": type(error).__name__, "operation_id": getattr(error, "operation_id", None),
-                "detail": str(error) if isinstance(error, RolloutFailure) else "client_error:" + type(error).__name__,
+                "detail": str(error) if isinstance(error, RolloutFailure) else client_failure(error),
                 **recovery_report(error, args.recovery_directory)}
 
     def checked(connection, sql, kind, expected=None, validate=None, operation_id=None, allow_when_stopped=False, **kwargs):

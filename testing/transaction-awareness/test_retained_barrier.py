@@ -30,6 +30,36 @@ def response(rows=None, next_uri=None, state=None):
 
 
 class RetainedBarrierTest(unittest.TestCase):
+    def test_sql_padding_is_a_varchar_not_an_array(self):
+        self.assertIn("rpad('x', 1024, 'x')", retained_sql())
+        self.assertNotIn("repeat(", retained_sql())
+
+    def test_invalid_array_prefix_reports_only_owned_reason_and_keeps_capability(self):
+        with tempfile.TemporaryDirectory() as directory:
+            marker = ReleaseMarker(str(Path(directory) / "release"))
+            client = RolloutClient("https://gateway.example", "reader", "catalog", "password")
+            hold = ExecutingResultHold(marker, 2, threading.Event(), lambda *a, **k: None,
+                                       lambda: None, expected_rows=2, padding=4)
+            try:
+                with patch("rollout_client.request", side_effect=[response(next_uri=EXECUTING),
+                           response([[1, ["1", "x", "x", "x", "x"]]], NEXT)]), patch("retained_barrier.request") as head:
+                    with self.assertRaisesRegex(RolloutFailure, "^client_error:invalid_retained_result_prefix$") as failure:
+                        client.query(retained_sql(), executing_page_callback=hold)
+                self.assertEqual(failure.exception.recovery.next_uri, NEXT)
+                head.assert_not_called()
+            finally:
+                marker.close()
+
+    def test_value_error_diagnostics_are_exact_allowlist_only(self):
+        from rollout_client import client_failure
+        for reason in ("invalid_retained_result_prefix", "retained_barrier_not_released",
+                       "retained_row_count_mismatch", "invalid_retained_query_identity",
+                       "retained_hold_requires_autocommit", "release_marker_must_be_private_and_owned"):
+            self.assertEqual(client_failure(ValueError(reason)), "client_error:" + reason)
+        for error in (ValueError("password secret"), ValueError("invalid_retained_result_prefix secret"),
+                      ValueError("invalid_retained_result_prefix", "secret"), RuntimeError("invalid_retained_result_prefix")):
+            self.assertEqual(client_failure(error), "client_error:" + type(error).__name__)
+
     def test_only_executing_data_page_enters_hold_and_heads_exact_next_uri(self):
         with tempfile.TemporaryDirectory() as directory:
             marker = ReleaseMarker(str(Path(directory) / "release"))

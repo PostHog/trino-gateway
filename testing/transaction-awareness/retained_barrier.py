@@ -12,7 +12,7 @@ from rollout_client import RolloutFailure, http_failure, private_descriptor, req
 
 
 def retained_sql():
-    return "SELECT n, CAST(n AS varchar) || repeat('x', 1024) FROM UNNEST(sequence(1, 10000)) AS t(n) ORDER BY n"
+    return "SELECT n, CAST(n AS varchar) || rpad('x', 1024, 'x') FROM UNNEST(sequence(1, 10000)) AS t(n) ORDER BY n"
 
 
 def retained_rows(count=10000, padding=1024):

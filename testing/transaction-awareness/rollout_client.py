@@ -96,6 +96,15 @@ def recovery_report(error, directory=None):
     return report
 
 
+def client_failure(error):
+    allowed = {"invalid_retained_result_prefix", "retained_barrier_not_released",
+               "retained_row_count_mismatch", "invalid_retained_query_identity",
+               "retained_hold_requires_autocommit", "release_marker_must_be_private_and_owned"}
+    if type(error) is ValueError and len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in allowed:
+        return "client_error:" + error.args[0]
+    return "client_error:" + type(error).__name__
+
+
 def request_failure(error):
     if not isinstance(error, socket.gaierror):
         return "request_error:" + type(error).__name__
@@ -188,7 +197,7 @@ class RolloutClient:
             raise
         except Exception as error:
             known = r"(?:query_deadline|query_identity_changed|missing_query_identity|conflicting_transaction_identity|transaction_identity_changed|continuation_origin|query_page_limit|query_response_invalid|query_error:[A-Z0-9_]{1,100})"
-            message = str(error) if type(error) in (RuntimeError, TimeoutError) and re.fullmatch(known, str(error)) else "client_error:" + type(error).__name__
+            message = str(error) if type(error) in (RuntimeError, TimeoutError) and re.fullmatch(known, str(error)) else client_failure(error)
             raise RolloutFailure(message, self.pending_continuation) from None
 
     def _run(self, url, method, body, identity, previous_rows, deadline_seconds, max_pages,
