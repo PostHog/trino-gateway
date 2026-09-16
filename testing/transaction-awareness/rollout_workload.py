@@ -1,8 +1,9 @@
 """Bounded read-only traffic during an independently controlled Gateway rollout."""
 
 import argparse
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import getpass
 import json
@@ -13,11 +14,72 @@ import threading
 import time
 import uuid
 
-from rollout_client import RolloutClient, RolloutFailure, recovery_report, validate_recovery_directory
+from rollout_client import RolloutClient, RolloutFailure, recovery_report, save_recovery, validate_recovery_directory
 
 
 class OperationStopped(RuntimeError):
     pass
+
+
+class StatementBudget:
+    def __init__(self, limit):
+        if type(limit) is not int or limit < 1:
+            raise ValueError("invalid_statement_limit")
+        self.limit, self.active, self.uncertain = limit, 0, 0
+        self.condition, self.waiters = threading.Condition(), deque()
+
+    def acquire(self, stop=None, cleanup=False):
+        with self.condition:
+            if cleanup:
+                if self.active >= self.limit:
+                    return False
+                self.active += 1
+                return True
+            ticket = object()
+            self.waiters.append(ticket)
+            try:
+                while True:
+                    if stop is not None and stop.is_set():
+                        return False
+                    if self.waiters[0] is ticket and self.active < self.limit:
+                        self.active += 1
+                        return True
+                    self.condition.wait(.05)
+            finally:
+                self.waiters.remove(ticket)
+                self.condition.notify_all()
+
+    def finish(self, uncertain=False):
+        with self.condition:
+            if uncertain:
+                self.uncertain += 1
+            else:
+                self.active -= 1
+            self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            return {"limit": self.limit, "occupied_slots": self.active,
+                    "uncertain_statements": self.uncertain, "waiting_operations": len(self.waiters)}
+
+
+@dataclass(frozen=True)
+class TransactionRecovery:
+    transaction_id: str = field(repr=False)
+    context_hash: str = field(repr=False)
+    format: str = "rollout-open-transaction-v1"
+
+
+def transaction_recovery_report(connection, directory):
+    report = {"transaction_still_open": True, "transaction_recovery_saved": False}
+    if directory:
+        try:
+            record = TransactionRecovery(connection.transaction, connection.context_hash)
+            report["transaction_recovery_file"] = os.path.basename(save_recovery(record, directory))
+            report["transaction_recovery_saved"] = True
+        except (OSError, ValueError):
+            report["transaction_recovery_save_failed"] = True
+    return report
 
 
 class StopController:
@@ -87,14 +149,26 @@ class OperationLedger:
         self.transition(operation_id, "unresolved", outcome, metadata)
 
     def run(self, kind, operation, validate=None, operation_id=None, parent_operation_id=None,
-            include_query_metadata=False, stop=None):
+            include_query_metadata=False, stop=None, budget=None, cleanup=False):
         if operation_id is None:
             operation_id = self.offer(kind, parent_operation_id)
         else:
             with self.lock:
                 if self.operations.get(operation_id, {}).get("kind") != kind:
                     raise ValueError("operation_kind_changed")
+        if budget is not None:
+            started = time.monotonic()
+            acquired = budget.acquire(stop, cleanup)
+            self.event("operation_client_wait", operation_id=operation_id,
+                       seconds=time.monotonic() - started, acquired=acquired)
+            if not acquired:
+                self.transition(operation_id, "offered", "not_submitted_statement_budget" if cleanup else "not_submitted_stopped")
+                error = OperationStopped("statement_budget_unavailable" if cleanup else "workload_stopped")
+                error.operation_id = operation_id
+                raise error
         if stop is not None and not stop.begin_operation(lambda: self.submit(operation_id)):
+            if budget is not None:
+                budget.finish()
             self.transition(operation_id, "offered", "not_submitted_stopped")
             error = OperationStopped("workload_stopped")
             error.operation_id = operation_id
@@ -107,10 +181,16 @@ class OperationLedger:
                 validate(result)
             metadata = query_metadata(result) if include_query_metadata else None
         except BaseException as error:
+            if budget is not None:
+                if stop is not None:
+                    stop.request("first_failure", operation_id)
+                budget.finish(uncertain=True)
             self.finish(operation_id, "failed")
             error.operation_id = operation_id
             raise
         self.finish(operation_id, "succeeded", metadata)
+        if budget is not None:
+            budget.finish()
         return result
 
     def snapshot(self):
@@ -119,12 +199,12 @@ class OperationLedger:
         states = Counter(record["state"] for record in records)
         submitted = sum(states[state] for state in ("succeeded", "failed", "unresolved"))
         counts = {"offered": len(records), "submitted": submitted,
-                  **{state: states[state] for state in ("succeeded", "failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped")},
+                  **{state: states[state] for state in ("succeeded", "failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped", "not_submitted_statement_budget")},
                   "not_submitted_pending": states["offered"]}
         counts["accounting_valid"] = (counts["submitted"] == counts["succeeded"] + counts["failed"] + counts["unresolved"] and
-                                      counts["offered"] == counts["submitted"] + counts["not_submitted_capacity"] + counts["not_submitted_stopped"] + counts["not_submitted_pending"])
+                                      counts["offered"] == counts["submitted"] + counts["not_submitted_capacity"] + counts["not_submitted_stopped"] + counts["not_submitted_statement_budget"] + counts["not_submitted_pending"])
         counts["zero_error_acceptance"] = (counts["accounting_valid"] and counts["submitted"] > 0 and
-                                           not any(counts[key] for key in ("failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped", "not_submitted_pending")))
+                                           not any(counts[key] for key in ("failed", "unresolved", "not_submitted_capacity", "not_submitted_stopped", "not_submitted_statement_budget", "not_submitted_pending")))
         counts["by_kind"] = {kind: dict(Counter(record["state"] for record in records if record["kind"] == kind))
                              for kind in sorted({record["kind"] for record in records})}
         return counts
@@ -149,8 +229,11 @@ def main():
     parser.add_argument("--rate", type=float, default=4)
     parser.add_argument("--transaction-seconds", type=int, default=180)
     parser.add_argument("--retained-seconds", type=int, default=100)
+    parser.add_argument("--max-concurrent-statements", type=int,
+                        help="Optional shared limit including retained results and transaction control statements")
     parser.add_argument("--recovery-directory", help="Opt in to private capability files in an existing mode-0700 directory")
     args = parser.parse_args()
+    budget = StatementBudget(args.max_concurrent_statements) if args.max_concurrent_statements is not None else None
     validate_recovery_directory(args.recovery_directory)
     if not 30 <= args.seconds <= 600 or not 0 <= args.rate <= 4:
         raise ValueError("Bound the run to 30-600 seconds and at most four queries per second")
@@ -192,7 +275,8 @@ def main():
             if validate is not None:
                 validate(result)
         result = ledger.run(kind, lambda: connection.query(sql, **kwargs), validate_result,
-                            operation_id=operation_id, include_query_metadata=True, stop=None if allow_when_stopped else stop)
+                            operation_id=operation_id, include_query_metadata=True, stop=None if allow_when_stopped else stop,
+                            budget=budget, cleanup=allow_when_stopped)
         with lock:
             owners.add(result["query_id"].rsplit("_", 1)[-1])
             counts["statements_completed"] += 1
@@ -275,10 +359,19 @@ def main():
                 try:
                     checked(connection, "ROLLBACK", "transaction_cleanup", validate=validate_terminal, allow_when_stopped=True)
                     event("transaction_cleanup_rollback", index=index)
+                except OperationStopped as error:
+                    with lock:
+                        counts["cleanup_not_submitted_statement_budget"] += 1
+                    event("transaction_cleanup_not_submitted", index=index, operation_id=error.operation_id)
                 except Exception as error:
                     with lock:
                         counts["cleanup_failed"] += 1
                     event("transaction_cleanup_failed", index=index, **failure_fields(error))
+            if connection.transaction != "NONE":
+                with lock:
+                    counts["transactions_left_open"] += 1
+                event("transaction_recovery_required", index=index,
+                      **transaction_recovery_report(connection, args.recovery_directory))
             with lock:
                 open_transactions.discard(index)
 
@@ -308,7 +401,8 @@ def main():
             event("retained_query_failure", **failure_fields(error))
 
     event("workload_started", offered_queries_per_second=args.rate, seconds=args.seconds,
-          transaction_seconds=args.transaction_seconds, concurrency_cap=16, client_retries=0)
+          transaction_seconds=args.transaction_seconds, concurrency_cap=16, client_retries=0,
+          max_concurrent_statements=args.max_concurrent_statements)
     extra = [threading.Thread(target=transaction, args=(index,)) for index in range(3)]
     extra.append(threading.Thread(target=retained))
     planned = math.ceil(args.seconds * args.rate)
@@ -357,6 +451,7 @@ def main():
     counts["transaction_threads_not_started"] = sum(thread.ident is None for thread in extra[:3])
     counts["retained_thread_not_started"] = int(extra[3].ident is None)
     event("summary", counts=dict(counts), operation_accounting=accounting,
+          statement_budget=budget.snapshot() if budget is not None else None,
           small_latency_seconds=latency, query_owners=sorted(owners), client_retries=0,
           failed_continuations=len(failed_continuations), recovery_persistence_requested=bool(args.recovery_directory),
           stopped_early=stop.is_set())

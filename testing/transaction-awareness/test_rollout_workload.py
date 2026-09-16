@@ -167,15 +167,26 @@ class OperationLedgerTest(unittest.TestCase):
         self.assertEqual(len(stopped), 1)
         self.assertEqual(stopped[0]["operation_id"], "original-operation")
 
-    def run_stopped_workload(self, interrupt=False):
+    def run_stopped_workload(self, interrupt=False, statement_limit=None):
         ready, retained, lock = threading.Event(), threading.Event(), threading.Lock()
         readers, calls = set(), []
+        active, peak = [0], [0]
         original_wait = StopController.wait
 
         class Client:
             transaction = "NONE"
 
             def query(self, sql, **kwargs):
+                with lock:
+                    active[0] += 1
+                    peak[0] = max(peak[0], active[0])
+                try:
+                    return self.run_query(sql, **kwargs)
+                finally:
+                    with lock:
+                        active[0] -= 1
+
+            def run_query(self, sql, **kwargs):
                 with lock:
                     calls.append(sql)
                     sequence = len(calls)
@@ -209,6 +220,8 @@ class OperationLedgerTest(unittest.TestCase):
 
         args = ["rollout_workload.py", "--server", "https://gateway.example", "--user", "reader", "--catalog", "catalog",
                 "--seconds", "600", "--rate", "4", "--transaction-seconds", "540", "--retained-seconds", "240"]
+        if statement_limit is not None:
+            args += ["--max-concurrent-statements", str(statement_limit)]
         output, started = io.StringIO(), time.monotonic()
         with patch("sys.argv", args), patch.dict("os.environ", {"TX_TRINO_PASSWORD": "private-password"}), \
                 patch("rollout_workload.RolloutClient", side_effect=lambda *args: Client()), \
@@ -223,7 +236,18 @@ class OperationLedgerTest(unittest.TestCase):
         self.assertEqual(summary["operation_accounting"]["submitted"], len(calls))
         self.assertEqual(summary["operation_accounting"]["unresolved"], 0)
         self.assertEqual(summary["counts"]["small_planned"], summary["counts"]["small_offered"] + summary["counts"]["small_not_offered"])
+        if statement_limit is not None:
+            self.assertLessEqual(peak[0], statement_limit)
         return summary, events, calls
+
+    def test_bounded_workload_keeps_three_transactions_and_retained_result(self):
+        summary, events, calls = self.run_stopped_workload(statement_limit=3)
+        self.assertEqual(sum(row["event"] == "transaction_open" for row in events), 3)
+        self.assertTrue(any(row["event"] == "workload_ready_for_rollout" for row in events))
+        self.assertTrue(any(row["event"] == "retained_query_finished" for row in events))
+        self.assertEqual(summary["counts"]["small_offered"], 1)
+        self.assertEqual(summary["statement_budget"]["uncertain_statements"], 1)
+        self.assertTrue(any(row["event"] == "operation_client_wait" for row in events))
 
     def test_first_failure_stops_arrivals_wakes_retention_and_rolls_back_open_transactions(self):
         summary, events, calls = self.run_stopped_workload()
