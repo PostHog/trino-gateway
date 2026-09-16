@@ -18,6 +18,41 @@ pass `--server`, `--user`, `--catalog`, and `--group`. Wait for the JSON event
 Check that all intended Gateway replicas were replaced while the transactions
 were open. The client does not identify which replica handles each request.
 
+### Operation accounting
+
+Each logical statement receives a unique operation identifier. This includes
+transaction BEGIN, each transaction read, COMMIT, ROLLBACK, cleanup ROLLBACK,
+retained-result queries, and offered autocommit queries. Statement success requires
+the expected rows and applicable transaction identity, owner, and terminal-state
+checks. Opening a transaction or retaining a result does not prove that expensive
+query computation remains active during a deployment.
+Independently verify that transactions and retained results overlap the actual
+deployment window. The readiness event records one observation, not continuous
+overlap. This workload does not yet test a long-running CPU query.
+
+The summary reports `submitted = succeeded + failed + unresolved` and
+`offered = submitted + not_submitted_capacity + not_submitted_pending`.
+Submitted means the client invoked the logical statement, not that Trino accepted
+or executed it. Failed means the client observed a failure; backend execution can
+still be uncertain. Unresolved means an invoked operation has no recorded client
+outcome. Pending means an offered operation has not reached the client invocation.
+Capacity drops remain explicit failures of workload coverage.
+
+Zero-error acceptance requires both equations, at least one submitted operation,
+no failures, unresolved operations, capacity drops, or pending offers, and the
+existing transaction, retained-result, and rollout-readiness checks. HTTP page
+counts are separate from logical-statement counts. Operation events contain no
+SQL text, credentials, result rows, or continuation capabilities.
+Successful operations also emit their validated Trino query identifier, page count,
+and row count for reconciliation with the Gateway ledger. Keep all runtime output
+private and outside this repository. Failed continuations retain their original
+operation identifier alongside the opt-in private recovery handle.
+
+The accounting helper supports a separately identified explicit continuation
+resumption linked to its failed original operation. The workload does not perform
+automatic resumption. A successful resumption never changes the original failure
+or makes the original run satisfy zero-error acceptance.
+
 ### Failed continuations
 
 The client preserves the exact last validated continuation in memory when a
