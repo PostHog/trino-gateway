@@ -4,8 +4,10 @@ import contextlib
 import io
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from manual_cutover_smoke import CutoverSmoke
+from manual_cutover_smoke import Admin, CutoverSmoke
+from protocol import Response
 
 
 class Fixture:
@@ -56,7 +58,10 @@ class Fixture:
         if method != "GET":
             if action == "seal" and self.open and name == "blue":
                 assert expected == 409
-                return None
+                public = Response(409, [], b"Transaction routing state rejected the operation: NOT_DRAINED")
+                with patch("manual_cutover_smoke.request", return_value=public):
+                    return Admin("https://gateway.example", "operator", "password", "token").call(
+                        path, method, body, expected, error_contains)
             assert expected == 200
             state["state"] = {"drain": "DRAINING", "seal": "SEALED", "resume": "ACTIVE"}[action]
             state["generation"] += 1
@@ -155,6 +160,21 @@ class ManualCutoverTest(unittest.TestCase):
         self.assertEqual(self.run_fixture(fixture), 1)
         self.assertEqual(fixture.writes, [])
         self.assertFalse(fixture.open)
+
+    def test_public_not_drained_response_is_accepted_but_other_conflicts_are_not(self):
+        admin = Admin("https://gateway.example", "operator", "password", "token")
+        for code in ("NOT_DRAINED", "STALE_GENERATION", "CONFLICT"):
+            with self.subTest(code=code):
+                response = Response(409, [], ("Transaction routing state rejected the operation: " + code).encode())
+                with patch("manual_cutover_smoke.request", return_value=response):
+                    def call():
+                        return admin.call("/backends/blue/seal", "POST", {"generation": 1}, expected=409,
+                                          error_contains="Transaction routing state rejected the operation: NOT_DRAINED")
+                    if code == "NOT_DRAINED":
+                        self.assertIsNone(call())
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "unexpected_administrative_rejection"):
+                            call()
 
 
 if __name__ == "__main__":

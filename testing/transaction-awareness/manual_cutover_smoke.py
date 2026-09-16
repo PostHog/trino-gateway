@@ -210,7 +210,7 @@ class CutoverSmoke:
             require(drained["openTransactions"] >= 1 and not drained["readyToSeal"], "open_transaction_not_blocking_drain")
             self.admin.call("/backends/" + quote(self.args.blue, safe="") + "/seal", "POST",
                             {"generation": drained["generation"]}, expected=409,
-                            error_contains="Backend still has work or is not draining")
+                            error_contains="Transaction routing state rejected the operation: NOT_DRAINED")
             self.unchanged_backend(drained, "DRAINING")
             self.unchanged_route()
             self.emit("seal_blocked_by_open_transaction")
