@@ -642,6 +642,32 @@ class TestTransactionAwarenessService
     }
 
     @Test
+    void unexpectedRoutingFailureHasSafeClassificationWithoutExceptionDetails()
+    {
+        when(store.routeStatus("group")).thenThrow(new IllegalStateException("private connection string and credentials"));
+        assertThatThrownBy(() -> service.routeStatus("group")).isInstanceOfSatisfying(
+                WebApplicationException.class,
+                failure -> {
+                    assertThat(failure.getResponse().getStatus()).isEqualTo(503);
+                    assertThat(failure.getResponse().getHeaderString("X-Trino-Gateway-Error")).isEqualTo("ROUTING_STATE_UNAVAILABLE");
+                    assertThat(failure.getResponse().getEntity().toString()).doesNotContain("private", "connection string", "credentials");
+                });
+    }
+
+    @Test
+    void rejectedRoutingStateHasItsOwnSafeClassification()
+    {
+        when(store.routeStatus("group")).thenThrow(new StoreException(ErrorCode.NOT_ACTIVE, "private backend name"));
+        assertThatThrownBy(() -> service.routeStatus("group")).isInstanceOfSatisfying(
+                WebApplicationException.class,
+                failure -> {
+                    assertThat(failure.getResponse().getStatus()).isEqualTo(503);
+                    assertThat(failure.getResponse().getHeaderString("X-Trino-Gateway-Error")).isEqualTo("ROUTING_STATE_NOT_ACTIVE");
+                    assertThat(failure.getResponse().getEntity().toString()).doesNotContain("private");
+                });
+    }
+
+    @Test
     void deadlineThatExpiresDuringProbeRejectsKnownAdmissionBeforeDispatch()
     {
         service.shutdown();

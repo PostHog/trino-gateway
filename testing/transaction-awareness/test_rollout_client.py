@@ -96,6 +96,23 @@ class RolloutClientTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, '"Server": "redacted"'):
             self.client().query("SELECT 1")
 
+    @patch("rollout_client.request")
+    def test_shutdown_error_code_is_captured_without_body(self, request):
+        request.return_value = Response(503, [("X-Trino-Gateway-Error", "GATEWAY_STOPPING")], b"private details")
+        with self.assertRaises(RuntimeError) as failure:
+            self.client().query("SELECT 1")
+        message = str(failure.exception)
+        self.assertIn('"classification": ["shutdown"]', message)
+        self.assertIn('"X-Trino-Gateway-Error": "GATEWAY_STOPPING"', message)
+        self.assertNotIn("private", message)
+
+    @patch("rollout_client.request")
+    def test_unknown_gateway_error_code_is_not_echoed(self, request):
+        request.return_value = Response(503, [("X-Trino-Gateway-Error", "private-backend")], b"private details")
+        with self.assertRaises(RuntimeError) as failure:
+            self.client().query("SELECT 1")
+        self.assertNotIn("private", str(failure.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

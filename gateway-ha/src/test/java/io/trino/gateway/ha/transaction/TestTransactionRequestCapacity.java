@@ -31,6 +31,33 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestTransactionRequestCapacity
 {
     @Test
+    void overloadAndShutdownHaveDistinctSafeErrorCodes()
+    {
+        TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
+        config.setMaxInFlightRequests(1);
+        config.setCompletionThreads(1);
+        TransactionRequestCapacity capacity = new TransactionRequestCapacity(config);
+        try (TransactionRequestCapacity.Lease ignored = capacity.acquire()) {
+            assertRejectionCode(capacity, "CAPACITY_EXHAUSTED");
+            capacity.shutdown();
+            assertRejectionCode(capacity, "GATEWAY_STOPPING");
+        }
+        assertRejectionCode(capacity, "GATEWAY_STOPPING");
+    }
+
+    private static void assertRejectionCode(TransactionRequestCapacity capacity, String code)
+    {
+        assertThatThrownBy(capacity::acquire).isInstanceOfSatisfying(
+                WebApplicationException.class,
+                failure -> {
+                    assertThat(failure.getResponse().getStatus()).isEqualTo(503);
+                    assertThat(failure.getResponse().getHeaderString("X-Trino-Gateway-Error")).isEqualTo(code);
+                    assertThat(failure.getResponse().getHeaderString("Retry-After")).isEqualTo("1");
+                    assertThat(failure.getResponse().getEntity().toString()).contains("no backend request was dispatched");
+                });
+    }
+
+    @Test
     void completionWorkersAndWaitingBodiesRemainBoundedDuringShutdown()
             throws Exception
     {

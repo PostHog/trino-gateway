@@ -22,6 +22,13 @@ def http_failure(result, method, page):
     }
     categories = [name for name, phrases in markers.items() if any(phrase in body for phrase in phrases)]
     headers = {}
+    known_codes = {"CAPACITY_EXHAUSTED": "transaction_capacity", "GATEWAY_STOPPING": "shutdown",
+                   "ROUTING_STATE_UNAVAILABLE": "routing_state", "ROUTING_STATE_NOT_ACTIVE": "routing_state"}
+    codes = result.values("X-Trino-Gateway-Error")
+    if len(codes) == 1 and codes[0] in known_codes:
+        headers["X-Trino-Gateway-Error"] = codes[0]
+        if known_codes[codes[0]] not in categories:
+            categories.append(known_codes[codes[0]])
     for name in ("Retry-After", "Content-Type", "Server"):
         values = result.values(name)
         if values:

@@ -46,6 +46,7 @@ import jakarta.annotation.PreDestroy;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletRequestWrapper;
 import jakarta.ws.rs.WebApplicationException;
+import jakarta.ws.rs.core.Response;
 import org.jdbi.v3.core.Jdbi;
 
 import java.io.IOException;
@@ -750,10 +751,16 @@ public class TransactionAwarenessService
                 case NOT_ACTIVE -> 503;
                 default -> 409;
             };
-            throw error(status, "Transaction routing state rejected the operation: " + e.code());
+            throw classifiedRoutingError(status, "ROUTING_STATE_" + e.code(), "Transaction routing state rejected the operation: " + e.code());
         }
         catch (RuntimeException e) {
-            throw error(503, "Transaction routing state is unavailable; the request was not reassigned");
+            throw classifiedRoutingError(503, "ROUTING_STATE_UNAVAILABLE", "Transaction routing state is unavailable; the request was not reassigned");
         }
+    }
+
+    private static WebApplicationException classifiedRoutingError(int status, String code, String message)
+    {
+        return new WebApplicationException(Response.status(status).type("text/plain")
+                .header("X-Trino-Gateway-Error", code).entity(message).build());
     }
 }
