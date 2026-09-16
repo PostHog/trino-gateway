@@ -15,6 +15,7 @@ import time
 import uuid
 
 from rollout_client import RolloutClient, RolloutFailure, recovery_report, save_recovery, validate_recovery_directory
+from retained_barrier import ExecutingResultHold, ReleaseMarker, retained_sql, validate_retained_result
 
 
 class OperationStopped(RuntimeError):
@@ -229,6 +230,7 @@ def main():
     parser.add_argument("--rate", type=float, default=4)
     parser.add_argument("--transaction-seconds", type=int, default=180)
     parser.add_argument("--retained-seconds", type=int, default=100)
+    parser.add_argument("--retained-release-file", help="Private external release marker for an executing result hold")
     parser.add_argument("--max-concurrent-statements", type=int,
                         help="Optional shared limit including retained results and transaction control statements")
     parser.add_argument("--recovery-directory", help="Opt in to private capability files in an existing mode-0700 directory")
@@ -241,6 +243,7 @@ def main():
         raise ValueError("Transactions must finish within the traffic window")
     if not 5 <= args.retained_seconds < args.transaction_seconds:
         raise ValueError("Retained results must resume before transactions finish")
+    release_marker = ReleaseMarker(args.retained_release_file) if args.retained_release_file else None
     password = os.environ.get("TX_TRINO_PASSWORD") or getpass.getpass("Trino password: ")
     started, lock, capacity = time.monotonic(), threading.Lock(), threading.Semaphore(16)
     counts, durations, owners = Counter(), [], set()
@@ -383,11 +386,18 @@ def main():
         def validate_retained(result):
             if result["pages"] < 2:
                 raise RuntimeError("no_retained_continuation")
+            if release_marker is not None:
+                validate_retained_result(result)
         try:
-            result = checked(client(), "SELECT n FROM UNNEST(sequence(1, 10000)) AS t(n) ORDER BY n",
-                             "retained", [[n] for n in range(1, 10001)], validate=validate_retained,
-                             deadline_seconds=args.retained_seconds + 60,
-                             first_page_pause=args.retained_seconds, first_page_callback=first_page, first_page_release=stop)
+            query = "SELECT n FROM UNNEST(sequence(1, 10000)) AS t(n) ORDER BY n"
+            expected = [[n] for n in range(1, 10001)]
+            options = {"first_page_pause": args.retained_seconds, "first_page_callback": first_page, "first_page_release": stop}
+            if release_marker is not None:
+                query, expected = retained_sql(), None
+                options = {"executing_page_callback": ExecutingResultHold(release_marker, args.retained_seconds,
+                                                                          stop, event, first_page)}
+            result = checked(client(), query, "retained", expected, validate=validate_retained,
+                             deadline_seconds=args.retained_seconds + 60, **options)
             with lock:
                 counts["retained_query_completed"] += 1
             event("retained_query_finished", duration_seconds=result["duration_seconds"], pages=result["pages"])
@@ -402,7 +412,7 @@ def main():
 
     event("workload_started", offered_queries_per_second=args.rate, seconds=args.seconds,
           transaction_seconds=args.transaction_seconds, concurrency_cap=16, client_retries=0,
-          max_concurrent_statements=args.max_concurrent_statements)
+          max_concurrent_statements=args.max_concurrent_statements, external_retained_release=release_marker is not None)
     extra = [threading.Thread(target=transaction, args=(index,)) for index in range(3)]
     extra.append(threading.Thread(target=retained))
     planned = math.ceil(args.seconds * args.rate)
@@ -439,6 +449,8 @@ def main():
                 break
             except KeyboardInterrupt:
                 stop.request("interrupt")
+        if release_marker is not None:
+            release_marker.close()
     ordered = sorted(durations)
     latency = {"min": min(ordered), "max": max(ordered), "mean": sum(ordered) / len(ordered),
                "p50": ordered[int((len(ordered) - 1) * .50)],

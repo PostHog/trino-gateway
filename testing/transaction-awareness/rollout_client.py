@@ -152,10 +152,11 @@ class RolloutClient:
             raise RuntimeError("continuation_origin")
 
     def query(self, sql, deadline_seconds=60, max_pages=500, first_page_pause=0, first_page_callback=None,
-              first_page_release=None):
+              first_page_release=None, executing_page_callback=None):
         self.pending_continuation = None
         return self._guarded_run(self.server + "/v1/statement", "POST", sql, None, 0,
-                                 deadline_seconds, max_pages, first_page_pause, first_page_callback, first_page_release)
+                                 deadline_seconds, max_pages, first_page_pause, first_page_callback, first_page_release,
+                                 executing_page_callback)
 
     def resume(self, handle, deadline_seconds=60, max_pages=500):
         if handle.context_hash != self.context_hash or self.transaction != handle.transaction_id:
@@ -163,7 +164,7 @@ class RolloutClient:
         self.validate_continuation(handle.next_uri)
         self.pending_continuation = handle
         result = self._guarded_run(handle.next_uri, "GET", None, handle.query_id, handle.previous_rows,
-                                   deadline_seconds, max_pages, 0, None, None)
+                                   deadline_seconds, max_pages, 0, None, None, None)
         return {**result, "resumed": True, "previous_rows": handle.previous_rows}
 
     def _guarded_run(self, *args):
@@ -177,10 +178,11 @@ class RolloutClient:
             raise RolloutFailure(message, self.pending_continuation) from None
 
     def _run(self, url, method, body, identity, previous_rows, deadline_seconds, max_pages,
-             first_page_pause, first_page_callback, first_page_release):
+             first_page_pause, first_page_callback, first_page_release, executing_page_callback):
         started = time.monotonic()
         deadline = started + deadline_seconds
         rows, started_ids = [], set()
+        hold_result = None
         for page in range(max_pages):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -230,10 +232,12 @@ class RolloutClient:
             if not payload.get("nextUri"):
                 self.pending_continuation = None
                 return {"rows": rows, "pages": page + 1, "query_id": identity,
-                        "duration_seconds": time.monotonic() - started}
+                        "duration_seconds": time.monotonic() - started, **(hold_result or {})}
             self.validate_continuation(payload["nextUri"])
             self.pending_continuation = RecoveryHandle(str(uuid.uuid4()), payload["nextUri"], identity,
                                                        self.transaction, self.context_hash, previous_rows + len(rows))
+            if executing_page_callback is not None and hold_result is None:
+                hold_result = executing_page_callback(self, method, url, payload, rows, deadline)
             if page == 0 and first_page_pause:
                 if first_page_callback:
                     first_page_callback()

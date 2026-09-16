@@ -102,7 +102,37 @@ when the initial response was lost. Without private recovery persistence, known
 transaction IDs disappear when the process exits. Recovery still requires the
 original connection identity and credentials, supplied separately by the operator.
 
-### Failed continuations
+### Externally released executing results
+
+Optionally pass `--retained-release-file` with a nonexistent marker in an owned
+mode-0700 directory. This replaces the fixed first-page pause with an executing
+result hold. The query returns 10,000 ordered rows with distinct padded strings.
+The client requires a successful executing GET, a validated nonempty prefix, and
+an advertised executing continuation with unread rows before it announces the hold.
+Receiving only queued status or the final acknowledgement cannot satisfy this gate.
+
+The client sends an immediate HEAD heartbeat to that exact advertised URI, then
+one every 30 seconds while held. It validates the original HTTPS origin and
+retains the original credentials. HEAD does not consume another result page.
+Every heartbeat attempt and success has a separate event; these are HTTP
+requests within the retained statement, not additional SQL operations. No failed
+heartbeat is retried. A failed heartbeat preserves the pending GET capability.
+
+Before restarting, wait for `workload_ready_for_rollout` and the first
+`retained_heartbeat_success`. Independently record both original pod UIDs.
+Create the owned mode-0600 marker only after both originals are absent and their
+replacements are Ready. The marker is an operator assertion, not a Kubernetes
+check performed by the client. Then verify the hold-finished timestamp follows
+that observation and that the client receives all 10,000 expected rows.
+
+`--retained-seconds` limits the hold. A stop or timeout releases normal result
+consumption for cleanup, but fails retained-result acceptance even if that
+consumption succeeds. An expired deadline cannot accept a late marker. The run
+does not claim rollout coverage unless the explicit release and heartbeat gates
+pass. A Kubernetes Deployment restart uses its rolling strategy; it does not
+execute Argo migration hooks or validate the separate blue/green controller.
+
+### Failed continuation recovery
 
 The client preserves the exact last validated continuation in memory when a
 request fails. It does not retry requests, invent continuation tokens, replay
