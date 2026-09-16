@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import stat
 import time
 import uuid
@@ -95,6 +96,28 @@ def recovery_report(error, directory=None):
     return report
 
 
+def client_failure(error):
+    allowed = {"invalid_retained_result_prefix", "retained_barrier_not_released",
+               "retained_row_count_mismatch", "invalid_retained_query_identity",
+               "retained_hold_requires_autocommit", "release_marker_must_be_private_and_owned"}
+    if type(error) is ValueError and len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in allowed:
+        return "client_error:" + error.args[0]
+    return "client_error:" + type(error).__name__
+
+
+def request_failure(error):
+    if not isinstance(error, socket.gaierror):
+        return "request_error:" + type(error).__name__
+    number = error.errno
+    if type(number) is not int or not -(2 ** 31) <= number < 2 ** 31:
+        number = None
+    allowed = ("EAI_AGAIN", "EAI_BADFLAGS", "EAI_FAIL", "EAI_FAMILY", "EAI_MEMORY", "EAI_NONAME",
+               "EAI_SERVICE", "EAI_SOCKTYPE", "EAI_SYSTEM", "EAI_ADDRFAMILY", "EAI_NODATA",
+               "EAI_BADHINTS", "EAI_OVERFLOW", "EAI_PROTOCOL")
+    code = next((name for name in allowed if number is not None and getattr(socket, name, None) == number), "UNKNOWN")
+    return "request_error:gaierror:" + json.dumps({"errno": number, "code": code}, sort_keys=True)
+
+
 def http_failure(result, method, page):
     body = result.body[:4096].decode("utf-8", errors="replace").lower()
     markers = {
@@ -152,10 +175,11 @@ class RolloutClient:
             raise RuntimeError("continuation_origin")
 
     def query(self, sql, deadline_seconds=60, max_pages=500, first_page_pause=0, first_page_callback=None,
-              first_page_release=None):
+              first_page_release=None, executing_page_callback=None):
         self.pending_continuation = None
         return self._guarded_run(self.server + "/v1/statement", "POST", sql, None, 0,
-                                 deadline_seconds, max_pages, first_page_pause, first_page_callback, first_page_release)
+                                 deadline_seconds, max_pages, first_page_pause, first_page_callback, first_page_release,
+                                 executing_page_callback)
 
     def resume(self, handle, deadline_seconds=60, max_pages=500):
         if handle.context_hash != self.context_hash or self.transaction != handle.transaction_id:
@@ -163,7 +187,7 @@ class RolloutClient:
         self.validate_continuation(handle.next_uri)
         self.pending_continuation = handle
         result = self._guarded_run(handle.next_uri, "GET", None, handle.query_id, handle.previous_rows,
-                                   deadline_seconds, max_pages, 0, None, None)
+                                   deadline_seconds, max_pages, 0, None, None, None)
         return {**result, "resumed": True, "previous_rows": handle.previous_rows}
 
     def _guarded_run(self, *args):
@@ -173,14 +197,15 @@ class RolloutClient:
             raise
         except Exception as error:
             known = r"(?:query_deadline|query_identity_changed|missing_query_identity|conflicting_transaction_identity|transaction_identity_changed|continuation_origin|query_page_limit|query_response_invalid|query_error:[A-Z0-9_]{1,100})"
-            message = str(error) if type(error) in (RuntimeError, TimeoutError) and re.fullmatch(known, str(error)) else "client_error:" + type(error).__name__
+            message = str(error) if type(error) in (RuntimeError, TimeoutError) and re.fullmatch(known, str(error)) else client_failure(error)
             raise RolloutFailure(message, self.pending_continuation) from None
 
     def _run(self, url, method, body, identity, previous_rows, deadline_seconds, max_pages,
-             first_page_pause, first_page_callback, first_page_release):
+             first_page_pause, first_page_callback, first_page_release, executing_page_callback):
         started = time.monotonic()
         deadline = started + deadline_seconds
         rows, started_ids = [], set()
+        hold_result = None
         for page in range(max_pages):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -189,7 +214,7 @@ class RolloutClient:
                 result = request(url, method, body, headers=self.headers + [
                     ("X-Trino-Transaction-Id", self.transaction)], timeout=min(30, remaining))
             except Exception as error:
-                raise RolloutFailure("request_error:" + type(error).__name__, self.pending_continuation) from None
+                raise RolloutFailure(request_failure(error), self.pending_continuation) from None
             if result.status != 200:
                 raise RolloutFailure(http_failure(result, method, page), self.pending_continuation)
             payload = result.json()
@@ -230,10 +255,12 @@ class RolloutClient:
             if not payload.get("nextUri"):
                 self.pending_continuation = None
                 return {"rows": rows, "pages": page + 1, "query_id": identity,
-                        "duration_seconds": time.monotonic() - started}
+                        "duration_seconds": time.monotonic() - started, **(hold_result or {})}
             self.validate_continuation(payload["nextUri"])
             self.pending_continuation = RecoveryHandle(str(uuid.uuid4()), payload["nextUri"], identity,
                                                        self.transaction, self.context_hash, previous_rows + len(rows))
+            if executing_page_callback is not None and hold_result is None:
+                hold_result = executing_page_callback(self, method, url, payload, rows, deadline)
             if page == 0 and first_page_pause:
                 if first_page_callback:
                     first_page_callback()
