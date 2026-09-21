@@ -289,8 +289,21 @@ class TestTransactionAwarenessService
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {CONTINUATION, "/v1/statement/executing/partialCancel/" + QUERY + "/1/capability/1", "/v1/query/" + QUERY})
-    void acknowledgedCancellationSettlesOnlyTransport(String path)
+    @ValueSource(strings = {CONTINUATION, "/v1/statement/queued/" + QUERY + "/capability/1", "/v1/query/" + QUERY})
+    void acknowledgedWholeQueryCancellationCompletesQueryWithoutClosingTransaction(String path)
+    {
+        HttpServletRequest request = admitted("DELETE", path, QUERY, TRANSACTION);
+        Admission admission = admission(request);
+        ProxyResponse acknowledged = response(204, "");
+        assertThat(service.recordResponse(request, acknowledged)).isSameAs(acknowledged);
+        verify(store).recordResponse(admission.id(), new ResponseObservation(QUERY, null, false, true, 120));
+        verify(store, never()).rejectAdmission(any());
+        verify(store, never()).markUncertain(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"/v1/statement/executing/partialCancel/" + QUERY + "/1/capability/1", "/v1/query/" + QUERY + "/unknown", CONTINUATION + "/extra"})
+    void acknowledgedPartialOrUnrecognizedCancellationSettlesOnlyTransport(String path)
     {
         HttpServletRequest request = admitted("DELETE", path, QUERY, TRANSACTION);
         Admission admission = admission(request);

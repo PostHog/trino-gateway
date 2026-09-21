@@ -418,7 +418,12 @@ public class TransactionAwarenessService
             boolean completedCancellation = response.statusCode() == 204 && method.equals("DELETE");
             if ((rejectedContinuation || completedCancellation) && admission.queryId() != null &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
-                store.rejectAdmission(admission.id());
+                if (completedCancellation && isWholeQueryCancellation(requestUri, admission.queryId())) {
+                    store.recordResponse(admission.id(), new ResponseObservation(admission.queryId(), null, false, true, config.getTerminalRetentionSeconds()));
+                }
+                else {
+                    store.rejectAdmission(admission.id());
+                }
                 return response;
             }
             if ((response.statusCode() == 401 || response.statusCode() == 403) &&
@@ -495,6 +500,23 @@ public class TransactionAwarenessService
             }
             return response;
         });
+    }
+
+    private boolean isWholeQueryCancellation(String requestUri, String queryId)
+    {
+        if (requestUri.equals("/v1/query/" + queryId)) {
+            return true;
+        }
+        for (String path : statementPaths) {
+            for (String state : List.of("queued", "executing")) {
+                String prefix = path + "/" + state + "/" + queryId + "/";
+                if (requestUri.startsWith(prefix)) {
+                    String[] capability = requestUri.substring(prefix.length()).split("/", -1);
+                    return capability.length == 2 && !capability[0].isEmpty() && capability[1].matches("[0-9]+");
+                }
+            }
+        }
+        return false;
     }
 
     public void requestFailed(HttpServletRequest request)
