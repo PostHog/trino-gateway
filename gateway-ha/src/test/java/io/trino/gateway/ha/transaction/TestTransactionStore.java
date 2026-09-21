@@ -407,6 +407,36 @@ class TestTransactionStore
     }
 
     @Test
+    void acknowledgedQueryCancellationPreservesTransactionAndConcurrentResponse()
+    {
+        Admission start = first.admitNew("blue", "owner", "group");
+        first.recordResponse(start.id(), new ResponseObservation("query", "transaction", false, false, 120));
+        Admission poll = first.admitQuery("query", Optional.of("owner"), Optional.of("transaction"));
+        Admission cancel = second.admitQuery("query", Optional.of("owner"), Optional.of("transaction"));
+        ResponseObservation cancelled = new ResponseObservation("query", null, false, true, 120);
+        second.recordResponse(cancel.id(), cancelled);
+        String retained = retention("query");
+        var status = first.beginDrain("blue");
+        assertThat(status.pendingRequests()).isEqualTo(1);
+        assertThat(status.activeQueries()).isEqualTo(1);
+        assertThat(status.openTransactions()).isEqualTo(1);
+        expect(NOT_DRAINED, () -> second.seal("blue", status.generation()));
+        first.recordResponse(poll.id(), new ResponseObservation("query", null, false, false, 120));
+        assertThat(second.getQuery("query").orElseThrow().terminal()).isTrue();
+        assertThat(retention("query")).isEqualTo(retained);
+        first.recordResponse(cancel.id(), cancelled);
+        assertThat(retention("query")).isEqualTo(retained);
+        assertThat(second.getTransaction("transaction").orElseThrow().state()).isEqualTo("OPEN");
+        database.useHandle(handle -> handle.execute("UPDATE transaction_query SET retain_until = clock_timestamp() - INTERVAL '1 second'"));
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        assertThat(first.drainStatus("blue").activeQueries()).isZero();
+        expect(NOT_DRAINED, () -> second.seal("blue", status.generation()));
+        Admission rollback = second.admitTransaction("transaction", "owner");
+        second.recordResponse(rollback.id(), new ResponseObservation("rollback", null, true, true, 0));
+        assertThat(first.seal("blue", status.generation()).drained()).isTrue();
+    }
+
+    @Test
     void terminalWindowAndLateContinuationFenceSealing()
     {
         Admission admission = first.admitNew("blue", "owner", "group");

@@ -131,6 +131,33 @@ These suites require explicit fault opt-in. Their assertions compare obligation 
 
 `test_partial_cancel` uses the optional fake `partial_cancel` setting to advertise Trino's stage-cancellation URI shape. DELETE must remain on the original owner after cutover. A 204 response settles only that request, not its query or transaction. Unsupported-method checks retain uncertain admissions, so run this suite before the coordinator-restart test. It does not replace cancellation against real Trino.
 
+`test_whole_query_cancel` starts two Gateway processes with a shared disposable
+PostgreSQL instance. It verifies successful whole-query cancellation across
+replicas, concurrent result requests, retained results, late heartbeats, and
+independent transaction completion. Run it with the same `GATEWAY_TEST_JAVA`,
+`GATEWAY_TEST_CLASSPATH`, and `GATEWAY_TEST_PG_BIN` settings as `test_rollout_api`.
+The CI transaction suite includes it.
+
+### Abandoned-query drain recovery
+
+A successful whole-query `DELETE` response with HTTP 204 marks the query terminal
+and retains its binding for `terminalRetentionSeconds`. Existing requests still
+block sealing, and cancellation does not close an explicit transaction. Partial
+stage cancellation, HTTP 404, failed cancellation, and query metadata reporting
+`FINISHED` do not establish that a whole query and its retained results are done.
+
+This change does not automatically clear historical abandoned queries. If a
+client never consumes its final response, the query binding remains a drain
+blocker; it has no unconditional age timeout. After confirming that the query is
+abandoned and obtaining authorization to cancel it, send an owner-authenticated
+`DELETE /v1/query/<query-id>` through Gateway. The request must use the original
+query owner's credentials. Only a successful upstream 204 acknowledges the whole
+query cancellation. Trino also acknowledges this operation when it has already
+forgotten the query. Wait for terminal retention to expire, then inspect the
+remaining requests and transactions before sealing. Do not delete ledger rows or
+infer successful drain from elapsed time. A lost or failed cancellation response
+remains unresolved and requires investigation.
+
 The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields: a URL followed by `null`. Rejection must preserve uncertainty instead of making the query appear complete.
 
 ## Pooled member lifecycle
