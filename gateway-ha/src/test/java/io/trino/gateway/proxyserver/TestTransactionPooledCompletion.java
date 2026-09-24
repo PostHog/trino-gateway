@@ -146,7 +146,7 @@ class TestTransactionPooledCompletion
                 when(info.getStatusCode()).thenReturn(200);
                 when(info.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
                 when(monitor.execute(any(), any())).thenReturn(info);
-                TransactionAwarenessService service = new TransactionAwarenessService(configuration, pooled, mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class));
+                TransactionAwarenessService service = new TransactionAwarenessService(configuration, pooled, mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class), new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
                 HttpClient proxy = mock(HttpClient.class);
                 SettableFuture<ProxyResponse> raw = SettableFuture.create();
                 doReturn(new TestingResponseFuture(raw)).when(proxy).executeAsync(any(), any());

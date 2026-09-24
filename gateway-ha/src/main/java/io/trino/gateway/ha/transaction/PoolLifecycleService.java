@@ -55,14 +55,16 @@ public class PoolLifecycleService
     private final PoolStore store;
     private final TransactionAwarenessService transactions;
     private final GatewayBackendManager backendManager;
+    private final TransactionLifecycleStats lifecycleStats;
 
     @Inject
-    public PoolLifecycleService(HaGatewayConfiguration configuration, Jdbi jdbi, TransactionAwarenessService transactions, GatewayBackendManager backendManager)
+    public PoolLifecycleService(HaGatewayConfiguration configuration, Jdbi jdbi, TransactionAwarenessService transactions, GatewayBackendManager backendManager, TransactionLifecycleStats lifecycleStats)
     {
         this.config = configuration.getTransactionAwareness().getPool();
         this.store = new PoolStore(requireNonNull(jdbi, "jdbi is null"));
         this.transactions = requireNonNull(transactions, "transactions is null");
         this.backendManager = requireNonNull(backendManager, "backendManager is null");
+        this.lifecycleStats = requireNonNull(lifecycleStats, "lifecycleStats is null");
     }
 
     public boolean isEnabled()
@@ -106,7 +108,17 @@ public class PoolLifecycleService
 
     public List<PoolStore.Member> members(String poolId)
     {
-        return guarded(() -> store.members(poolId));
+        return guarded(() -> {
+            List<PoolStore.Member> members = store.members(poolId);
+            members.forEach(member -> lifecycleStats.drain(
+                    member.instanceId(),
+                    member.incarnation(),
+                    member.phase(),
+                    member.pendingRequests(),
+                    member.openTransactions(),
+                    member.activeQueries()));
+            return members;
+        });
     }
 
     public PoolStore.Member member(String poolId, String instanceId)
@@ -116,7 +128,16 @@ public class PoolLifecycleService
 
     public PoolStore.Obligations obligations(String poolId, String instanceId)
     {
-        return guarded(() -> store.obligations(poolId, instanceId).orElseThrow(() -> poolError(404, "POOL_NOT_FOUND", "Unknown pool member")));
+        return guarded(() -> {
+            PoolStore.Obligations obligations = store.obligations(poolId, instanceId).orElseThrow(() -> poolError(404, "POOL_NOT_FOUND", "Unknown pool member"));
+            lifecycleStats.drain(obligations.instanceId(),
+                    obligations.incarnation(),
+                    obligations.phase(),
+                    obligations.pendingRequests(),
+                    obligations.openTransactions(),
+                    obligations.activeQueries());
+            return obligations;
+        });
     }
 
     public PoolStore.FailureReceipt failureReceipt(String poolId, String instanceId)

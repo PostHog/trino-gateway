@@ -78,6 +78,7 @@ import static io.trino.gateway.ha.persistence.DatabaseDeadline.withDeadline;
 import static io.trino.gateway.ha.transaction.TransactionIdentity.canonicalTransactionId;
 import static io.trino.gateway.ha.transaction.TransactionIdentity.error;
 import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 @Singleton
@@ -89,6 +90,7 @@ public class TransactionAwarenessService
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
     private final TransactionAwarenessConfiguration config;
     private final TransactionStore store;
+    private final TransactionLifecycleStats lifecycleStats;
     private final RolloutStore rollouts;
     private final TransactionIdentity identity;
     private final GatewayBackendManager backendManager;
@@ -112,8 +114,9 @@ public class TransactionAwarenessService
     }
 
     @Inject
-    public TransactionAwarenessService(HaGatewayConfiguration configuration, Jdbi jdbi, GatewayBackendManager backendManager, @ForMonitor HttpClient httpClient, RoutingGroupSelector routingGroupSelector)
+    public TransactionAwarenessService(HaGatewayConfiguration configuration, Jdbi jdbi, GatewayBackendManager backendManager, @ForMonitor HttpClient httpClient, RoutingGroupSelector routingGroupSelector, TransactionLifecycleStats lifecycleStats)
     {
+        this.lifecycleStats = requireNonNull(lifecycleStats, "lifecycleStats is null");
         config = configuration.getTransactionAwareness();
         config.validate(configuration.getDataStore(), configuration.getRouting());
         store = new TransactionStore(jdbi);
@@ -419,8 +422,14 @@ public class TransactionAwarenessService
             if ((rejectedContinuation || completedCancellation) && admission.queryId() != null &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
                 boolean forgottenExecutingQuery = rejectedContinuation && method.equals("GET") && isExecutingQueryContinuation(requestUri, admission.queryId());
+                if (rejectedContinuation) {
+                    lifecycleStats.notFoundContinuation(admission, forgottenExecutingQuery);
+                }
                 if ((completedCancellation && isWholeQueryCancellation(requestUri, admission.queryId())) || forgottenExecutingQuery) {
                     store.recordResponse(admission.id(), new ResponseObservation(admission.queryId(), null, false, true, config.getTerminalRetentionSeconds()));
+                    if (completedCancellation) {
+                        lifecycleStats.terminalResult(true);
+                    }
                 }
                 else {
                     store.rejectAdmission(admission.id());
@@ -434,7 +443,7 @@ public class TransactionAwarenessService
                 return response;
             }
             if (response.statusCode() != 200) {
-                store.markUncertain(admission.id());
+                markUncertain(admission, response.statusCode());
                 return response;
             }
             if (method.equals("HEAD")) {
@@ -496,6 +505,9 @@ public class TransactionAwarenessService
                 }
             }
             store.recordResponse(admission.id(), new ResponseObservation(queryId, started.orElse(null), clear, terminal, config.getTerminalRetentionSeconds(), capabilities));
+            if (terminal) {
+                lifecycleStats.terminalResult(false);
+            }
             if (started.isPresent() && !store.getTransaction(started.orElseThrow()).orElseThrow().state().equals("OPEN")) {
                 throw error(409, "A completed transaction cannot be started again by a replayed response");
             }
@@ -542,12 +554,24 @@ public class TransactionAwarenessService
     {
         if (admission != null) {
             try {
-                store.markUncertain(admission.id());
+                markUncertain(admission, 0);
             }
             catch (RuntimeException ignored) {
                 // The durable admission remains a drain blocker when the database is unavailable.
             }
         }
+    }
+
+    private void markUncertain(Admission admission, int status)
+    {
+        try {
+            store.markUncertain(admission.id());
+        }
+        catch (RuntimeException failure) {
+            lifecycleStats.uncertain(admission, status, false);
+            throw failure;
+        }
+        lifecycleStats.uncertain(admission, status, true);
     }
 
     public void requestRejectedBeforeDispatch(HttpServletRequest request)
