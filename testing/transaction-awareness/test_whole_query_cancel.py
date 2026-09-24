@@ -79,7 +79,7 @@ class WholeQueryCancellationContract(unittest.TestCase):
             status = self.status(name)
             self.assertEqual(self.admin(name, "/seal", "POST", {"generation": status["generation"]}, replica=1).status, 200)
 
-    def test_partial_cancel_and_404_do_not_close_query_or_transaction(self):
+    def test_partial_cancel_and_non_get_404_do_not_close_query_or_transaction(self):
         with local_gateways() as fixture:
             self.setup_fixture(*fixture)
             start = self.submit("START TRANSACTION")
@@ -98,7 +98,7 @@ class WholeQueryCancellationContract(unittest.TestCase):
             with backend.state.lock:
                 held_result = backend.state.queries.pop(path)
             try:
-                self.assertEqual(request(uri).status, 404)
+                self.assertEqual(request(uri, "HEAD").status, 404)
                 self.assertEqual(request(uri, "DELETE").status, 404)
             finally:
                 with backend.state.lock:
@@ -118,6 +118,30 @@ class WholeQueryCancellationContract(unittest.TestCase):
             self.assertTrue(any(page.values("X-Trino-Clear-Transaction-Id") for page in rollback))
             self.eventually(lambda: self.status(name)["readyToSeal"])
             self.assertEqual(self.admin(name, "/seal", "POST", {"generation": self.status(name)["generation"]}).status, 200)
+
+    def test_forgotten_executing_query_does_not_close_its_transaction(self):
+        with local_gateways() as fixture:
+            self.setup_fixture(*fixture)
+            started = self.submit("START TRANSACTION")
+            pages = finish(started, self.gateways[1])
+            transaction = next(value for page in pages for value in page.values("X-Trino-Started-Transaction-Id"))
+            initial = self.submit("SELECT 1", transaction)
+            backend = self.owner(initial)
+            name = backend.state.identity
+            uri = through_gateway(initial.json()["nextUri"], self.gateways[1])
+            with backend.state.lock:
+                del backend.state.queries[urlsplit(uri).path]
+            self.assertEqual(request(uri).status, 404)
+            self.assertEqual(self.admin(name, "/drain", "POST").status, 200)
+            self.eventually(lambda: self.status(name)["activeQueries"] == 0)
+            status = self.status(name)
+            self.assertEqual(status["openTransactions"], 1)
+            self.assertFalse(status["readyToSeal"])
+            self.assertEqual(self.admin(name, "/seal", "POST", {"generation": status["generation"]}).status, 409)
+            rollback = finish(self.submit("ROLLBACK", transaction, replica=1), self.gateways[0])
+            self.assertTrue(all(page.status == 200 for page in rollback))
+            self.assertTrue(any(page.values("X-Trino-Clear-Transaction-Id") for page in rollback))
+            self.eventually(lambda: self.status(name)["readyToSeal"])
 
 
 if __name__ == "__main__":

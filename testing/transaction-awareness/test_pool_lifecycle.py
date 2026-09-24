@@ -11,6 +11,7 @@ import json
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 from protocol import finish, request, through_gateway
 from test_rollout_api import local_gateways
@@ -97,6 +98,57 @@ class PoolLifecycleContract(unittest.TestCase):
         data = [page.json()["data"] for page in pages if page.json().get("data")]
         self.assertTrue(data, "A completed statement returned no data")
         return data[-1][0][0]
+
+    def test_forgotten_executing_query_releases_pool_drain_across_replicas(self):
+        with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            epoch = 3
+            self.successful(self.configure(api, epoch, "configure"))
+            members = {}
+            for backend in backends:
+                member = self.bootstrap(api, backend, epoch, "op-boot-" + backend.state.identity)
+                members[member["instanceId"]] = member
+            initial = request(gateways[0] + "/v1/statement", "POST", "SELECT 1", CREDENTIAL)
+            self.assertEqual(initial.status, 200, initial.body)
+            query_id = initial.json()["id"]
+            backend = next(item for item in backends if query_id.endswith("_" + item.state.coordinator_id))
+            name = backend.state.identity
+            path = "/members/" + name
+            drained = self.successful(api(path + "/drain", "POST", {
+                "operationId": "op-drain", "stepId": "drain", "controllerEpoch": epoch,
+                "ownerIdentity": self.OWNER, "expectedGeneration": members[name]["generation"]}, replica=1))
+            self.assertEqual(drained["phase"], "DRAINING")
+            continuation = through_gateway(initial.json()["nextUri"], gateways[1])
+            seal_body = {
+                "operationId": "op-drain", "stepId": "seal", "controllerEpoch": epoch,
+                "ownerIdentity": self.OWNER, "expectedGeneration": drained["generation"]}
+            backend.state.poll_release.clear()
+            with backend.state.lock:
+                backend.state.config["hold_poll"] = True
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(request, through_gateway(continuation, gateways[0]))
+                try:
+                    self.assertTrue(backend.state.poll_entered.wait(5), "Concurrent poll did not capture its response")
+                    self.assertEqual(self.successful(api(path + "/obligations"))["pendingRequests"], 1)
+                    with backend.state.lock:
+                        del backend.state.queries[urlsplit(continuation).path]
+                    self.assertEqual(request(continuation).status, 404)
+                    self.assertEqual(self.successful(api(path + "/obligations"))["activeQueries"], 1)
+                    deadline = time.monotonic() + 5
+                    while self.successful(api(path + "/obligations"))["activeQueries"]:
+                        self.assertLess(time.monotonic(), deadline, "Forgotten query still blocks pool drain")
+                        time.sleep(0.05)
+                    self.assertEqual(self.successful(api(path + "/obligations"))["pendingRequests"], 1)
+                    self.assertEqual(api(path + "/seal", "POST", seal_body).status, 409)
+                finally:
+                    backend.state.poll_release.set()
+                self.assertEqual(pending.result(timeout=10).status, 200)
+            deadline = time.monotonic() + 5
+            while self.successful(api(path + "/obligations"))["activeQueries"]:
+                self.assertLess(time.monotonic(), deadline, "Late poll retention did not expire")
+                time.sleep(0.05)
+            sealed = self.successful(api(path + "/seal", "POST", seal_body, replica=0))
+            self.assertEqual(sealed["phase"], "SEALED")
 
     def test_bootstrap_surge_floor_and_leader_takeover_across_replicas(self):
         with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS) as (gateways, backends, token):

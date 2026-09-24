@@ -418,7 +418,8 @@ public class TransactionAwarenessService
             boolean completedCancellation = response.statusCode() == 204 && method.equals("DELETE");
             if ((rejectedContinuation || completedCancellation) && admission.queryId() != null &&
                     responseHeader(response, "X-Trino-Started-Transaction-Id").isEmpty() && responseHeader(response, "X-Trino-Clear-Transaction-Id").isEmpty()) {
-                if (completedCancellation && isWholeQueryCancellation(requestUri, admission.queryId())) {
+                boolean forgottenExecutingQuery = rejectedContinuation && method.equals("GET") && isExecutingQueryContinuation(requestUri, admission.queryId());
+                if ((completedCancellation && isWholeQueryCancellation(requestUri, admission.queryId())) || forgottenExecutingQuery) {
                     store.recordResponse(admission.id(), new ResponseObservation(admission.queryId(), null, false, true, config.getTerminalRetentionSeconds()));
                 }
                 else {
@@ -517,6 +518,14 @@ public class TransactionAwarenessService
             }
         }
         return false;
+    }
+
+    private boolean isExecutingQueryContinuation(String requestUri, String queryId)
+    {
+        // Admission verifies the stored capability before dispatch. A missing issued executing
+        // result ends this query obligation; HEAD and queued requests do not provide this guarantee.
+        return statementPaths.stream().anyMatch(path -> requestUri.startsWith(path + "/executing/" + queryId + "/")) &&
+                isWholeQueryCancellation(requestUri, queryId);
     }
 
     public void requestFailed(HttpServletRequest request)
