@@ -135,6 +135,8 @@ public class BaseApp
         jaxrsBinder(binder).bind(AuthorizedExceptionMapper.class);
         binder.bind(ProxyHandlerStats.class).in(Scopes.SINGLETON);
         binder.bind(io.trino.gateway.ha.transaction.TransactionAwarenessService.class).in(Scopes.SINGLETON);
+        binder.bind(io.trino.gateway.ha.transaction.TransactionLifecycleStats.class).in(Scopes.SINGLETON);
+        newExporter(binder).export(io.trino.gateway.ha.transaction.TransactionLifecycleStats.class).withGeneratedName();
         binder.bind(io.trino.gateway.ha.transaction.PoolLifecycleService.class).in(Scopes.SINGLETON);
         binder.bind(io.trino.gateway.ha.clustermonitor.PoolMonitoringScope.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ProxyHandlerStats.class).withGeneratedName();

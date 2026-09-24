@@ -159,6 +159,39 @@ scrape_configs:
         - gateway1.example.com:8080
 ```
 
+## Transaction lifecycle diagnostics
+
+With transaction-aware routing, the existing `/metrics` endpoint exports fixed-name
+counters under `io_trino_gateway_ha_transaction_name_TransactionLifecycleStats_`:
+
+| Counter suffix | Observation |
+| --- | --- |
+| `TerminalResults` | Successful terminal JSON-result ledger recording calls. |
+| `CancellationAcknowledgements` | Successful whole-query cancellation recording calls. |
+| `NotFoundContinuations` | Continuation HTTP 404 responses without transaction lifecycle headers. |
+| `ExecutingNotFoundResponses` | The subset received for exact admitted executing-result GET requests. |
+| `MarkUncertainSuccesses` | Calls to mark an admission uncertain that returned successfully. |
+| `MarkUncertainFailures` | Calls to mark an admission uncertain that failed. |
+| `BlockedDrainObservations` | Draining members with nonzero obligations observed in member-list or obligation reads. |
+
+These counters describe observations on each Gateway process, not distinct queries,
+current obligations, or completed state transitions. Retries and repeated polls can
+increment them again. Marking an already-complete admission uncertain is a successful
+no-op. Counters reset when the process restarts. Use the pool obligation API for
+current authoritative counts; never use these counters to authorize retirement.
+
+Diagnostic logs use the fixed reasons `EXECUTING_RESULT_NOT_FOUND`,
+`MARK_UNCERTAIN_SUCCEEDED`, `MARK_UNCERTAIN_FAILED`, and `POOL_DRAIN_BLOCKED`.
+Each reason has an independent limit of one log per 30 seconds per process; counters
+remain unsampled. Logs include admission/query/incarnation identifiers or member
+obligation counts, but not SQL, credentials, transaction identifiers, result
+capabilities, backend URLs, response bodies, or exception messages. A status of zero
+means the failure handler did not have an upstream HTTP status. Ordinary terminal
+responses and cancellation acknowledgements update counters without success logs.
+
+An executing-result 404 observation does not claim that query recovery occurred.
+This instrumentation does not add a reconciler or change any drain decision.
+
 ## Trino Gateway health endpoints
 
 Trino Gateway provides two API endpoints to indicate the current status of the server:
