@@ -13,6 +13,9 @@
  */
 package io.trino.gateway.ha.transaction;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.trino.gateway.ha.config.HaGatewayConfiguration;
+import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.transaction.PoolStore.Guard;
 import io.trino.gateway.ha.transaction.PoolStore.Member;
 import io.trino.gateway.ha.transaction.PoolStore.PoolException;
@@ -32,6 +35,7 @@ import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -65,6 +69,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 import static org.junit.jupiter.api.parallel.ExecutionMode.SAME_THREAD;
+import static org.mockito.Mockito.mock;
 
 /**
  * Pooled member lifecycle contract against a real PostgreSQL database.
@@ -519,6 +524,217 @@ class TestPoolStore
     // --------------------------------------------------------------------------------------------
     // Authoritative principal mapping
     // --------------------------------------------------------------------------------------------
+
+    @Test
+    void serviceGrantsUsePreviouslyPublishedRootBinding()
+    {
+        first.configurePool(POOL, guard("op-service-gate", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", true), true);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        first.publishTenantPrincipals(POOL, "org-unrelated", guard("op-root-binding", "principals"), "rev-1", List.of("warehouse-one", "warehouse-one.svc_reporter"));
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-root-publication", "open"), "pub-root", "org-unrelated", "rev-1", membership, PLAN_HASH);
+        receiptFor("pub-root", "i-1", "rev-1");
+        receiptFor("pub-root", "i-2", "rev-1");
+        receiptFor("pub-root", "i-3", "rev-1");
+        first.commitPublication(POOL, "pub-root", guard("op-root-publication", "commit"), membership);
+        assertThatCode(() -> transactions.admitPooledMember(
+                POOL,
+                "backend-i-1",
+                "owner",
+                new TransactionStore.TenantGate("warehouse-one.svc_" + "a".repeat(24)))).doesNotThrowAnyException();
+    }
+
+    private record LegacyTenantAdmission(
+            int protocolVersion,
+            String poolId,
+            String tenant,
+            String state,
+            String admittedRevision,
+            String publicationId,
+            String principalRevision,
+            int principalCount,
+            String principalsHash,
+            List<String> principals,
+            boolean replayed) {}
+
+    @Test
+    void recordedPrincipalPublicationCanBeDecodedByAnOldReplica()
+            throws Exception
+    {
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-legacy-step", "principals"), "rev-1", List.of("warehouse-one"));
+        String recorded = database.withHandle(handle -> handle.createQuery("SELECT result::text FROM pool_operation WHERE operation_id = 'op-legacy-step'").mapTo(String.class).one());
+        LegacyTenantAdmission decoded = new ObjectMapper().readValue(recorded, LegacyTenantAdmission.class);
+        assertThat(decoded.principalRevision()).isEqualTo("rev-1");
+        assertThat(second.publishTenantPrincipals(POOL, "org-1", guard("op-legacy-step", "principals"), "rev-1", List.of("warehouse-one")).replayed()).isTrue();
+    }
+
+    @Test
+    void serviceCredentialsUseExistingPublicationAndAdmission()
+            throws Exception
+    {
+        first.configurePool(POOL, guard("op-service-gate", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", true), true);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        PoolLifecycleService service = new PoolLifecycleService(
+                new HaGatewayConfiguration(),
+                database,
+                mock(TransactionAwarenessService.class),
+                mock(GatewayBackendManager.class),
+                mock(TransactionLifecycleStats.class));
+        ObjectMapper json = new ObjectMapper();
+        PoolStore.TenantAdmission published = service.publishTenantPrincipals(POOL, "org-1", json.readTree(
+                """
+                {"operationId":"op-service-publish","stepId":"principals","controllerEpoch":7,
+                 "revision":"rev-1","principals":["warehouse-one","warehouse-one.svc_reporter"]}
+                """));
+        assertThat(json.valueToTree(published).has("service_principal_prefix")).isFalse();
+        assertThatThrownBy(() -> transactions.admitPooledMember(
+                POOL,
+                "backend-i-1",
+                "owner",
+                new TransactionStore.TenantGate("warehouse-one.svc_" + "a".repeat(24))))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-service-publication", "open"), "pub-service", "org-1", "rev-1", membership, PLAN_HASH);
+        receiptFor("pub-service", "i-1", "rev-1");
+        receiptFor("pub-service", "i-2", "rev-1");
+        receiptFor("pub-service", "i-3", "rev-1");
+        first.commitPublication(POOL, "pub-service", guard("op-service-publication", "commit"), membership);
+        assertThatCode(() -> transactions.admitPooledMember(
+                POOL,
+                "backend-i-1",
+                "owner",
+                new TransactionStore.TenantGate("warehouse-one.svc_" + "a".repeat(24)))).doesNotThrowAnyException();
+        assertThatCode(() -> transactions.admitPooledMember(
+                POOL, "backend-i-1", "owner", new TransactionStore.TenantGate("warehouse-one.svc_reporter"))).doesNotThrowAnyException();
+        for (String principal : List.of(
+                "warehouse-one.svc_" + "a".repeat(23),
+                "warehouse-one.svc_" + "a".repeat(25),
+                "warehouse-one.svc_" + "A".repeat(24),
+                "warehouse-one.alice",
+                "warehouse-two.svc_" + "a".repeat(24),
+                "svc_" + "a".repeat(24))) {
+            assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner", new TransactionStore.TenantGate(principal)))
+                    .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+        }
+        second.revokeTenant(POOL, "org-1", guard("op-service-revoke", "revoke"), "test revocation");
+        assertThatThrownBy(() -> transactions.admitPooledMember(
+                POOL,
+                "backend-i-1",
+                "owner",
+                new TransactionStore.TenantGate("warehouse-one.svc_" + "a".repeat(24))))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+    }
+
+    @Test
+    void rootReplacementAndReplayKeepOneAtomicTenantMapping()
+    {
+        first.configurePool(POOL, guard("op-root-gate", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", true), true);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-service-1", "publish"), "rev-1", List.of("warehouse-one"));
+        assertThat(second.publishTenantPrincipals(POOL, "org-1", guard("op-service-1", "publish"), "rev-1", List.of("warehouse-one")).replayed()).isTrue();
+        admitServiceTenant("org-1", "rev-1");
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-service-2", "publish"), "rev-2", List.of("warehouse-new"));
+        assertThat(second.tenantAdmission(POOL, "org-1").orElseThrow().principals()).containsExactly("warehouse-new");
+        assertThatThrownBy(() -> transactions.admitPooledMember(
+                POOL, "backend-i-1", "owner", new TransactionStore.TenantGate("warehouse-one.svc_" + "a".repeat(24))))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+    }
+
+    @Test
+    void serviceRootConflictsWithExactGrantMappingInEitherPublicationOrder()
+    {
+        first.configurePool(POOL, guard("op-conflict-gate", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", true), true);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        String grant = "warehouse-one.svc_" + "a".repeat(24);
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-root-1", "publish"), "rev-1", List.of("warehouse-one"));
+        second.publishTenantPrincipals(POOL, "org-2", guard("op-exact-1", "publish"), "rev-1", List.of(grant));
+        admitServiceTenant("org-1", "rev-1");
+        admitServiceTenant("org-2", "rev-1");
+        assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner", new TransactionStore.TenantGate(grant)))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+        String otherGrant = "warehouse-two.svc_" + "b".repeat(24);
+        second.publishTenantPrincipals(POOL, "org-3", guard("op-exact-2", "publish"), "rev-1", List.of(otherGrant));
+        first.publishTenantPrincipals(POOL, "org-4", guard("op-root-2", "publish"), "rev-1", List.of("warehouse-two"));
+        admitServiceTenant("org-3", "rev-1");
+        admitServiceTenant("org-4", "rev-1");
+        assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner", new TransactionStore.TenantGate(otherGrant)))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+    }
+
+    private void admitServiceTenant(String tenant, String revision)
+    {
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        String publication = "pub-" + tenant;
+        first.openPublication(POOL, guard("op-" + publication, "open"), publication, tenant, revision, membership, PLAN_HASH);
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            first.recordPublicationReceipt(
+                    POOL,
+                    publication,
+                    guard("op-" + publication, "receipt-" + instance),
+                    instance,
+                    "pod-" + instance,
+                    "boot-" + instance,
+                    revision,
+                    AUTH_FINGERPRINT);
+        }
+        first.commitPublication(POOL, publication, guard("op-" + publication, "commit"), membership);
+    }
+
+    @Test
+    void concurrentRootClaimsCannotAdmitTwoTenants()
+            throws Exception
+    {
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            CountDownLatch start = new CountDownLatch(1);
+            var firstClaim = executor.submit(() -> claimRoot(first, "org-1", start));
+            var secondClaim = executor.submit(() -> claimRoot(second, "org-2", start));
+            start.countDown();
+            assertThat(List.of(firstClaim.get(10, TimeUnit.SECONDS), secondClaim.get(10, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
+        }
+    }
+
+    private boolean claimRoot(PoolStore store, String tenant, CountDownLatch start)
+            throws InterruptedException
+    {
+        start.await();
+        try {
+            store.publishTenantPrincipals(POOL, tenant, guard("op-service-" + tenant, "publish"), "rev-1", List.of("warehouse-one"));
+            return true;
+        }
+        catch (PoolException e) {
+            assertThat(e.code()).isEqualTo(POOL_PRINCIPAL_CONFLICT);
+            return false;
+        }
+    }
+
+    @Test
+    void serviceCredentialsRequireTheBoundedDatabaseNameGrammar()
+    {
+        first.configurePool(POOL, guard("op-grammar-gate", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", true), true);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        List<String> invalidRoots = List.of("Warehouse", "-warehouse", "warehouse-", "warehouse.child", "warehouse_1", "a".repeat(64));
+        List<String> roots = new ArrayList<>(invalidRoots);
+        roots.add("1");
+        first.publishTenantPrincipals(POOL, "org-1", guard("op-grammar", "publish"), "rev-1", roots);
+        admitServiceTenant("org-1", "rev-1");
+        for (String root : invalidRoots) {
+            assertThatThrownBy(() -> transactions.admitPooledMember(
+                    POOL, "backend-i-1", "owner", new TransactionStore.TenantGate(root + ".svc_" + "a".repeat(24))))
+                    .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.TENANT_NOT_ADMITTED));
+        }
+        assertThatCode(() -> transactions.admitPooledMember(
+                POOL, "backend-i-1", "owner", new TransactionStore.TenantGate("1.svc_" + "a".repeat(24)))).doesNotThrowAnyException();
+    }
 
     @Test
     void aTenantsPrincipalSetIsPublishedWholeAndReadBack()

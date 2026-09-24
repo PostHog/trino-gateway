@@ -341,7 +341,12 @@ public class PoolLifecycleService
             }
             names.add(principal.asText());
         });
-        return guarded(() -> store.publishTenantPrincipals(poolId, tenant, guard(body), text(body, "revision"), List.copyOf(names)));
+        return guarded(() -> store.publishTenantPrincipals(
+                poolId,
+                tenant,
+                guard(body),
+                text(body, "revision"),
+                List.copyOf(names)));
     }
 
     public PoolStore.TenantAdmission revokeTenant(String poolId, String tenant, JsonNode body)
