@@ -196,6 +196,37 @@ class TestTransactionAwarenessService
         verify(store).recordResponse(admission.id(), new ResponseObservation(QUERY, null, false, false, 120));
     }
 
+    @Test
+    void forgottenExecutingQuerySettlesQueryWithoutClosingTransaction()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        ProxyResponse forgotten = response(404, "Query not found");
+        assertThat(service.recordResponse(request, forgotten)).isSameAs(forgotten);
+        verify(store).recordResponse(admission(request).id(), new ResponseObservation(QUERY, null, false, true, 120));
+        verify(store, never()).markUncertain(any());
+        verify(store, never()).rejectAdmission(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {CONTINUATION, "/v1/query/" + QUERY, "/v1/query/" + QUERY + "/unknown"})
+    void goneResponsesCannotCompleteQuery(String path)
+    {
+        HttpServletRequest request = admitted("GET", path, QUERY, TRANSACTION);
+        service.recordResponse(request, response(410, "Gone"));
+        verify(store).markUncertain(admission(request).id());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"X-Trino-Started-Transaction-Id", "X-Trino-Clear-Transaction-Id"})
+    void goneMetadataWithLifecycleSignalRemainsUncertain(String header)
+    {
+        HttpServletRequest request = admitted("GET", "/v1/query/" + QUERY, QUERY, TRANSACTION);
+        service.recordResponse(request, response(410, "Gone", header, TRANSACTION));
+        verify(store).markUncertain(admission(request).id());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"X-Trino-Started-Transaction-Id", "X-Trino-Clear-Transaction-Id"})
     void metadataCannotForwardUnrecordedLifecycleHeaders(String header)
@@ -276,7 +307,7 @@ class TestTransactionAwarenessService
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"GET", "HEAD", "DELETE"})
+    @ValueSource(strings = {"HEAD", "DELETE"})
     void rejectedCapabilitySettlesTransportWithoutCompletingQuery(String method)
     {
         HttpServletRequest request = admitted(method, CONTINUATION, QUERY, TRANSACTION);
@@ -285,6 +316,21 @@ class TestTransactionAwarenessService
         assertThat(service.recordResponse(request, rejected)).isSameAs(rejected);
         verify(store).rejectAdmission(admission.id());
         verify(store, never()).markUncertain(any());
+        verify(store, never()).recordResponse(any(), any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "/v1/statement/queued/" + QUERY + "/capability/1",
+            "/v1/statement/executing/partialCancel/" + QUERY + "/1/capability/1",
+            "/v1/query/" + QUERY,
+            CONTINUATION + "/extra",
+    })
+    void notFoundOutsideExactExecutingCapabilityCannotCompleteQuery(String path)
+    {
+        HttpServletRequest request = admitted("GET", path, QUERY, TRANSACTION);
+        service.recordResponse(request, response(404, "Query not found"));
+        verify(store).rejectAdmission(admission(request).id());
         verify(store, never()).recordResponse(any(), any());
     }
 

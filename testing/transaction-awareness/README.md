@@ -143,8 +143,20 @@ The CI transaction suite includes it.
 A successful whole-query `DELETE` response with HTTP 204 marks the query terminal
 and retains its binding for `terminalRetentionSeconds`. Existing requests still
 block sealing, and cancellation does not close an explicit transaction. Partial
-stage cancellation, HTTP 404, failed cancellation, and query metadata reporting
+stage cancellation, failed cancellation, and query metadata reporting
 `FINISHED` do not establish that a whole query and its retained results are done.
+
+An HTTP 404 from a routed `GET` to an exact, previously issued executing-result
+capability also marks that query terminal. Gateway verifies the capability and
+coordinator identity before dispatch. The binding remains retained for
+`terminalRetentionSeconds`, and existing admissions and explicit transactions
+still block drain. The response remains HTTP 404: this releases an unavailable
+query's drain obligation; it does not recover the query or its results.
+
+This exception does not apply to `HEAD`, queued results, partial cancellation,
+metadata requests, or stale-result HTTP 410 responses. Those responses do not
+prove that executing results are unavailable. HTTP 404 from `DELETE` also keeps
+its existing conservative behavior.
 
 This change does not automatically clear historical abandoned queries. If a
 client never consumes its final response, the query binding remains a drain

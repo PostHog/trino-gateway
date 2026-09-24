@@ -16,6 +16,7 @@ class State:
         self.lock = threading.RLock()
         self.release = threading.Event()
         self.poll_release = threading.Event()
+        self.poll_entered = threading.Event()
         self.release.set()
         self.reset()
 
@@ -33,6 +34,7 @@ class State:
                            "hold_start": False, "hold_poll": False}
             self.release.set()
             self.poll_release.set()
+            self.poll_entered.clear()
 
 
 def make_server(host="127.0.0.1", port=0, identity="blue"):
@@ -118,9 +120,11 @@ def make_server(host="127.0.0.1", port=0, identity="blue"):
             if response is None:
                 self.respond(404, {"error": "Unknown query"})
                 return
-            if config.get("hold_poll") and not state.poll_release.wait(30):
-                self.respond(503, {"error": "Test poll barrier timed out"})
-                return
+            if config.get("hold_poll"):
+                state.poll_entered.set()
+                if not state.poll_release.wait(30):
+                    self.respond(503, {"error": "Test poll barrier timed out"})
+                    return
             if config.get("drop_poll_response"):
                 self.disconnect()
                 return
