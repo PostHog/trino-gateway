@@ -45,6 +45,26 @@ class WholeQueryCancellationContract(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, "Expected obligation transition did not occur")
             time.sleep(0.05)
 
+    def test_lifecycle_metrics_are_exported_by_the_handling_replica(self):
+        with local_gateways() as fixture:
+            self.setup_fixture(*fixture)
+            initial = self.submit("SELECT 1")
+            backend = self.owner(initial)
+            uri = through_gateway(initial.json()["nextUri"], self.gateways[1])
+            with backend.state.lock:
+                del backend.state.queries[urlsplit(uri).path]
+            self.assertEqual(request(uri).status, 404)
+            for replica, expected in ((0, 0), (1, 1)):
+                metrics = request(self.gateways[replica] + "/metrics")
+                self.assertEqual(metrics.status, 200, metrics.body)
+                samples = [line for line in metrics.body.decode().splitlines()
+                           if not line.startswith("#") and "TransactionLifecycleStats" in line
+                           and "ExecutingNotFoundResponses" in line]
+                self.assertEqual(len(samples), 1, samples)
+                self.assertEqual(float(samples[0].split()[-1]), expected)
+                self.assertNotIn(initial.json()["id"], samples[0])
+                self.assertNotIn("capability", samples[0])
+
     def test_cancel_keeps_inflight_poll_and_retention_until_safe_seal(self):
         with local_gateways() as fixture:
             self.setup_fixture(*fixture)

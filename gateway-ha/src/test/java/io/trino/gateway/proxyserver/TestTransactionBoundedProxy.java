@@ -104,7 +104,7 @@ class TestTransactionBoundedProxy
         when(info.getStatusCode()).thenReturn(200);
         when(info.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
         when(monitor.execute(any(), any())).thenReturn(info);
-        service = new TransactionAwarenessService(config, mock(Jdbi.class), mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class));
+        service = new TransactionAwarenessService(config, mock(Jdbi.class), mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class), new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
         store = construction.constructed().getFirst();
         when(store.getQuery(QUERY)).thenReturn(Optional.of(new QueryBinding(QUERY, "owner", BACKEND, null, false)));
         when(store.admitQuery(anyString(), any(), any(), any())).thenAnswer(_ -> new Admission(UUID.randomUUID(), BACKEND, "owner", null, QUERY));
