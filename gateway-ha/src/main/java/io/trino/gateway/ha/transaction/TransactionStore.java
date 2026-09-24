@@ -23,11 +23,13 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 import static java.util.Objects.requireNonNull;
 
 public final class TransactionStore
 {
+    private static final Pattern SERVICE_PRINCIPAL = Pattern.compile("[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_[0-9a-f]{24}");
     private static final int QUERY_LOCK_NAMESPACE = 0x54585152;
     private static final int TRANSACTION_LOCK_NAMESPACE = 0x54585452;
 
@@ -735,21 +737,31 @@ public final class TransactionStore
             return;
         }
         check(gate != null && gate.principal() != null, ErrorCode.TENANT_NOT_ADMITTED, "The request presents no credential to restrict");
-        // A service grant resolves only through a controller-published namespace. The prefix never identifies a tenant by itself.
+        // A service grant uses the already-published root binding; the database name never identifies a tenant by itself.
         List<String> states = handle.createQuery(
                         """
                         WITH tenants AS (
                           SELECT tenant FROM pool_tenant_principal WHERE pool_id = :pool AND principal = :principal
                           UNION
-                          SELECT tenant FROM pool_tenant_service_principal WHERE pool_id = :pool AND service_principal_prefix = :prefix
+                          SELECT tenant FROM pool_tenant_principal WHERE pool_id = :pool AND principal = :serviceRoot
                         )
                         SELECT coalesce(a.state, 'PENDING') AS state
                         FROM tenants t
                         LEFT JOIN pool_tenant_admission a ON a.pool_id = :pool AND a.tenant = t.tenant
                         """)
-                .bind("pool", poolId).bind("principal", gate.principal()).bind("prefix", PoolStore.servicePrincipalPrefix(gate.principal()))
+                .bind("pool", poolId).bind("principal", gate.principal())
+                .bind("serviceRoot", serviceCredentialRootPrincipal(gate.principal()))
                 .mapTo(String.class).list();
         check(states.size() == 1 && states.getFirst().equals("ADMITTED"), ErrorCode.TENANT_NOT_ADMITTED, "The request's tenant is not admitted");
+    }
+
+    @Nullable
+    private static String serviceCredentialRootPrincipal(String principal)
+    {
+        if (principal.length() <= 92 && SERVICE_PRINCIPAL.matcher(principal).matches()) {
+            return principal.substring(0, principal.indexOf('.'));
+        }
+        return null;
     }
 
     static boolean isPooledMode(Handle handle, String routingGroup)
