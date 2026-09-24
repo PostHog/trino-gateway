@@ -18,6 +18,8 @@ import io.trino.gateway.ha.config.DataStoreConfiguration;
 import org.flywaydb.core.Flyway;
 import org.flywaydb.core.api.output.MigrateResult;
 
+import java.util.Map;
+
 public class FlywayMigration
 {
     private static final Logger log = Logger.get(FlywayMigration.class);
@@ -50,6 +52,10 @@ public class FlywayMigration
                 .locations(getLocation(config.getJdbcUrl()))
                 .baselineOnMigrate(true)
                 .baselineVersion("0")
+                // A transaction-level lock prevents concurrent indexes from finishing their snapshot wait.
+                .configuration(config.getJdbcUrl().startsWith("jdbc:postgresql:")
+                        ? Map.of("flyway.postgresql.transactional.lock", "false")
+                        : Map.of())
                 .load();
         flyway.repair();
         MigrateResult migrations = flyway.migrate();
