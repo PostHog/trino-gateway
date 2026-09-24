@@ -317,7 +317,7 @@ public class PoolLifecycleService
     {
         return guarded(() -> store.tenantAdmission(poolId, tenant)
                 .orElseGet(() -> new PoolStore.TenantAdmission(
-                        PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, null, 0, null, List.of(), false)));
+                        PoolStore.PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, null, 0, null, List.of(), null, false)));
     }
 
     /**
@@ -341,7 +341,17 @@ public class PoolLifecycleService
             }
             names.add(principal.asText());
         });
-        return guarded(() -> store.publishTenantPrincipals(poolId, tenant, guard(body), text(body, "revision"), List.copyOf(names)));
+        JsonNode prefix = body.get("service_principal_prefix");
+        if (prefix != null && !prefix.isNull() && !prefix.isTextual()) {
+            throw poolError(400, "POOL_VALIDATION", "service_principal_prefix must be a string");
+        }
+        return guarded(() -> store.publishTenantPrincipals(
+                poolId,
+                tenant,
+                guard(body),
+                text(body, "revision"),
+                List.copyOf(names),
+                prefix == null || prefix.isNull() ? null : prefix.asText()));
     }
 
     public PoolStore.TenantAdmission revokeTenant(String poolId, String tenant, JsonNode body)

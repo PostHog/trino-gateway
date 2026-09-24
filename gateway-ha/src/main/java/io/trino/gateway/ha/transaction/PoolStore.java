@@ -14,6 +14,7 @@
 package io.trino.gateway.ha.transaction;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -33,6 +34,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_APIMODE;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_EVIDENCE_REQUIRED;
@@ -69,6 +71,7 @@ public final class PoolStore
 
     private static final ObjectMapper JSON = new ObjectMapper().disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
     private static final int MAX_RESULT_BYTES = 65536;
+    private static final Pattern SERVICE_PRINCIPAL = Pattern.compile("[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_[0-9a-f]{24}");
 
     /**
      * Phases that occupy a live compute slot.
@@ -344,6 +347,7 @@ public final class PoolStore
              * {@code principalsHash} instead and leaves this empty.
              */
             List<String> principals,
+            @JsonProperty("service_principal_prefix") @Nullable String servicePrincipalPrefix,
             boolean replayed)
     {
         public TenantAdmission
@@ -904,7 +908,14 @@ public final class PoolStore
      */
     public TenantAdmission publishTenantPrincipals(String poolId, String tenant, Guard guard, String revision, List<String> principals)
     {
+        return publishTenantPrincipals(poolId, tenant, guard, revision, principals, null);
+    }
+
+    public TenantAdmission publishTenantPrincipals(String poolId, String tenant, Guard guard, String revision, List<String> principals, @Nullable String servicePrincipalPrefix)
+    {
         validateTenant(tenant);
+        check(servicePrincipalPrefix == null || (servicePrincipalPrefix.length() <= 68
+                && servicePrincipalPrefix.matches("[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_")), POOL_VALIDATION, "service_principal_prefix is invalid");
         check(revision != null && revision.matches("[A-Za-z0-9_.:-]{1,64}"), POOL_VALIDATION, "revision is invalid");
         check(principals != null && !principals.isEmpty() && principals.size() <= 10000, POOL_VALIDATION, "principals are required");
         principals.forEach(principal -> check(
@@ -925,6 +936,45 @@ public final class PoolStore
                     .bindArray("principals", String.class, ordered.toArray(String[]::new))
                     .mapTo(String.class).list();
             check(contested.isEmpty(), POOL_PRINCIPAL_CONFLICT, "A published principal already belongs to another tenant");
+            List<String> servicePrefixes = ordered.stream().map(PoolStore::servicePrincipalPrefix).filter(Objects::nonNull).distinct().toList();
+            if (servicePrincipalPrefix != null) {
+                servicePrefixes = new ArrayList<>(servicePrefixes);
+                servicePrefixes.add(servicePrincipalPrefix);
+                boolean overlaps = handle.createQuery(
+                                """
+                                SELECT EXISTS (
+                                  SELECT 1 FROM pool_tenant_principal
+                                  WHERE pool_id = :pool AND tenant <> :tenant
+                                    AND left(principal, length(principal) - 24) = :prefix
+                                    AND length(principal) <= 92
+                                    AND principal ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_[0-9a-f]{24}$'
+                                )
+                                """)
+                        .bind("pool", poolId).bind("tenant", tenant).bind("prefix", servicePrincipalPrefix)
+                        .mapTo(Boolean.class).one();
+                check(!overlaps, POOL_PRINCIPAL_CONFLICT, "A service principal already belongs to another tenant");
+            }
+            boolean namespaceConflict = handle.createQuery(
+                            """
+                            SELECT EXISTS (
+                              SELECT 1 FROM pool_tenant_service_principal
+                              WHERE pool_id = :pool AND tenant <> :tenant AND service_principal_prefix = ANY(:prefixes)
+                            )
+                            """)
+                    .bind("pool", poolId).bind("tenant", tenant)
+                    .bindArray("prefixes", String.class, servicePrefixes.toArray(String[]::new))
+                    .mapTo(Boolean.class).one();
+            check(!namespaceConflict, POOL_PRINCIPAL_CONFLICT, "A service principal namespace already belongs to another tenant");
+            handle.createUpdate("DELETE FROM pool_tenant_service_principal WHERE pool_id = :pool AND tenant = :tenant")
+                    .bind("pool", poolId).bind("tenant", tenant).execute();
+            if (servicePrincipalPrefix != null) {
+                handle.createUpdate(
+                                """
+                                INSERT INTO pool_tenant_service_principal (pool_id, service_principal_prefix, tenant, revision)
+                                VALUES (:pool, :prefix, :tenant, :revision)
+                                """)
+                        .bind("pool", poolId).bind("prefix", servicePrincipalPrefix).bind("tenant", tenant).bind("revision", revision).execute();
+            }
             handle.createUpdate(
                             """
                             DELETE FROM pool_tenant_principal
@@ -952,6 +1002,15 @@ public final class PoolStore
                     .bind("pool", poolId).bind("tenant", tenant).execute();
             return tenantAdmission(handle, poolId, tenant, false, false);
         });
+    }
+
+    @Nullable
+    static String servicePrincipalPrefix(String principal)
+    {
+        if (principal.length() <= 92 && SERVICE_PRINCIPAL.matcher(principal).matches()) {
+            return principal.substring(0, principal.length() - 24);
+        }
+        return null;
     }
 
     public TenantAdmission revokeTenant(String poolId, String tenant, Guard guard, String reason)
@@ -1519,6 +1578,8 @@ public final class PoolStore
                 "SELECT principal FROM pool_tenant_principal WHERE pool_id = :pool AND tenant = :tenant ORDER BY principal")
                   .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).list()
                 : List.of();
+        String servicePrefix = handle.createQuery("SELECT service_principal_prefix FROM pool_tenant_service_principal WHERE pool_id = :pool AND tenant = :tenant")
+                .bind("pool", poolId).bind("tenant", tenant).mapTo(String.class).findOne().orElse(null);
         String revision = summary.revision();
         int principalCount = summary.count();
         String principalsHash = principalCount == 0 ? null : summary.hash();
@@ -1535,10 +1596,11 @@ public final class PoolStore
                         principalCount,
                         principalsHash,
                         principals,
+                        servicePrefix,
                         replayed))
                 .findOne()
                 .orElseGet(() -> new TenantAdmission(
-                        PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, revision, principalCount, principalsHash, principals, replayed));
+                        PROTOCOL_VERSION, poolId, tenant, "PENDING", null, null, revision, principalCount, principalsHash, principals, servicePrefix, replayed));
     }
 
     /**
@@ -1941,6 +2003,7 @@ public final class PoolStore
                     admission.principalCount(),
                     admission.principalsHash(),
                     admission.principals(),
+                    admission.servicePrincipalPrefix(),
                     true);
             default -> Function.identity();
         };

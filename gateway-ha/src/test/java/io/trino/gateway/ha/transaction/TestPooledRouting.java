@@ -118,7 +118,7 @@ class TestPooledRouting
         for (String version : new String[] {
                 "V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql",
                 "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql",
-                "V11__pool_tenant_principals.sql",
+                "V11__pool_tenant_principals.sql", "V12__pool_tenant_service_principals.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -148,7 +148,7 @@ class TestPooledRouting
     {
         database.useHandle(handle -> handle.execute(
                 """
-                TRUNCATE pool_tenant_principal, pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
+                TRUNCATE pool_tenant_service_principal, pool_tenant_principal, pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt,
                   pool_member_certificate, pool_operation, pool, transaction_rollout, transaction_route,
                   transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend
                 """));
