@@ -72,12 +72,14 @@ final class TestDatabaseMigrationsPostgreSql
         verifyResultSetCount("SELECT publication_id FROM pool_publication_receipt", 0);
         verifyResultSetCount("SELECT tenant FROM pool_tenant_admission", 0);
         verifyResultSetCount("SELECT principal FROM pool_tenant_principal", 0);
+        verifyResultSetCount("SELECT service_principal_prefix FROM pool_tenant_service_principal", 0);
     }
 
     @Override
     protected void dropAllTables()
     {
         jdbi.useHandle(handle -> {
+            handle.execute("DROP TABLE pool_tenant_service_principal");
             handle.execute("DROP TABLE pool_tenant_principal");
             handle.execute("DROP TABLE pool_publication_receipt");
             handle.execute("DROP TABLE pool_publication");
