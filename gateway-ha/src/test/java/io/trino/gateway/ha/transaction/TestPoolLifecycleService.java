@@ -42,6 +42,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
@@ -88,6 +89,24 @@ class TestPoolLifecycleService
             assertThat(lifecycleStats.getBlockedDrainObservations().getTotalCount()).isEqualTo(1);
             verify(store).obligations("pool", "member");
             verifyNoMoreInteractions(store);
+        }
+    }
+
+    @Test
+    void reconciliationReplayDoesNotProbeADepartedCoordinator()
+    {
+        try (var construction = mockConstruction(PoolStore.class)) {
+            PoolLifecycleService service = service(true);
+            PoolStore store = construction.constructed().getLast();
+            var result = new PoolStore.ReconciliationResult(1);
+            when(store.replayedReconciliation(anyString(), any())).thenReturn(Optional.of(result));
+            assertThat(service.reconcileQueries("pool", "member", body(
+                    """
+                    {"operationId":"reconcile","stepId":"proof","controllerEpoch":1}
+                    """))).isEqualTo(result);
+            verify(store).replayedReconciliation(anyString(), any());
+            verifyNoMoreInteractions(store);
+            verifyNoInteractions(httpClient);
         }
     }
 

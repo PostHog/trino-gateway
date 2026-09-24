@@ -170,6 +170,48 @@ remaining requests and transactions before sealing. Do not delete ledger rows or
 infer successful drain from elapsed time. A lost or failed cancellation response
 remains unresolved and requires investigation.
 
+### Automatic pooled-query reconciliation
+
+A pool controller can reconcile abandoned queries without client credentials after
+an authenticated coordinator check proves that neither execution nor queued or
+cached results remain. Query metadata returning HTTP 410 is insufficient.
+
+The pool administration API exposes two endpoints:
+
+- `GET /gateway/v1/pools/{pool}/members/{instance}/drain-candidates?after={queryId}`
+  returns up to 100 nonterminal, nontransactional queries with their admission counts.
+  The opaque cursor is the last query ID returned; wrap after an empty page.
+- `POST /gateway/v1/pools/{pool}/members/{instance}/reconcile-queries` accepts the
+  existing operation/step, controller epoch and owner fields, `expectedGeneration`,
+  `nodeId`, `coordinatorId`, and `queries` containing the observed `queryId` and
+  `admissionCount` pairs. It returns the number of reconciled queries.
+
+Both endpoints require the pool administration credential. The controller must
+obtain an explicit `absent=true` response from the same coordinator's authenticated
+`/v1/query/{queryId}/drain-status` endpoint for each candidate. Missing endpoints,
+authentication failures, timeouts and metadata absence never authorize cleanup.
+Gateway independently verifies the live coordinator identity before accepting the
+receipt. Under its pool and backend locks, it checks the controller epoch, member
+generation and phase, absence of pending or uncertain admissions, and unchanged
+per-query admission counts. A request that completes during the check invalidates
+the receipt. Transactional query bindings remain excluded.
+
+A successful reconciliation starts the configured terminal retention window; it
+does not seal or retire the member. The normal zero-obligation check remains
+required. Replays return the original outcome without extending retention.
+
+Deploy the supporting Trino endpoint before enabling controller reconciliation.
+An older coordinator without the endpoint still requires the owner-authorized
+recovery described above. Trino must also expire completed history eventually;
+retaining a minimum number of historical queries indefinitely can prevent an
+otherwise quiet member from producing an absence proof.
+
+The query-admission index builds concurrently. PostgreSQL migrations use a
+session advisory lock so Flyway's transaction does not block the index snapshot
+wait. An interrupted build can leave an invalid index; the migration drops its
+own index before rebuilding it on retry. Do not remove the Flyway lock or run
+multiple uncoordinated migration processes.
+
 The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields: a URL followed by `null`. Rejection must preserve uncertainty instead of making the query appear complete.
 
 ## Pooled member lifecycle

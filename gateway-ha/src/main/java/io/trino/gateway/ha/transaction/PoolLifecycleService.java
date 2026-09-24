@@ -52,6 +52,7 @@ public class PoolLifecycleService
     private static final ObjectMapper JSON = new ObjectMapper().disable(SerializationFeature.FAIL_ON_EMPTY_BEANS);
 
     private final PoolLifecycleConfiguration config;
+    private final int terminalRetentionSeconds;
     private final PoolStore store;
     private final TransactionAwarenessService transactions;
     private final GatewayBackendManager backendManager;
@@ -61,6 +62,7 @@ public class PoolLifecycleService
     public PoolLifecycleService(HaGatewayConfiguration configuration, Jdbi jdbi, TransactionAwarenessService transactions, GatewayBackendManager backendManager, TransactionLifecycleStats lifecycleStats)
     {
         this.config = configuration.getTransactionAwareness().getPool();
+        this.terminalRetentionSeconds = configuration.getTransactionAwareness().getTerminalRetentionSeconds();
         this.store = new PoolStore(requireNonNull(jdbi, "jdbi is null"));
         this.transactions = requireNonNull(transactions, "transactions is null");
         this.backendManager = requireNonNull(backendManager, "backendManager is null");
@@ -225,6 +227,34 @@ public class PoolLifecycleService
     public PoolStore.Member drainMember(String poolId, String instanceId, JsonNode body)
     {
         return guarded(() -> store.drainMember(poolId, instanceId, guard(body), generation(body)));
+    }
+
+    public List<PoolStore.DrainCandidate> drainCandidates(String poolId, String instanceId, String after)
+    {
+        return guarded(() -> store.drainCandidates(poolId, instanceId, after == null ? "" : after));
+    }
+
+    public PoolStore.ReconciliationResult reconcileQueries(String poolId, String instanceId, JsonNode body)
+    {
+        Guard guard = guard(body);
+        Optional<PoolStore.ReconciliationResult> replay = guarded(() -> store.replayedReconciliation(poolId, guard));
+        if (replay.isPresent()) {
+            return replay.orElseThrow();
+        }
+        JsonNode receipts = body.path("queries");
+        if (!receipts.isArray() || receipts.isEmpty() || receipts.size() > 100) {
+            throw poolError(400, "POOL_VALIDATION", "One to 100 absence receipts are required");
+        }
+        List<PoolStore.DrainCandidate> queries = new ArrayList<>();
+        receipts.forEach(receipt -> queries.add(new PoolStore.DrainCandidate(text(receipt, "queryId"), longValue(receipt, "admissionCount"))));
+        String nodeId = text(body, "nodeId");
+        String coordinatorId = text(body, "coordinatorId");
+        PoolStore.Member member = member(poolId, instanceId);
+        JsonNode identity = probeIdentity(member.url());
+        if (!nodeId.equals(identity.path("nodeId").asText()) || !coordinatorId.equals(identity.path("coordinatorId").asText())) {
+            throw poolError(409, "POOL_IDENTITY_CONFLICT", "The absence receipt identifies a different coordinator process");
+        }
+        return guarded(() -> store.reconcileQueries(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, queries, terminalRetentionSeconds));
     }
 
     public PoolStore.Member sealMember(String poolId, String instanceId, JsonNode body)

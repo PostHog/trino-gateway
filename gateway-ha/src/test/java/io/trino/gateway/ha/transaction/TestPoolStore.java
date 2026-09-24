@@ -1667,6 +1667,109 @@ class TestPoolStore
         }
     }
 
+    @Test
+    void reconciliationPreservesRetentionAndRejectsAnInterveningCompletedPoll()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        var admission = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        String queryId = "20260101_000000_00001_abcde";
+        transactions.recordResponse(admission.id(), new ResponseObservation(queryId, null, false, false, 120));
+        Member draining = drain(first, "i-1", "op-drain");
+        var snapshot = first.drainCandidates(POOL, "i-1", "");
+        assertThat(snapshot).containsExactly(new PoolStore.DrainCandidate(queryId, 1));
+        var poll = transactions.admitQuery(queryId, Optional.of("owner"), Optional.empty());
+        assertThat(second.drainCandidates(POOL, "i-1", "")).isEmpty();
+        assertThatThrownBy(() -> second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "pending"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                snapshot,
+                120))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+        transactions.recordResponse(poll.id(), new ResponseObservation(queryId, null, false, false, 120));
+        assertThat(second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "stale"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                snapshot,
+                120).reconciled()).isZero();
+        var fresh = second.drainCandidates(POOL, "i-1", "");
+        assertThat(first.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "fresh"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                fresh,
+                120).reconciled()).isEqualTo(1);
+        assertThat(second.drainCandidates(POOL, "i-1", "")).isEmpty();
+        assertThatThrownBy(() -> seal("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+        assertThat(second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "fresh"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                fresh,
+                120).reconciled()).isEqualTo(1);
+    }
+
+    @Test
+    void reconciliationNeverClosesTransactionsOrAcceptsAnotherProcess()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        var admission = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        String queryId = "20260101_000000_00002_abcde";
+        transactions.recordResponse(admission.id(), new ResponseObservation(queryId, "transaction-a", false, false, 120));
+        Member draining = drain(first, "i-1", "op-drain");
+        assertThat(first.drainCandidates(POOL, "i-1", "")).isEmpty();
+        var fabricated = List.of(new PoolStore.DrainCandidate(queryId, 1));
+        assertThatThrownBy(() -> second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "restart"),
+                draining.generation(),
+                "node-i-1",
+                "different-process",
+                fabricated,
+                120))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_IDENTITY_CONFLICT));
+        assertThatThrownBy(() -> second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "generation"),
+                draining.generation() - 1,
+                "node-i-1",
+                "coord-i-1",
+                fabricated,
+                120))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_GENERATION));
+        assertThat(second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "transaction"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                fabricated,
+                120).reconciled()).isZero();
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().openTransactions()).isEqualTo(1);
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().activeQueries()).isEqualTo(1);
+    }
+
     private void receiptFor(String publicationId, String instanceId, String revision)
     {
         first.recordPublicationReceipt(

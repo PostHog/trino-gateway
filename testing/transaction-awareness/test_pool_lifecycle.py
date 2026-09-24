@@ -150,6 +150,49 @@ class PoolLifecycleContract(unittest.TestCase):
             sealed = self.successful(api(path + "/seal", "POST", seal_body, replica=0))
             self.assertEqual(sealed["phase"], "SEALED")
 
+    def test_absence_receipt_reconciles_an_unpolled_query_across_replicas(self):
+        with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            epoch = 3
+            self.successful(self.configure(api, epoch, "configure"))
+            members = {}
+            for backend in backends:
+                member = self.bootstrap(api, backend, epoch, "op-boot-" + backend.state.identity)
+                members[member["instanceId"]] = member
+            initial = request(gateways[0] + "/v1/statement", "POST", "SELECT 1", CREDENTIAL)
+            self.assertEqual(initial.status, 200, initial.body)
+            query_id = initial.json()["id"]
+            backend = next(item for item in backends if query_id.endswith("_" + item.state.coordinator_id))
+            name = backend.state.identity
+            path = "/members/" + name
+            drained = self.successful(api(path + "/drain", "POST", {
+                "operationId": "op-drain", "stepId": "drain", "controllerEpoch": epoch,
+                "ownerIdentity": self.OWNER, "expectedGeneration": members[name]["generation"]}))
+            candidates = self.successful(api(path + "/drain-candidates", replica=1))
+            self.assertEqual(candidates, [{"queryId": query_id, "admissionCount": 1}])
+            with backend.state.lock:
+                del backend.state.queries[urlsplit(initial.json()["nextUri"]).path]
+            receipt = {"operationId": "op-reconcile", "stepId": "absent", "controllerEpoch": epoch,
+                       "ownerIdentity": self.OWNER, "expectedGeneration": drained["generation"],
+                       "nodeId": backend.state.node_id, "coordinatorId": backend.state.coordinator_id,
+                       "queries": candidates}
+            self.assertEqual(request(gateways[0] + "/gateway/v1/pools/" + POOL + path +
+                                     "/reconcile-queries", "POST", json.dumps(receipt),
+                                     [("Content-Type", "application/json")]).status, 403)
+            wrong_process = dict(receipt, coordinatorId="other")
+            self.refused(api(path + "/reconcile-queries", "POST", wrong_process), "POOL_IDENTITY_CONFLICT")
+            result = self.successful(api(path + "/reconcile-queries", "POST", receipt, replica=1))
+            self.assertEqual(result, {"reconciled": 1})
+            self.assertEqual(self.successful(api(path + "/reconcile-queries", "POST", receipt)), result)
+            seal_body = {"operationId": "op-drain", "stepId": "seal", "controllerEpoch": epoch,
+                         "ownerIdentity": self.OWNER, "expectedGeneration": drained["generation"]}
+            self.assertEqual(api(path + "/seal", "POST", seal_body).status, 409)
+            deadline = time.monotonic() + 5
+            while self.successful(api(path + "/obligations"))["activeQueries"]:
+                self.assertLess(time.monotonic(), deadline, "Reconciled query retention did not expire")
+                time.sleep(0.05)
+            self.assertEqual(self.successful(api(path + "/seal", "POST", seal_body))["phase"], "SEALED")
+
     def test_bootstrap_surge_floor_and_leader_takeover_across_replicas(self):
         with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS) as (gateways, backends, token):
             api = self.pool_api(gateways, token)

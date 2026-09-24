@@ -626,6 +626,79 @@ public final class PoolStore
         });
     }
 
+    public record DrainCandidate(String queryId, long admissionCount) {}
+
+    public record ReconciliationResult(int reconciled) {}
+
+    public List<DrainCandidate> drainCandidates(String poolId, String instanceId, String after)
+    {
+        validatePoolId(poolId);
+        check(after != null && after.length() <= 256, POOL_VALIDATION, "Invalid query cursor");
+        return jdbi.inTransaction(handle -> {
+            Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
+            requirePooled(pool);
+            Row row = lockedMember(handle, poolId, instanceId);
+            check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
+            if (obligations(handle, poolId, instanceId).pendingRequests() != 0) {
+                return List.of();
+            }
+            return handle.createQuery(
+                            """
+                            SELECT q.query_id, (SELECT count(*) FROM transaction_admission a WHERE a.query_id = q.query_id) AS admissions
+                            FROM transaction_query q
+                            WHERE q.incarnation = :incarnation AND NOT q.terminal AND q.transaction_id IS NULL AND q.query_id > :after
+                            ORDER BY q.query_id LIMIT 100
+                            """).bind("incarnation", row.incarnation).bind("after", after)
+                    .map((rs, _) -> new DrainCandidate(rs.getString("query_id"), rs.getLong("admissions"))).list();
+        });
+    }
+
+    /**
+     * The controller attests explicit absence of execution AND queued/cached results on this process.
+     * A metadata 410 or query timeout is not such evidence. The admission count fences requests that
+     * began and finished during that observation, including a late result-cache insertion.
+     */
+    public ReconciliationResult reconcileQueries(
+            String poolId,
+            String instanceId,
+            Guard guard,
+            long expectedGeneration,
+            String nodeId,
+            String coordinatorId,
+            List<DrainCandidate> queries,
+            int retentionSeconds)
+    {
+        check(queries != null && !queries.isEmpty() && queries.size() <= 100, POOL_VALIDATION, "One to 100 absence receipts are required");
+        check(retentionSeconds > 0 && retentionSeconds <= 86400, POOL_VALIDATION, "Invalid terminal retention");
+        for (DrainCandidate query : queries) {
+            check(query != null && query.queryId() != null && query.queryId().matches("[a-zA-Z0-9_]{1,256}") && query.admissionCount() > 0,
+                    POOL_VALIDATION,
+                    "Invalid query absence receipt");
+        }
+        return inPool(poolId, guard, ReconciliationResult.class, (handle, pool) -> {
+            requirePooled(pool);
+            Row row = lockedMember(handle, poolId, instanceId);
+            requireGeneration(row, expectedGeneration);
+            check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
+            check(Objects.equals(row.nodeId, nodeId) && Objects.equals(row.coordinatorId, coordinatorId),
+                    POOL_IDENTITY_CONFLICT,
+                    "The absence receipt identifies a different coordinator process");
+            check(obligations(handle, poolId, instanceId).pendingRequests() == 0, POOL_NOT_DRAINED, "Pending or uncertain requests still pin this member");
+            int reconciled = 0;
+            for (DrainCandidate query : queries) {
+                reconciled += handle.createUpdate(
+                                """
+                                UPDATE transaction_query q SET terminal = TRUE,
+                                    retain_until = clock_timestamp() + make_interval(secs => :retention)
+                                WHERE q.query_id = :query AND q.incarnation = :incarnation AND NOT q.terminal AND q.transaction_id IS NULL
+                                  AND (SELECT count(*) FROM transaction_admission a WHERE a.query_id = q.query_id) = :admissions
+                                """).bind("query", query.queryId()).bind("incarnation", row.incarnation)
+                        .bind("admissions", query.admissionCount()).bind("retention", retentionSeconds).execute();
+            }
+            return new ReconciliationResult(reconciled);
+        });
+    }
+
     /**
      * DRAINING to SEALED, only with zero remaining obligations.
      */
@@ -1001,6 +1074,16 @@ public final class PoolStore
                 return Optional.empty();
             }
             return recordedStep(handle, poolId, guard).map(document -> decode(document, Member.class, true));
+        });
+    }
+
+    public Optional<ReconciliationResult> replayedReconciliation(String poolId, Guard guard)
+    {
+        return jdbi.inTransaction(handle -> {
+            if (poolRow(handle, poolId).isEmpty()) {
+                return Optional.empty();
+            }
+            return recordedStep(handle, poolId, guard).map(document -> decode(document, ReconciliationResult.class, false));
         });
     }
 

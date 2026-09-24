@@ -27,6 +27,7 @@ import jakarta.ws.rs.PUT;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 
 import java.util.List;
@@ -118,6 +119,31 @@ public class PoolResource
     {
         service.requireAdmin(request);
         return service.drainMember(poolId, instanceId, body);
+    }
+
+    @GET
+    @Path("/{poolId}/members/{instanceId}/drain-candidates")
+    public List<PoolStore.DrainCandidate> drainCandidates(
+            @PathParam("poolId") String poolId,
+            @PathParam("instanceId") String instanceId,
+            @QueryParam("after") String after,
+            @Context HttpServletRequest request)
+    {
+        service.requireAdmin(request);
+        return service.drainCandidates(poolId, instanceId, after);
+    }
+
+    @POST
+    @Path("/{poolId}/members/{instanceId}/reconcile-queries")
+    @Consumes(APPLICATION_JSON)
+    public PoolStore.ReconciliationResult reconcileQueries(
+            @PathParam("poolId") String poolId,
+            @PathParam("instanceId") String instanceId,
+            JsonNode body,
+            @Context HttpServletRequest request)
+    {
+        service.requireAdmin(request);
+        return service.reconcileQueries(poolId, instanceId, body);
     }
 
     @POST
