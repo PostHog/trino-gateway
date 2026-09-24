@@ -14,7 +14,7 @@ does not replace those checks.
 ## Registry access
 
 The workflow authenticates with GitHub OIDC and assumes the IAM role named by
-the repository variable `AWS_ECR_PUBLISH_IAM_ROLE`. That role is provisioned
+the repository variable `TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE`. That role is provisioned
 outside this repository, trusts only `refs/heads/main` of this repository, and
 may push only to the `trino-gateway` ECR repository. The registry hostname is
 taken from the ECR login step, so no account identifier is committed here. The
