@@ -1,15 +1,16 @@
 # Container image publishing
 
-The `Publish ECR image` workflow builds the `main` branch of
-`PostHog/trino-gateway` and publishes a multi-architecture image to the
-`trino-gateway` repository in the internal Amazon ECR registry. It also
-supports manual runs from `main`. It does not publish to Docker Hub, GHCR, or
-any other registry.
+The `publish-ecr` job of the `ci` workflow publishes a multi-architecture
+image of `PostHog/trino-gateway` to the `trino-gateway` repository in the
+internal Amazon ECR registry. It runs only for a push to `main` (or a manual
+run of the workflow from `main`) and only after the `maven-build` and
+`transaction-tests` jobs of the same run passed. It does not publish to
+Docker Hub, GHCR, or any other registry.
 
-The workflow uses Java 25 and the existing `docker/build.sh` image builder and
-container smoke tests for `linux/amd64` and `linux/arm64`. The normal CI and
-transaction-test workflows continue to run separately. The publishing workflow
-does not replace those checks.
+The job uses Java 25 and the existing `docker/build.sh` image builder and
+container smoke tests for `linux/amd64` and `linux/arm64`, then pushes the
+images that passed those tests. Pull requests do not build the container
+image; a broken Dockerfile surfaces on the merge to `main`.
 
 ## Registry access
 

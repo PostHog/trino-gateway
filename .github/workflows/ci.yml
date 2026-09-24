@@ -9,6 +9,10 @@ on:
       - main
     paths-ignore:
       - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 defaults:
   run:
@@ -35,21 +39,177 @@ jobs:
       - name: Build with Maven
         run: $MAVEN clean verify
 
-  docker-build:
+  transaction-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        with:
+          distribution: temurin
+          java-version: 25
+          cache: maven
+      - name: PostgreSQL transaction ledger and protocol adapter
+        env:
+          TX_STORE_TEST_JDBC_URL: jdbc:postgresql://127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
+          TX_STORE_TEST_USERNAME: postgres
+        run: >-
+          ./mvnw -B -ntp -pl gateway-ha -am test
+          -Dskip.installnodepnpm -Dskip.pnpm
+          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler,TestDatabaseDeadline,TestJdbcConnectionManager'
+          -Dsurefire.failIfNoSpecifiedTests=false
+      - name: Protocol and network fault fixture self-tests
+        working-directory: testing/transaction-awareness
+        run: python3 -m unittest -v test_fake_trino test_network_fault_proxy test_load_open_loop test_load_executor_setup test_load_client_cpu test_load_error_categories test_load_multiprocess test_load_aggregate test_load_cutover test_load_cutover_aggregate test_load_checkpoints test_database_metrics test_protocol_tls test_matrix_case test_fault_recovery test_rollout_client test_rollout_workload test_manual_cutover_smoke
+      - name: Multi-process rollout administration HTTP contracts
+        run: |
+          ./mvnw -B -ntp -pl gateway-ha dependency:build-classpath -Dmdep.outputFile=/tmp/gateway-rollout-classpath
+          export GATEWAY_TEST_CLASSPATH="$PWD/gateway-ha/target/classes:$(cat /tmp/gateway-rollout-classpath)"
+          export GATEWAY_TEST_JAVA="$JAVA_HOME/bin/java"
+          export GATEWAY_TEST_PG_BIN="$(pg_config --bindir)"
+          cd testing/transaction-awareness
+          python3 -m unittest -v test_rollout_api test_graceful_shutdown test_pool_lifecycle test_whole_query_cancel
+      - name: Disposable lab tooling tests
+        working-directory: testing/transaction-awareness/deploy
+        env:
+          TX_OBSERVER_LOCAL_PG: "yes"
+          PGHOST: 127.0.0.1
+          PGPORT: ${{ job.services.postgres.ports['5432'] }}
+          PGDATABASE: postgres
+          PGUSER: postgres
+        run: |
+          psql --version
+          python3 -m unittest discover -p 'test_*.py' -v
+
+  # Builds, smoke-tests and publishes the images, only after every test job
+  # passed on a main commit. The ECR repository enforces tag immutability.
+  publish-ecr:
+    if: >-
+      github.repository == 'PostHog/trino-gateway' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [maven-build, transaction-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    concurrency:
+      group: publish-ecr-main
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE_NAME: trino-gateway
+      AWS_REGION: us-east-1
+    steps:
+      - name: Require publish role
+        env:
+          PUBLISH_ROLE: ${{ secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
+        run: |
+          if [[ -z "$PUBLISH_ROLE" ]]; then
+            echo "::error::Set the repository secret TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE to the GitHub OIDC publish role ARN"
+            exit 1
+          fi
+
       - name: Checkout source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Install required Java distribution
         uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
         with:
           java-version: 25
           distribution: 'temurin'
+          cache: 'maven'
+
       - name: Maven Build
         run: $MAVEN install ${MAVEN_FAST_INSTALL}
+
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
           platforms: amd64,arm64
+
       - name: Build and Test Docker Image
+        env:
+          TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
+          TRINO_GATEWAY_IMAGE_REVISION: ${{ github.sha }}
         run: docker/build.sh
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+        with:
+          version: v0.22.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
+        with:
+          role-to-assume: ${{ secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+
+      - name: Publish and verify image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          image="${ECR_REGISTRY}/${IMAGE_NAME}"
+          source_url="https://github.com/${GITHUB_REPOSITORY}"
+          tag="sha-${GITHUB_SHA}"
+          reference="${image}:${tag}"
+
+          verify_index() {
+            local digest=$1
+            crane manifest "${image}@${digest}" | jq -e \
+              '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+            for arch in amd64 arm64; do
+              crane config --platform "linux/${arch}" "${image}@${digest}" | jq -e \
+                --arg source "$source_url" --arg revision "$GITHUB_SHA" \
+                '.config.Labels["org.opencontainers.image.source"] == $source and .config.Labels["org.opencontainers.image.revision"] == $revision'
+            done
+          }
+
+          # The repository enforces tag immutability. A rerun for a commit that
+          # already has an image must not push different bytes under the same tag.
+          if digest=$(crane digest "$reference" 2>/dev/null); then
+            echo "::notice::${reference} already exists; verifying the published image instead of pushing"
+            verify_index "$digest"
+            {
+              printf 'Already published `%s`\n\n' "$reference"
+              printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          version=$(<trino-gateway-version.txt)
+          publish_tmp=$(mktemp -d)
+          manifests=()
+          for arch in amd64 arm64; do
+            docker save "trino-gateway:${version}-${arch}" -o "${publish_tmp}/${arch}.tar"
+            arch_digest=$(crane digest --tarball "${publish_tmp}/${arch}.tar")
+            crane push "${publish_tmp}/${arch}.tar" "${image}@${arch_digest}" --image-refs "${publish_tmp}/${arch}.ref"
+            manifests+=(-m "$(<"${publish_tmp}/${arch}.ref")")
+          done
+
+          crane index append "${manifests[@]}" -t "$reference"
+          digest=$(crane digest "$reference")
+          verify_index "$digest"
+          {
+            printf 'Published `%s`\n\n' "$reference"
+            printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
+          } >> "$GITHUB_STEP_SUMMARY"
