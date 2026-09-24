@@ -52,6 +52,9 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.logging.Handler;
+import java.util.logging.LogRecord;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -84,6 +87,7 @@ class TestTransactionAwarenessService
     private GatewayBackendManager backendManager;
     private HttpClient httpClient;
     private RoutingGroupSelector selector;
+    private TransactionLifecycleStats lifecycleStats;
 
     @BeforeEach
     void setup()
@@ -99,7 +103,8 @@ class TestTransactionAwarenessService
         backendManager = mock(GatewayBackendManager.class);
         httpClient = mock(HttpClient.class);
         selector = mock(RoutingGroupSelector.class);
-        service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector);
+        lifecycleStats = new TransactionLifecycleStats();
+        service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats);
         store = construction.constructed().getFirst();
     }
 
@@ -295,6 +300,18 @@ class TestTransactionAwarenessService
         verify(store, never()).recordResponse(any(), any());
     }
 
+    @Test
+    void uncertaintyPersistenceFailureIsCountedWithoutChangingFailureHandling()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, null);
+        doThrow(new IllegalStateException("private database connection detail")).when(store).markUncertain(any());
+        expectStatus(503, () -> service.recordResponse(request, response(503, "private upstream detail")));
+        assertThat(lifecycleStats.getMarkUncertainFailures().getTotalCount()).isEqualTo(1);
+        assertThat(lifecycleStats.getMarkUncertainSuccesses().getTotalCount()).isZero();
+        service.requestFailed(request);
+        assertThat(lifecycleStats.getMarkUncertainFailures().getTotalCount()).isEqualTo(2);
+    }
+
     @ParameterizedTest
     @ValueSource(ints = {401, 403})
     void authenticationRejectionWithoutLifecycleSignalSettlesOnlyAdmission(int status)
@@ -317,6 +334,39 @@ class TestTransactionAwarenessService
         verify(store).rejectAdmission(admission.id());
         verify(store, never()).markUncertain(any());
         verify(store, never()).recordResponse(any(), any());
+    }
+
+    @Test
+    void executingNotFoundEmitsSafeDiagnostic()
+    {
+        var messages = new CopyOnWriteArrayList<String>();
+        Handler handler = new Handler()
+        {
+            @Override
+            public void publish(LogRecord record)
+            {
+                messages.add(record.getMessage());
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        var logger = java.util.logging.Logger.getLogger("io.trino.gateway.ha.transaction.TransactionLifecycleStats");
+        logger.addHandler(handler);
+        try {
+            HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+            service.recordResponse(request, response(404, "sensitive upstream body"));
+            assertThat(lifecycleStats.getExecutingNotFoundResponses().getTotalCount()).isEqualTo(1);
+            assertThat(messages).anySatisfy(message -> assertThat(message)
+                    .contains("reason=EXECUTING_RESULT_NOT_FOUND", "query=" + QUERY)
+                    .doesNotContain("capability", TRANSACTION, "sensitive upstream body", "http://"));
+        }
+        finally {
+            logger.removeHandler(handler);
+        }
     }
 
     @ParameterizedTest
@@ -731,7 +781,7 @@ class TestTransactionAwarenessService
     {
         service.shutdown();
         configuration.getRouting().setAsyncTimeout(new io.airlift.units.Duration(50, java.util.concurrent.TimeUnit.MILLISECONDS));
-        service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector);
+        service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats);
         store = construction.constructed().getLast();
         Admission admission = configureKnownQuery();
         StringResponse process = mock(StringResponse.class);

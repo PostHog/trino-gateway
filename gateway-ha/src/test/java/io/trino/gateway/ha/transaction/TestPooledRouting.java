@@ -168,7 +168,7 @@ class TestPooledRouting
         selector = mock(RoutingGroupSelector.class);
         when(selector.findRoutingDestination(any())).thenReturn(new RoutingSelectorResponse(POOL));
         when(routingManager.getBackEndHealth(anyString())).thenReturn(Optional.of(TrinoStatus.HEALTHY));
-        service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector);
+        service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector, new TransactionLifecycleStats());
         service.setRoutingManager(routingManager);
         pools.configurePool(
                 POOL,
@@ -514,7 +514,7 @@ class TestPooledRouting
         configuration.getTransactionAwareness().getPool().setHostQualificationDomains(List.of(DOMAIN));
         configuration.getTransactionAwareness().getPool().setExcludedHostLabels(List.of("internal"));
         configuration.getTransactionAwareness().validate(configuration.getDataStore());
-        service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector);
+        service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector, new TransactionLifecycleStats());
         service.setRoutingManager(routingManager);
         pools.configurePool(
                 POOL,

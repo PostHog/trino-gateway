@@ -33,12 +33,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.TreeMap;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -54,6 +58,7 @@ class TestPoolLifecycleService
     private GatewayBackendManager backendManager;
     private HttpClient httpClient;
     private Jdbi jdbi;
+    private TransactionLifecycleStats lifecycleStats;
 
     @BeforeEach
     void setup()
@@ -68,6 +73,22 @@ class TestPoolLifecycleService
         backendManager = mock(GatewayBackendManager.class);
         httpClient = mock(HttpClient.class);
         jdbi = mock(Jdbi.class);
+        lifecycleStats = new TransactionLifecycleStats();
+    }
+
+    @Test
+    void blockedObligationReadUpdatesInjectedStatisticsWithoutAnotherRead()
+    {
+        try (var construction = mockConstruction(PoolStore.class)) {
+            PoolLifecycleService service = service(true);
+            PoolStore store = construction.constructed().getLast();
+            var obligations = new PoolStore.Obligations(1, "member", UUID.randomUUID(), "DRAINING", 1, 0, 1, 2, false, false);
+            when(store.obligations("pool", "member")).thenReturn(Optional.of(obligations));
+            assertThat(service.obligations("pool", "member")).isSameAs(obligations);
+            assertThat(lifecycleStats.getBlockedDrainObservations().getTotalCount()).isEqualTo(1);
+            verify(store).obligations("pool", "member");
+            verifyNoMoreInteractions(store);
+        }
     }
 
     @Test
@@ -253,8 +274,8 @@ class TestPoolLifecycleService
     {
         configuration.getTransactionAwareness().getPool().setEnabled(poolEnabled);
         RoutingGroupSelector selector = mock(RoutingGroupSelector.class);
-        TransactionAwarenessService transactions = new TransactionAwarenessService(configuration, jdbi, backendManager, httpClient, selector);
-        return new PoolLifecycleService(configuration, jdbi, transactions, backendManager);
+        TransactionAwarenessService transactions = new TransactionAwarenessService(configuration, jdbi, backendManager, httpClient, selector, lifecycleStats);
+        return new PoolLifecycleService(configuration, jdbi, transactions, backendManager, lifecycleStats);
     }
 
     private static JsonNode body(String json)
