@@ -30,9 +30,9 @@ jobs:
       id-token: write
     steps:
       - name: Require publish role
-        if: vars.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE == ''
+        if: secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE == ''
         run: |
-          echo "::error::Set the repository variable TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE to the GitHub OIDC publish role ARN"
+          echo "::error::Set the repository secret TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE to the GitHub OIDC publish role ARN"
           exit 1
 
       - name: Checkout source
@@ -69,7 +69,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
-          role-to-assume: ${{ vars.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
+          role-to-assume: ${{ secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR

@@ -14,11 +14,13 @@ does not replace those checks.
 ## Registry access
 
 The workflow authenticates with GitHub OIDC and assumes the IAM role named by
-the repository variable `TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE`. That role is provisioned
+the repository secret `TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE`. That role is provisioned
 outside this repository, trusts only `refs/heads/main` of this repository, and
 may push only to the `trino-gateway` ECR repository. The registry hostname is
-taken from the ECR login step, so no account identifier is committed here. The
-workflow fails early when the variable is unset.
+taken from the ECR login step, so no account identifier is committed here. The role ARN
+is a secret rather than a variable because this repository is public and
+variables are readable by anyone. The workflow fails early when the secret is
+unset.
 
 ## Tags and immutability
 
