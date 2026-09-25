@@ -7,8 +7,11 @@ run of the workflow from `main`) and only after the `maven-build` and
 `transaction-tests` jobs of the same run passed. It does not publish to
 Docker Hub, GHCR, or any other registry.
 
-The job uses Java 25 and the existing `docker/build.sh` image builder and
-container smoke tests for `linux/amd64` and `linux/arm64`. The same cached
+The job packages the `gateway-ha` jar that `maven-build` compiled and tested
+in the same run, handed over as a one-day workflow artifact, so nothing is
+compiled a second time and the job needs no Java. It runs the existing
+`docker/build.sh` image builder (with `TRINO_GATEWAY_JAR` pointing at that
+jar) and container smoke tests for `linux/amd64` and `linux/arm64`. The same cached
 build is exported as an OCI layout per architecture, `docker/oci-index.sh`
 assembles one annotated OCI index from them, and `crane push --index`
 publishes it. Pull requests do not build the container

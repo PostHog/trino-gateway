@@ -26,7 +26,6 @@ defaults:
 env:
   # Use Maven wrapper from repo with Maven version and other configs
   MAVEN: ./mvnw -B
-  MAVEN_FAST_INSTALL: "-B -V -T 1C -DskipTests -Dmaven.source.skip=true -Dair.check.skip-all"
 
 jobs:
   maven-build:
@@ -43,6 +42,16 @@ jobs:
           distribution: 'temurin'
       - name: Build with Maven
         run: $MAVEN clean verify
+      # The publish job packages this exact jar instead of compiling again.
+      # Pull request runs never publish, so they skip the upload.
+      - name: Upload the tested gateway-ha jar
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gateway-ha-jar
+          path: gateway-ha/target/gateway-ha-*-jar-with-dependencies.jar
+          retention-days: 1
+          if-no-files-found: error
 
   transaction-tests:
     runs-on: ubuntu-latest
@@ -100,8 +109,9 @@ jobs:
           psql --version
           python3 -m unittest discover -p 'test_*.py' -v
 
-  # Builds, smoke-tests and publishes the images, only after every test job
-  # passed on a main commit. The ECR repository enforces tag immutability.
+  # Packages the jar maven-build tested, smoke-tests and publishes the
+  # images, only after every test job passed on a main commit. The ECR
+  # repository enforces tag immutability.
   publish-ecr:
     if: >-
       github.repository == 'PostHog/trino-gateway' &&
@@ -137,15 +147,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install required Java distribution
-        uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+      # The jar that maven-build compiled and tested in this run; build.sh
+      # reads the version from its filename, so this job needs no Java.
+      - name: Download the tested gateway-ha jar
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          java-version: 25
-          distribution: 'temurin'
-          cache: 'maven'
-
-      - name: Maven Build
-        run: $MAVEN install ${MAVEN_FAST_INSTALL}
+          name: gateway-ha-jar
+          path: ${{ runner.temp }}/gateway-ha-jar
 
       - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
         with:
@@ -164,7 +172,15 @@ jobs:
           TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
           TRINO_GATEWAY_IMAGE_REVISION: ${{ github.sha }}
           TRINO_GATEWAY_OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
-        run: docker/build.sh
+          JAR_DIR: ${{ runner.temp }}/gateway-ha-jar
+        run: |
+          jars=("${JAR_DIR}"/gateway-ha-*-jar-with-dependencies.jar)
+          if [[ ${#jars[@]} -ne 1 || ! -f "${jars[0]}" ]]; then
+            echo "::error::expected exactly one gateway-ha jar-with-dependencies in ${JAR_DIR}"
+            ls -la "${JAR_DIR}" || true
+            exit 1
+          fi
+          TRINO_GATEWAY_JAR="${jars[0]}" docker/build.sh
 
       - name: Assemble and inspect the index (dry run)
         if: ${{ inputs.dry_run }}
