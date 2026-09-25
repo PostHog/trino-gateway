@@ -147,6 +147,7 @@ jobs:
         env:
           TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
           TRINO_GATEWAY_IMAGE_REVISION: ${{ github.sha }}
+          TRINO_GATEWAY_OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
         run: docker/build.sh
 
       - name: Install crane
@@ -167,6 +168,7 @@ jobs:
       - name: Publish and verify image
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+          OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
         run: |
           image="${ECR_REGISTRY}/${IMAGE_NAME}"
           source_url="https://github.com/${GITHUB_REPOSITORY}"
@@ -178,49 +180,42 @@ jobs:
             local ref=$1
             crane manifest "$ref" | jq -e \
               --arg source "$source_url" --arg revision "$GITHUB_SHA" '
-              ([.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"])
+              .mediaType == "application/vnd.oci.image.index.v1+json"
+              and ([.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"])
               and .annotations["org.opencontainers.image.revision"] == $revision
-              and .annotations["org.opencontainers.image.source"] == $source'
+              and .annotations["org.opencontainers.image.source"] == $source' > /dev/null
             for arch in amd64 arm64; do
               crane config --platform "linux/${arch}" "$ref" | jq -e \
                 --arg source "$source_url" --arg revision "$GITHUB_SHA" \
-                '.config.Labels["org.opencontainers.image.source"] == $source and .config.Labels["org.opencontainers.image.revision"] == $revision'
+                '.config.Labels["org.opencontainers.image.source"] == $source and .config.Labels["org.opencontainers.image.revision"] == $revision' > /dev/null
             done
           }
 
           # The repository enforces tag immutability and a rerun would mint a
-          # new timestamped tag for the same commit. Verify the existing release
-          # instead of publishing a second one.
-          existing=$(crane ls "$image" | grep -E "^r[0-9]{12}-${short_sha}$" | sort | tail -n 1 || true)
+          # new timestamped tag for the same commit. Verify the newest existing
+          # release instead of publishing a second one; only a release that
+          # fails verification is superseded by a new tag.
+          existing=$(crane ls "$image" | { grep -E "^r[0-9]{12}-${short_sha}$" || true; } | sort | tail -n 1)
           if [[ -n "$existing" ]]; then
             reference="${image}:${existing}"
-            echo "::notice::${reference} already exists for ${GITHUB_SHA}; verifying instead of pushing"
-            verify_index "$reference"
-            digest=$(crane digest "$reference")
-            {
-              printf 'Already published `%s`\n\n' "$reference"
-              printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
-            } >> "$GITHUB_STEP_SUMMARY"
-            exit 0
+            if verify_index "$reference"; then
+              digest=$(crane digest "$reference")
+              echo "::notice::${reference} already exists for ${GITHUB_SHA}; verified instead of pushing"
+              {
+                printf 'Already published `%s`\n\n' "$reference"
+                printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::warning::${reference} exists but fails verification; publishing a new release tag"
           fi
 
           tag="r$(date -u +%Y%m%d%H%M)-${short_sha}"
           reference="${image}:${tag}"
-          version=$(<trino-gateway-version.txt)
-          publish_tmp=$(mktemp -d)
-          children=()
-          for arch in amd64 arm64; do
-            docker save "trino-gateway:${version}-${arch}" -o "${publish_tmp}/${arch}.tar"
-            arch_digest=$(crane digest --tarball "${publish_tmp}/${arch}.tar")
-            crane push "${publish_tmp}/${arch}.tar" "${image}@${arch_digest}"
-            children+=("${image}@${arch_digest}")
-          done
-
-          docker buildx imagetools create \
-            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
-            --annotation "index:org.opencontainers.image.source=${source_url}" \
-            --tag "$reference" \
-            "${children[@]}"
+          layout=$(mktemp -d)
+          docker/oci-index.sh "$layout" "$GITHUB_SHA" "$source_url" \
+            "amd64=${OCI_OUTPUT_DIR}/amd64.tar" "arm64=${OCI_OUTPUT_DIR}/arm64.tar"
+          crane push --index "$layout" "$reference"
           verify_index "$reference"
           digest=$(crane digest "$reference")
           {

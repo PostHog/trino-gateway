@@ -8,8 +8,10 @@ run of the workflow from `main`) and only after the `maven-build` and
 Docker Hub, GHCR, or any other registry.
 
 The job uses Java 25 and the existing `docker/build.sh` image builder and
-container smoke tests for `linux/amd64` and `linux/arm64`, then pushes the
-images that passed those tests. Pull requests do not build the container
+container smoke tests for `linux/amd64` and `linux/arm64`. The same cached
+build is exported as an OCI layout per architecture, `docker/oci-index.sh`
+assembles one annotated OCI index from them, and `crane push --index`
+publishes it. Pull requests do not build the container
 image; a broken Dockerfile surfaces on the merge to `main`.
 
 ## Registry access
