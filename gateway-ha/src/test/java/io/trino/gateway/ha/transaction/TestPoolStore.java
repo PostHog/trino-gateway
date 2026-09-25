@@ -411,6 +411,108 @@ class TestPoolStore
     }
 
     @Test
+    void repairsRestoreServingCapacityWithoutDiscardingDrainingWork()
+    {
+        configure(3, 3, 1, 3);
+        for (String id : List.of("i-1", "i-2", "i-3", "i-4")) {
+            serving(id);
+            transactions.admitPooledMember(POOL, "backend-" + id, "owner");
+            suspect(id);
+            drain(first, id, "drain-" + id);
+        }
+        for (int index = 1; index <= 3; index++) {
+            String id = "repair-" + index;
+            register(id, "r-1", "i-" + index);
+            admit(id);
+        }
+        PoolStore.PoolState restored = second.poolState(POOL).orElseThrow();
+        assertThat(restored.servingMembers()).isEqualTo(3);
+        assertThat(restored.repairInUse()).isEqualTo(3);
+        assertThat(restored.counts().get("DRAINING")).isEqualTo(4);
+        for (String id : List.of("i-1", "i-2", "i-3", "i-4")) {
+            assertThat(first.obligations(POOL, id).orElseThrow().pendingRequests()).isEqualTo(1);
+        }
+        assertThatThrownBy(() -> register("extra-repair", "r-1", "i-4"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET));
+    }
+
+    @Test
+    void repairRegistrationSurvivesTheTargetCompletingItsDrain()
+    {
+        for (String phase : List.of("DRAINING", "SEALED", "RETIRING", "RETIRED")) {
+            resetLedger();
+            serving("i-1");
+            suspect("i-1");
+            drain(first, "i-1", "drain-target");
+            if (!phase.equals("DRAINING")) {
+                seal("i-1");
+            }
+            if (phase.equals("RETIRING") || phase.equals("RETIRED")) {
+                retire("i-1");
+            }
+            if (phase.equals("RETIRED")) {
+                retired("i-1");
+            }
+            assertThat(register("repair", "r-1", "i-1").phase()).isEqualTo("PREPARING");
+            assertThat(second.member(POOL, "i-1").orElseThrow().phase()).isEqualTo(phase);
+        }
+    }
+
+    @Test
+    void departingRepairsReserveCapacityAndReplayAfterTheDeficitCloses()
+    {
+        configure(1, 1, 1, 3);
+        serving("i-1");
+        suspect("i-1");
+        drain(first, "i-1", "drain-target");
+        serving("i-2");
+        assertThatThrownBy(() -> register("repair", "r-1", "i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET));
+        suspect("i-2");
+        drain(first, "i-2", "drain-second");
+        Member preparing = register("repair", "r-1", "i-1");
+        assertThatThrownBy(() -> register("extra", "r-1", "i-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET));
+        admit("repair");
+        Member replay = second.registerMember(POOL, guard("op-repair-register", "register"), registration("repair", "r-1", "i-1"));
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.incarnation()).isEqualTo(preparing.incarnation());
+    }
+
+    @Test
+    void concurrentRepairsCannotReplaceTheSameTargetTwice()
+            throws Exception
+    {
+        configure(3, 3, 1, 3);
+        serving("i-1");
+        suspect("i-1");
+        CountDownLatch start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var attempts = List.of(first, second).stream().map(store -> executor.submit(() -> {
+                start.await();
+                String id = store == first ? "repair-a" : "repair-b";
+                try {
+                    store.registerMember(POOL, guard("register-" + id, "register"), registration(id, "r-1", "i-1"));
+                    return true;
+                }
+                catch (PoolException failure) {
+                    assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET);
+                    return false;
+                }
+            })).toList();
+            start.countDown();
+            int accepted = 0;
+            for (var attempt : attempts) {
+                if (attempt.get(30, TimeUnit.SECONDS)) {
+                    accepted++;
+                }
+            }
+            assertThat(accepted).isEqualTo(1);
+        }
+        assertThat(first.poolState(POOL).orElseThrow().repairInUse()).isEqualTo(1);
+    }
+
+    @Test
     void aProvenLostMemberStopsConsumingItsSlotButASuspectedOneDoesNot()
     {
         configure(1, 1, 0, 0);

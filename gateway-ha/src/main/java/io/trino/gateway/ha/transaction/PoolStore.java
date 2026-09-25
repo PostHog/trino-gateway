@@ -459,10 +459,22 @@ public final class PoolStore
             if (repair) {
                 Row target = memberRow(handle, poolId, registration.repairFor())
                         .orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "The repaired instance is not a member of this pool"));
-                check(Set.of("SUSPECT", "LOST").contains(target.state) || "FAILED".equals(target.retirementKind),
+                boolean departing = Set.of("DRAINING", "SEALED", "RETIRING", "RETIRED").contains(target.state);
+                boolean capacityDeficit = departing && countMembers(handle, poolId, Set.of("ACTIVE", "PREPARING")) < Math.max(pool.desiredMembers, pool.minServing);
+                check(Set.of("SUSPECT", "LOST").contains(target.state) || "FAILED".equals(target.retirementKind) || capacityDeficit,
                         POOL_REPAIR_BUDGET,
-                        "Repair is only permitted for a suspect, lost or failure-retired member");
+                        "Repair requires a failed member or a departing member with unreserved serving capacity missing");
                 check(countRepair(handle, poolId) < pool.maxRepair, POOL_REPAIR_BUDGET, "The pool repair budget is exhausted");
+                check(!handle.createQuery(
+                                        """
+                                        SELECT EXISTS (SELECT 1 FROM transaction_backend
+                                          WHERE pool_id = :pool AND repair AND repair_for = :target AND state = ANY(:phases))
+                                        """)
+                                .bind("pool", poolId).bind("target", registration.repairFor())
+                                .bindArray("phases", String.class, LIVE_PHASES.toArray(String[]::new))
+                                .mapTo(Boolean.class).one(),
+                        POOL_REPAIR_BUDGET,
+                        "This member already has a live repair replacement");
             }
             else {
                 long live = countMembers(handle, poolId, LIVE_PHASES) - countRepair(handle, poolId);
