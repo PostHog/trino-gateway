@@ -170,25 +170,33 @@ jobs:
         run: |
           image="${ECR_REGISTRY}/${IMAGE_NAME}"
           source_url="https://github.com/${GITHUB_REPOSITORY}"
-          tag="sha-${GITHUB_SHA}"
-          reference="${image}:${tag}"
+          short_sha="${GITHUB_SHA:0:6}"
 
+          # Kargo discovers releases lexically by tag and correlates the tag's
+          # short commit with the revision annotation on the OCI index.
           verify_index() {
-            local digest=$1
-            crane manifest "${image}@${digest}" | jq -e \
-              '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+            local ref=$1
+            crane manifest "$ref" | jq -e \
+              --arg source "$source_url" --arg revision "$GITHUB_SHA" '
+              ([.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"])
+              and .annotations["org.opencontainers.image.revision"] == $revision
+              and .annotations["org.opencontainers.image.source"] == $source'
             for arch in amd64 arm64; do
-              crane config --platform "linux/${arch}" "${image}@${digest}" | jq -e \
+              crane config --platform "linux/${arch}" "$ref" | jq -e \
                 --arg source "$source_url" --arg revision "$GITHUB_SHA" \
                 '.config.Labels["org.opencontainers.image.source"] == $source and .config.Labels["org.opencontainers.image.revision"] == $revision'
             done
           }
 
-          # The repository enforces tag immutability. A rerun for a commit that
-          # already has an image must not push different bytes under the same tag.
-          if digest=$(crane digest "$reference" 2>/dev/null); then
-            echo "::notice::${reference} already exists; verifying the published image instead of pushing"
-            verify_index "$digest"
+          # The repository enforces tag immutability and a rerun would mint a
+          # new timestamped tag for the same commit. Verify the existing release
+          # instead of publishing a second one.
+          existing=$(crane ls "$image" | grep -E "^r[0-9]{12}-${short_sha}$" | sort | tail -n 1 || true)
+          if [[ -n "$existing" ]]; then
+            reference="${image}:${existing}"
+            echo "::notice::${reference} already exists for ${GITHUB_SHA}; verifying instead of pushing"
+            verify_index "$reference"
+            digest=$(crane digest "$reference")
             {
               printf 'Already published `%s`\n\n' "$reference"
               printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
@@ -196,19 +204,25 @@ jobs:
             exit 0
           fi
 
+          tag="r$(date -u +%Y%m%d%H%M)-${short_sha}"
+          reference="${image}:${tag}"
           version=$(<trino-gateway-version.txt)
           publish_tmp=$(mktemp -d)
-          manifests=()
+          children=()
           for arch in amd64 arm64; do
             docker save "trino-gateway:${version}-${arch}" -o "${publish_tmp}/${arch}.tar"
             arch_digest=$(crane digest --tarball "${publish_tmp}/${arch}.tar")
-            crane push "${publish_tmp}/${arch}.tar" "${image}@${arch_digest}" --image-refs "${publish_tmp}/${arch}.ref"
-            manifests+=(-m "$(<"${publish_tmp}/${arch}.ref")")
+            crane push "${publish_tmp}/${arch}.tar" "${image}@${arch_digest}"
+            children+=("${image}@${arch_digest}")
           done
 
-          crane index append "${manifests[@]}" -t "$reference"
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --annotation "index:org.opencontainers.image.source=${source_url}" \
+            --tag "$reference" \
+            "${children[@]}"
+          verify_index "$reference"
           digest=$(crane digest "$reference")
-          verify_index "$digest"
           {
             printf 'Published `%s`\n\n' "$reference"
             printf 'Pin deployments to `%s@%s`.\n' "$image" "$digest"
