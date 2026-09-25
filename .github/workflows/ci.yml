@@ -10,6 +10,11 @@ on:
     paths-ignore:
       - 'docs/**'
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the publish job's build, export and index assembly without pushing (any ref)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -100,8 +105,10 @@ jobs:
   publish-ecr:
     if: >-
       github.repository == 'PostHog/trino-gateway' &&
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || inputs.dry_run))
+      )
     needs: [maven-build, transaction-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -116,6 +123,7 @@ jobs:
       AWS_REGION: us-east-1
     steps:
       - name: Require publish role
+        if: ${{ !inputs.dry_run }}
         env:
           PUBLISH_ROLE: ${{ secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
         run: |
@@ -146,30 +154,54 @@ jobs:
       # docker-container builder: the OCI exporter build.sh uses for the
       # publishable layouts is not supported by the default docker driver.
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+        id: buildx
 
       - name: Build and Test Docker Image
         env:
+          # docker build does not follow the buildx "current" builder here;
+          # name it explicitly so the OCI export runs on the container driver.
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
           TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
           TRINO_GATEWAY_IMAGE_REVISION: ${{ github.sha }}
           TRINO_GATEWAY_OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
         run: docker/build.sh
 
+      - name: Assemble and inspect the index (dry run)
+        if: ${{ inputs.dry_run }}
+        env:
+          OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
+        run: |
+          layout=$(mktemp -d)
+          docker/oci-index.sh "$layout" "$GITHUB_SHA" "https://github.com/${GITHUB_REPOSITORY}" \
+            "amd64=${OCI_OUTPUT_DIR}/amd64.tar" "arm64=${OCI_OUTPUT_DIR}/arm64.tar"
+          jq -e --arg revision "$GITHUB_SHA" '
+            .mediaType == "application/vnd.oci.image.index.v1+json"
+            and ([.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"])
+            and ([.manifests[].mediaType] | all(. == "application/vnd.oci.image.manifest.v1+json"))
+            and .annotations["org.opencontainers.image.revision"] == $revision' "${layout}/index.json"
+          echo "::notice::dry run: index assembled and verified locally, nothing pushed"
+          exit 0
+
       - name: Install crane
+        if: ${{ !inputs.dry_run }}
         uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
         with:
           version: v0.22.0
 
       - name: Configure AWS credentials
+        if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@61815dcd50bd041e203e49132bacad1fd04d2708 # v5.1.1
         with:
           role-to-assume: ${{ secrets.TRINO_GATEWAY_AWS_ECR_PUBLISH_IAM_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Log in to Amazon ECR
+        if: ${{ !inputs.dry_run }}
         id: ecr
         uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
 
       - name: Publish and verify image
+        if: ${{ !inputs.dry_run }}
         env:
           ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
           OCI_OUTPUT_DIR: ${{ runner.temp }}/oci
