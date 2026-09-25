@@ -25,16 +25,20 @@ unset.
 
 ## Tags and immutability
 
-Images include OCI source and revision labels. Each run publishes a single
-`sha-<full-commit>` tag pointing at an OCI index with both architectures. The
-ECR repository enforces tag immutability and carries no floating tags such as
-`main` or `latest`.
+Each release is one OCI index with both architectures, tagged
+`r<YYYYMMDDHHmm>-<sha6>` where the suffix is the first six characters of the
+built commit. The index carries `org.opencontainers.image.revision` (full
+commit) and `org.opencontainers.image.source` annotations, and each
+architecture image carries the same values as labels. Kargo's Warehouse
+discovers releases lexically by that tag grammar and checks the annotations
+against the tag before it creates Freight. The ECR repository enforces tag
+immutability and carries no floating tags such as `main` or `latest`.
 
-A rerun for a commit that already has a published tag does not push again. It
-verifies the existing image and reports its digest, because a rebuild can
-produce different bytes when base images or package dependencies change. Pin
-deployments to `@sha256:<digest>`; the publication summary gives the resulting
-multi-architecture digest.
+A rerun for a commit that already has a release tag does not publish again.
+It verifies the newest existing release for that commit and reports its
+digest, because a rebuild can produce different bytes when base images or
+package dependencies change. Pin deployments to `@sha256:<digest>`; the
+publication summary gives the resulting digest.
 
 ## Consumers
 
