@@ -126,11 +126,15 @@ for arch in "${ARCHITECTURES[@]}"; do
         --build-arg TRINO_GATEWAY_BASE_IMAGE="${TRINO_GATEWAY_BASE_IMAGE}" \
         --build-arg TRINO_GATEWAY_BUILD_IMAGE="${TRINO_GATEWAY_BUILD_IMAGE}" \
         --platform "linux/$arch" \
+        --load \
         -f Dockerfile \
         -t "${TAG_PREFIX}-$arch"
     if [[ -n "${TRINO_GATEWAY_OCI_OUTPUT_DIR:-}" ]]; then
         # Same build from cache, exported as an OCI layout tarball so a
         # publisher can assemble a standards-compliant multi-arch index.
+        # The OCI exporter needs a docker-container BuildKit builder (the
+        # default docker driver refuses it); --load above keeps the tested
+        # image in the daemon with either driver.
         mkdir -p "${TRINO_GATEWAY_OCI_OUTPUT_DIR}"
         DOCKER_BUILDKIT=1 \
         docker build \

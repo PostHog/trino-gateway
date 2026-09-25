@@ -143,6 +143,10 @@ jobs:
         with:
           platforms: amd64,arm64
 
+      # docker-container builder: the OCI exporter build.sh uses for the
+      # publishable layouts is not supported by the default docker driver.
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
       - name: Build and Test Docker Image
         env:
           TRINO_GATEWAY_IMAGE_SOURCE: https://github.com/${{ github.repository }}
