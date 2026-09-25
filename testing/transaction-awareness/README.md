@@ -216,6 +216,40 @@ The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields:
 
 ## Pooled member lifecycle
 
+### Replacement capacity during drain
+
+A repair may replace a `DRAINING`, `SEALED`, `RETIRING`, or `RETIRED` member when
+`ACTIVE + PREPARING` is below the larger of the pool's desired and minimum serving
+counts. Counting preparing members reserves their future capacity. Including the
+later departure phases allows an unchanged registration request to finish even
+when its target completes a clean drain during replacement startup.
+
+The existing suspect, lost, and failure-retired repair paths remain available.
+All repair registrations share the configured `maxRepair` allowance and permit
+only one live repair per target. These checks run under the pool transaction
+lock, so different Gateway replicas cannot spend the same allowance concurrently.
+Accepted registration retries still replay their recorded result after capacity
+or target state changes. No replacement registration discards pinned queries or
+transactions, reactivates a draining member, or grants retirement authority.
+
+Deploy this Gateway support before a controller starts selecting departing repair
+targets. The controller must also exclude departures from future serving capacity,
+count live repairs against its allowance, and reserve a target for each replacement.
+Provision sufficient bounded repair headroom; this protocol does not override
+serving, repair, or compute limits when capacity is exhausted.
+
+The PostgreSQL store tests cover budget limits, concurrent duplicate targets,
+reservation accounting, idempotency, and targets finishing their drain. The
+two-process HTTP test also exercises restored routing while an old transaction
+and its query continuation remain pinned to a draining member.
+
+Known limitation: live replacements keep their `repair` classification even after
+their target retires. They continue consuming repair allowance. Automatic budget
+normalization is a separate follow-up; do not infer unlimited repeated-failure
+recovery or clear this accounting manually.
+
+### Multi-process contract fixture
+
 `test_pool_lifecycle` runs the pooled member protocol through the same two-JVM,
 one-PostgreSQL fixture as `test_rollout_api`, with synthetic coordinators. It
 covers bootstrap to the desired member count without deadlocking on the serving

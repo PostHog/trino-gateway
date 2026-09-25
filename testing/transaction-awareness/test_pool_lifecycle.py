@@ -351,6 +351,69 @@ class PoolLifecycleContract(unittest.TestCase):
                               CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
             self.assertNotEqual(refused.status, 200)
 
+    def test_repairs_restore_an_all_draining_pool_without_losing_pinned_work(self):
+        names = tuple(f"member-{index}" for index in range(7))
+        with local_gateways(pool=POOL_CONFIG, backend_names=names) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            epoch = 5
+            self.successful(self.configure(api, epoch, "configure", minServing=3, maxRepair=3))
+            members = {}
+            for index, backend in enumerate(backends[:4]):
+                member = self.bootstrap(api, backend, epoch, "boot-" + backend.state.identity, replica=index % 2)
+                members[member["instanceId"]] = member
+            by_coordinator = {backend.state.coordinator_id: backend.state.identity for backend in backends}
+            started = request(gateways[0] + "/v1/statement", "POST", "START TRANSACTION", CREDENTIAL)
+            self.assertEqual(started.status, 200, started.body)
+            transaction = started.values("X-Trino-Started-Transaction-Id")
+            owner = by_coordinator[started.json()["id"].rsplit("_", 1)[1]]
+            for page in finish(started, gateways[0]):
+                self.assertEqual(page.status, 200, page.body)
+            pending = request(gateways[0] + "/v1/statement", "POST", "SELECT 1",
+                              CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+            self.assertEqual(pending.status, 200, pending.body)
+            continuation = pending.json()["nextUri"]
+            for index, (name, member) in enumerate(members.items()):
+                body = {"operationId": "depart-" + name, "stepId": "suspect", "controllerEpoch": epoch,
+                        "ownerIdentity": self.OWNER, "expectedGeneration": member["generation"],
+                        "reason": "coordinator health unavailable"}
+                suspected = self.successful(api("/members/" + name + "/suspect", "POST", body, replica=index % 2))
+                self.successful(api("/members/" + name + "/drain", "POST", {
+                    "operationId": "depart-" + name, "stepId": "drain", "controllerEpoch": epoch,
+                    "ownerIdentity": self.OWNER, "expectedGeneration": suspected["generation"]}, replica=1))
+            self.assertEqual(self.successful(api(""))["servingMembers"], 0)
+            for index, backend in enumerate(backends[4:]):
+                member = self.identity(backend)
+                name = member["instanceId"]
+                body = {"operationId": "replace-" + name, "stepId": "register", "controllerEpoch": epoch,
+                        "ownerIdentity": self.OWNER, "instanceId": name, "backendName": name,
+                        "podUid": "pod-" + name, "bootId": "boot-" + name,
+                        "configRevision": "r-1", "repairFor": names[index]}
+                registered = self.successful(api("/members", "POST", body, replica=index % 2))
+                self.successful(api("/members/" + name + "/admit", "POST",
+                                    self.admission(member, epoch, registered["generation"], "replace-" + name), replica=1))
+                replayed = self.successful(api("/members", "POST", body, replica=1))
+                self.assertTrue(replayed["replayed"])
+            restored = self.successful(api("", replica=1))
+            self.assertEqual(restored["servingMembers"], 3)
+            self.assertEqual(restored["repairInUse"], 3)
+            self.assertEqual(restored["counts"]["DRAINING"], 4)
+            self.assertEqual(self.successful(api("/members/" + owner + "/obligations"))["openTransactions"], 1)
+            page = request(through_gateway(continuation, gateways[1]))
+            self.assertEqual(page.status, 200, page.body)
+            self.assertEqual(page.json()["id"], pending.json()["id"])
+            for page in finish(page, gateways[1]):
+                self.assertEqual(page.status, 200, page.body)
+                self.assertNotIn("error", page.json())
+            for replica in (0, 1):
+                self.assertIn(self.served_by(gateways, replica=replica), names[4:])
+            inside = request(gateways[1] + "/v1/statement", "POST", "SELECT 2",
+                             CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+            self.assertEqual(inside.status, 200, inside.body)
+            self.assertEqual(by_coordinator[inside.json()["id"].rsplit("_", 1)[1]], owner)
+            for page in finish(inside, gateways[0]):
+                self.assertEqual(page.status, 200, page.body)
+                self.assertNotIn("error", page.json())
+
     def test_a_suspected_member_is_replaced_through_the_drain_path(self):
         """A member that never recovered is replaced without claiming its process ended."""
         with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3]) as (gateways, backends, token):
