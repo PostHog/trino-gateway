@@ -128,6 +128,24 @@ for arch in "${ARCHITECTURES[@]}"; do
         --platform "linux/$arch" \
         -f Dockerfile \
         -t "${TAG_PREFIX}-$arch"
+    if [[ -n "${TRINO_GATEWAY_OCI_OUTPUT_DIR:-}" ]]; then
+        # Same build from cache, exported as an OCI layout tarball so a
+        # publisher can assemble a standards-compliant multi-arch index.
+        mkdir -p "${TRINO_GATEWAY_OCI_OUTPUT_DIR}"
+        DOCKER_BUILDKIT=1 \
+        docker build \
+            "${WORK_DIR}" \
+            ${IMAGE_LABEL_ARGS[@]+"${IMAGE_LABEL_ARGS[@]}"} \
+            --build-arg JDK_RELEASE_NAME="${JDK_RELEASE_NAME}" \
+            --build-arg JDK_DOWNLOAD_LINK="$(temurin_jdk_link "jdk-${JDK_RELEASE_NAME}" "${arch}")" \
+            --build-arg TRINO_GATEWAY_BASE_IMAGE="${TRINO_GATEWAY_BASE_IMAGE}" \
+            --build-arg TRINO_GATEWAY_BUILD_IMAGE="${TRINO_GATEWAY_BUILD_IMAGE}" \
+            --platform "linux/$arch" \
+            --provenance=false \
+            --sbom=false \
+            --output "type=oci,dest=${TRINO_GATEWAY_OCI_OUTPUT_DIR}/${arch}.tar" \
+            -f Dockerfile
+    fi
 done
 
 echo "🧹 Cleaning up the build context directory"
