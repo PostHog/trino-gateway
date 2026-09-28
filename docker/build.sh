@@ -11,11 +11,22 @@ Builds the Trino Gateway Docker image
 -a       Build the specified comma-separated architectures, defaults to amd64,arm64
 -r       Build the specified Trino Gateway release version, downloads all required artifacts
 -j       Build the Trino Gateway release with specified Temurin JDK release
+
+Environment:
+TRINO_GATEWAY_JAR   Path to a prebuilt gateway-ha-<version>-jar-with-dependencies.jar
+                    to package instead of gateway-ha/target; the version is read
+                    from the filename, so neither Java nor Maven is needed
 EOF
 }
 
 # Retrieve the script directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+# Optional prebuilt gateway-ha jar-with-dependencies (for example a CI
+# artifact); a relative path is taken from the caller's directory.
+TRINO_GATEWAY_JAR="${TRINO_GATEWAY_JAR:-}"
+if [[ -n "${TRINO_GATEWAY_JAR}" && "${TRINO_GATEWAY_JAR}" != /* ]]; then
+    TRINO_GATEWAY_JAR="${PWD}/${TRINO_GATEWAY_JAR}"
+fi
 cd "${SCRIPT_DIR}" || exit 2
 
 SOURCE_DIR="${SCRIPT_DIR}/.."
@@ -86,6 +97,16 @@ if [ -n "$TRINO_GATEWAY_VERSION" ]; then
     local_repo=$("${SOURCE_DIR}/mvnw" -B help:evaluate -Dexpression=settings.localRepository -q -DforceStdout)
     trino_gateway_ha="$local_repo/io/trino/gateway/gateway-ha/${TRINO_GATEWAY_VERSION}/gateway-ha-${TRINO_GATEWAY_VERSION}-jar-with-dependencies.jar"
     chmod +x "$trino_gateway_ha"
+elif [ -n "$TRINO_GATEWAY_JAR" ]; then
+    jar_name="$(basename "$TRINO_GATEWAY_JAR")"
+    if [[ ! -f "$TRINO_GATEWAY_JAR" || "$jar_name" != gateway-ha-?*-jar-with-dependencies.jar ]]; then
+        echo >&2 "TRINO_GATEWAY_JAR must name an existing gateway-ha-<version>-jar-with-dependencies.jar, got: ${TRINO_GATEWAY_JAR}"
+        exit 1
+    fi
+    TRINO_GATEWAY_VERSION="${jar_name#gateway-ha-}"
+    TRINO_GATEWAY_VERSION="${TRINO_GATEWAY_VERSION%-jar-with-dependencies.jar}"
+    echo "📦 Using prebuilt Trino Gateway artifact ${TRINO_GATEWAY_JAR} with version ${TRINO_GATEWAY_VERSION}"
+    trino_gateway_ha="$TRINO_GATEWAY_JAR"
 else
     TRINO_GATEWAY_VERSION=$("${SOURCE_DIR}/mvnw" -f "${SOURCE_DIR}/pom.xml" --quiet help:evaluate -Dexpression=project.version -DforceStdout)
     echo "🎯 Using currently built artifacts from the gateway-ha module with version ${TRINO_GATEWAY_VERSION}"
