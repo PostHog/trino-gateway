@@ -25,6 +25,23 @@ public class RoutingConfiguration
 
     private String defaultRoutingGroup = "adhoc";
 
+    /**
+     * Protocol the proxy asserts to Trino in {@code X-Forwarded-Proto}, instead of the scheme of
+     * the connection it received. Set to {@code https} when a load balancer in front of the
+     * Gateway terminates TLS and forwards plain HTTP, so that a coordinator running
+     * {@code http-server.process-forwarded=true} still authenticates and builds next URIs with the
+     * external scheme. {@code null} forwards the connection scheme.
+     */
+    private String forwardedProto;
+
+    /**
+     * Port the proxy asserts to Trino in {@code X-Forwarded-Port}, instead of the port of the
+     * connection it received. Pair with {@link #forwardedProto} behind a load balancer that
+     * terminates TLS: the external port is what next URIs must carry. {@code null} forwards the
+     * connection port.
+     */
+    private Integer forwardedPort;
+
     public Duration getAsyncTimeout()
     {
         return asyncTimeout;
@@ -53,5 +70,25 @@ public class RoutingConfiguration
     public void setDefaultRoutingGroup(String defaultRoutingGroup)
     {
         this.defaultRoutingGroup = defaultRoutingGroup;
+    }
+
+    public String getForwardedProto()
+    {
+        return forwardedProto;
+    }
+
+    public void setForwardedProto(String forwardedProto)
+    {
+        this.forwardedProto = forwardedProto;
+    }
+
+    public Integer getForwardedPort()
+    {
+        return forwardedPort;
+    }
+
+    public void setForwardedPort(Integer forwardedPort)
+    {
+        this.forwardedPort = forwardedPort;
     }
 }
