@@ -63,6 +63,12 @@ include exception messages, SQL text, bound parameters, or credentials.
 Unexpected non-SQL failures log their exception class without their message.
 Expected store conflicts do not produce database failure warnings.
 
+When a deadline expires between attempts, the `DEADLINE` diagnostic retains the
+last database failure's class, SQLState, and vendor code. That failure remains
+the thrown exception's cause. An already-expired phase before the initial
+attempt instead reports `PHASE_DEADLINE`, zero attempts, and `NONE` for the
+exception class and SQLState; no database request has failed in that case.
+
 Identical failure signatures are sampled for 30 seconds. Different operation,
 outcome, exception class, SQLState, or vendor-code signatures are independent;
 the sampling cache holds at most 128 signatures. `suppressed` reports the number

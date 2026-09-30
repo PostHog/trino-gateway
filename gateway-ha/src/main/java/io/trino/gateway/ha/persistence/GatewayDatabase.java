@@ -43,6 +43,27 @@ public final class GatewayDatabase
     private static final Logger log = Logger.get(GatewayDatabase.class);
     private static final long RETRY_BUDGET_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final int MAX_ATTEMPTS = 3;
+    private static final RetryTiming RETRY_TIMING = new RetryTiming();
+
+    static class RetryTiming
+    {
+        long nanoTime()
+        {
+            return System.nanoTime();
+        }
+
+        long remainingNanos()
+                throws SQLException
+        {
+            return DatabaseDeadline.remainingNanos();
+        }
+
+        void sleep(long nanos)
+                throws InterruptedException
+        {
+            TimeUnit.NANOSECONDS.sleep(nanos);
+        }
+    }
 
     public enum Operation
     {
@@ -175,13 +196,20 @@ public final class GatewayDatabase
 
     private static <T> T retry(Operation operation, Safety safety, AtomicBoolean entered, AtomicBoolean completed, Supplier<T> action)
     {
-        long retryDeadline = System.nanoTime() + RETRY_BUDGET_NANOS;
+        return retry(operation, safety, entered, completed, action, RETRY_TIMING);
+    }
+
+    static <T> T retry(Operation operation, Safety safety, AtomicBoolean entered, AtomicBoolean completed, Supplier<T> action, RetryTiming timing)
+    {
+        long retryDeadline = timing.nanoTime() + RETRY_BUDGET_NANOS;
+        RuntimeException lastFailure = null;
         for (int attempt = 1; ; attempt++) {
+            boolean retryBudgetExpired = attempt > 1 && timing.nanoTime() >= retryDeadline;
             try {
-                if (attempt > 1 && System.nanoTime() >= retryDeadline) {
-                    throw new SQLException("Database retry scheduling deadline expired", "57014");
+                if (retryBudgetExpired) {
+                    throw new SQLException("Database retry scheduling deadline expired");
                 }
-                DatabaseDeadline.remainingNanos();
+                timing.remainingNanos();
                 if (attempt > 1 && Thread.currentThread().isInterrupted()) {
                     logFailure(operation, entered.get(), attempt - 1, "INTERRUPTED", "InterruptedException", "NONE", 0);
                     throw new IllegalStateException("Database operation interrupted");
@@ -193,10 +221,23 @@ public final class GatewayDatabase
                 return result;
             }
             catch (SQLException deadline) {
-                logFailure(operation, entered.get(), attempt - 1, "DEADLINE", "SQLException", "57014", 0);
-                throw new IllegalStateException("Database retry deadline expired", deadline);
+                if (lastFailure == null) {
+                    logFailure(operation, entered.get(), 0, "PHASE_DEADLINE", "NONE", "NONE", 0);
+                    throw new IllegalStateException("Database phase deadline expired before the initial attempt");
+                }
+                SQLException sql = sqlFailure(lastFailure);
+                logFailure(
+                        operation,
+                        entered.get(),
+                        attempt - 1,
+                        "DEADLINE",
+                        (sql == null ? lastFailure : sql).getClass().getSimpleName(),
+                        sql == null ? "NONE" : safeState(sql.getSQLState()),
+                        sql == null ? 0 : sql.getErrorCode());
+                throw new IllegalStateException(retryBudgetExpired ? "Database retry scheduling deadline expired" : "Database phase deadline expired before retry", lastFailure);
             }
             catch (RuntimeException failure) {
+                lastFailure = failure;
                 SQLException sql = sqlFailure(failure);
                 String state = sql == null ? "NONE" : safeState(sql.getSQLState());
                 boolean aborted = state.equals("40001") || state.equals("40P01") || state.equals("55P03");
@@ -205,7 +246,7 @@ public final class GatewayDatabase
                 boolean transientFailure = (aborted && (safety != Safety.WRITE || !completed.get())) || (connection && replaySafe);
                 long remaining;
                 try {
-                    remaining = Math.min(DatabaseDeadline.remainingNanos(), retryDeadline - System.nanoTime());
+                    remaining = Math.min(timing.remainingNanos(), retryDeadline - timing.nanoTime());
                 }
                 catch (SQLException ignored) {
                     remaining = 0;
@@ -234,7 +275,7 @@ public final class GatewayDatabase
                         state,
                         vendorCode);
                 try {
-                    TimeUnit.NANOSECONDS.sleep(delay);
+                    timing.sleep(delay);
                 }
                 catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();

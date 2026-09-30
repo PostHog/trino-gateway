@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.logging.Handler;
 import java.util.logging.LogRecord;
@@ -37,6 +38,119 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class TestGatewayDatabase
 {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void deadlineBetweenAttemptsRetainsTheOriginalFailure(boolean ambientPhaseExpires)
+    {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicInteger sleeps = new AtomicInteger();
+        AtomicBoolean slept = new AtomicBoolean();
+        AtomicLong now = new AtomicLong();
+        RuntimeException original = new RuntimeException(new SQLException("PRIVATE_DATABASE_FAILURE", "08006", ambientPhaseExpires ? 9181 : 9182));
+        GatewayDatabase.RetryTiming timing = new GatewayDatabase.RetryTiming()
+        {
+            @Override
+            long nanoTime()
+            {
+                return now.get();
+            }
+
+            @Override
+            long remainingNanos()
+                    throws SQLException
+            {
+                if (ambientPhaseExpires && slept.get()) {
+                    throw new SQLException("synthetic phase expiry", "57014");
+                }
+                return Long.MAX_VALUE;
+            }
+
+            @Override
+            void sleep(long nanos)
+            {
+                if (sleeps.incrementAndGet() == 1) {
+                    return;
+                }
+                slept.set(true);
+                if (!ambientPhaseExpires) {
+                    now.set(java.util.concurrent.TimeUnit.SECONDS.toNanos(11));
+                }
+            }
+        };
+        List<LogRecord> records = new CopyOnWriteArrayList<>();
+        var logger = java.util.logging.Logger.getLogger(GatewayDatabase.class.getName());
+        Handler handler = capturingHandler(records);
+        logger.addHandler(handler);
+        try {
+            assertThatThrownBy(() -> GatewayDatabase.retry(TRANSACTION_STORE, READ, new AtomicBoolean(true), new AtomicBoolean(), () -> {
+                if (calls.incrementAndGet() == 1) {
+                    throw new RuntimeException(new SQLTransientConnectionException("PRIVATE_FIRST_FAILURE", "08001", 9180));
+                }
+                throw original;
+            }, timing)).hasCause(original)
+                    .hasMessage(ambientPhaseExpires ? "Database phase deadline expired before retry" : "Database retry scheduling deadline expired");
+            assertThat(calls).hasValue(2);
+            assertThat(records).singleElement().satisfies(record -> {
+                assertThat(record.getThrown()).isNull();
+                assertThat(record.getMessage()).contains("outcome=DEADLINE", "attempts=2", "exceptionClass=SQLException", "sqlState=08006", "vendorCode=" + (ambientPhaseExpires ? 9181 : 9182))
+                        .doesNotContain("PRIVATE_DATABASE_FAILURE", "PRIVATE_FIRST_FAILURE", "57014");
+            });
+        }
+        finally {
+            logger.removeHandler(handler);
+        }
+    }
+
+    @Test
+    void initiallyExpiredPhaseDoesNotInventDatabaseFailure()
+    {
+        AtomicInteger calls = new AtomicInteger();
+        GatewayDatabase.RetryTiming timing = new GatewayDatabase.RetryTiming()
+        {
+            @Override
+            long remainingNanos()
+                    throws SQLException
+            {
+                throw new SQLException("synthetic phase expiry", "57014");
+            }
+        };
+        List<LogRecord> records = new CopyOnWriteArrayList<>();
+        var logger = java.util.logging.Logger.getLogger(GatewayDatabase.class.getName());
+        Handler handler = capturingHandler(records);
+        logger.addHandler(handler);
+        try {
+            assertThatThrownBy(() -> GatewayDatabase.retry(GatewayDatabase.Operation.HISTORY_DAO, READ, new AtomicBoolean(), new AtomicBoolean(), calls::incrementAndGet, timing))
+                    .isInstanceOf(IllegalStateException.class).hasMessageContaining("phase deadline").hasNoCause();
+            assertThat(calls).hasValue(0);
+            assertThat(records).singleElement().satisfies(record -> {
+                assertThat(record.getThrown()).isNull();
+                assertThat(record.getMessage()).contains("outcome=PHASE_DEADLINE", "attempts=0", "exceptionClass=NONE", "sqlState=NONE", "vendorCode=0")
+                        .doesNotContain("57014");
+            });
+        }
+        finally {
+            logger.removeHandler(handler);
+        }
+    }
+
+    private static Handler capturingHandler(List<LogRecord> records)
+    {
+        return new Handler()
+        {
+            @Override
+            public void publish(LogRecord record)
+            {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"08006", "08001", "40001", "40P01", "55P03", "57P01", "57P03"})
     void retriesTransientReads(String state)
