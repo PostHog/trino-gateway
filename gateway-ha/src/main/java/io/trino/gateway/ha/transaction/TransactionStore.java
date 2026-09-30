@@ -13,6 +13,7 @@
  */
 package io.trino.gateway.ha.transaction;
 
+import io.trino.gateway.ha.persistence.GatewayDatabase;
 import jakarta.annotation.Nullable;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
@@ -43,7 +44,7 @@ public final class TransactionStore
             FROM transaction_backend b WHERE b.incarnation = :id
             """;
 
-    private final Jdbi jdbi;
+    private final GatewayDatabase jdbi;
     private final RolloutStore.Guard operation;
 
     public TransactionStore(Jdbi jdbi)
@@ -53,13 +54,13 @@ public final class TransactionStore
 
     private TransactionStore(Jdbi jdbi, @Nullable RolloutStore.Guard operation)
     {
-        this.jdbi = requireNonNull(jdbi, "jdbi is null");
+        this.jdbi = new GatewayDatabase(requireNonNull(jdbi, "jdbi is null"), GatewayDatabase.Operation.TRANSACTION_STORE);
         this.operation = operation;
     }
 
     public TransactionStore withOperation(RolloutStore.Guard operation)
     {
-        return new TransactionStore(jdbi, requireNonNull(operation, "operation is null"));
+        return new TransactionStore(jdbi.raw(), requireNonNull(operation, "operation is null"));
     }
 
     /**
@@ -106,6 +107,7 @@ public final class TransactionStore
 
     public static final class StoreException
             extends RuntimeException
+            implements GatewayDatabase.ExpectedFailure
     {
         private final ErrorCode code;
 
@@ -264,7 +266,7 @@ public final class TransactionStore
         check(observation.retryWindowSeconds() >= 0, ErrorCode.CONFLICT, "Retry window cannot be negative");
         check(!(observation.clear() && observation.startedTxId() != null), ErrorCode.CONFLICT, "Response both starts and clears a transaction");
         observation.capabilityHashes().forEach(hash -> check(hash.matches("[0-9a-f]{64}"), ErrorCode.CONFLICT, "Capability must be a lowercase SHA-256 hash"));
-        jdbi.useTransaction(handle -> {
+        jdbi.withOperation(GatewayDatabase.Operation.RECORD_RESPONSE).useIdempotentTransaction(handle -> {
             Admission admission = lockAdmissionBackend(handle, admissionId);
             String fingerprint = fingerprint(observation);
             if (isComplete(handle, admissionId)) {
@@ -329,7 +331,7 @@ public final class TransactionStore
 
     public void markUncertain(UUID admissionId)
     {
-        jdbi.useTransaction(handle -> {
+        jdbi.withOperation(GatewayDatabase.Operation.MARK_UNCERTAIN).useIdempotentTransaction(handle -> {
             lockAdmissionBackend(handle, admissionId);
             handle.createUpdate("UPDATE transaction_admission SET state = 'UNCERTAIN' WHERE admission_id = :id AND state <> 'COMPLETE'")
                     .bind("id", admissionId).execute();
@@ -338,7 +340,7 @@ public final class TransactionStore
 
     public void rejectAdmission(UUID admissionId)
     {
-        jdbi.useTransaction(handle -> {
+        jdbi.withOperation(GatewayDatabase.Operation.REJECT_ADMISSION).useIdempotentTransaction(handle -> {
             lockAdmissionBackend(handle, admissionId);
             if (isComplete(handle, admissionId)) {
                 check("REJECTED".equals(recordedObservation(handle, admissionId)), ErrorCode.CONFLICT, "Admission already has a different outcome");
@@ -372,7 +374,7 @@ public final class TransactionStore
 
     public DrainStatus drainStatus(String name)
     {
-        return jdbi.inTransaction(handle -> status(handle, lockBackend(handle, name)));
+        return jdbi.inReadTransaction(handle -> status(handle, lockBackend(handle, name)));
     }
 
     public DrainStatus seal(String name, long generation)

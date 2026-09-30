@@ -18,6 +18,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
+import io.trino.gateway.ha.persistence.GatewayDatabase;
 import jakarta.annotation.Nullable;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
@@ -92,11 +93,11 @@ public final class PoolStore
 
     private static final List<String> ALL_PHASES = List.of("PREPARING", "ACTIVE", "DRAINING", "SEALED", "RETIRING", "RETIRED", "SUSPECT", "LOST");
 
-    private final Jdbi jdbi;
+    private final GatewayDatabase jdbi;
 
     public PoolStore(Jdbi jdbi)
     {
-        this.jdbi = requireNonNull(jdbi, "jdbi is null");
+        this.jdbi = new GatewayDatabase(requireNonNull(jdbi, "jdbi is null"), GatewayDatabase.Operation.POOL_STORE);
     }
 
     public enum PoolErrorCode
@@ -137,6 +138,7 @@ public final class PoolStore
 
     public static final class PoolException
             extends RuntimeException
+            implements GatewayDatabase.ExpectedFailure
     {
         private final PoolErrorCode code;
 
@@ -646,7 +648,7 @@ public final class PoolStore
     {
         validatePoolId(poolId);
         check(after != null && after.length() <= 256, POOL_VALIDATION, "Invalid query cursor");
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadTransaction(handle -> {
             Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
@@ -1081,7 +1083,7 @@ public final class PoolStore
      */
     public Optional<Member> replayedMember(String poolId, Guard guard)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadTransaction(handle -> {
             if (poolRow(handle, poolId).isEmpty()) {
                 return Optional.empty();
             }
@@ -1091,7 +1093,7 @@ public final class PoolStore
 
     public Optional<ReconciliationResult> replayedReconciliation(String poolId, Guard guard)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadTransaction(handle -> {
             if (poolRow(handle, poolId).isEmpty()) {
                 return Optional.empty();
             }
@@ -1253,7 +1255,7 @@ public final class PoolStore
     private <T> T inPool(String poolId, Guard guard, Class<T> resultType, PoolAction<T> action)
     {
         validatePoolId(poolId);
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inIdempotentTransaction(handle -> {
             TransactionStore.lockRoute(handle, poolId);
             Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
             lockedPool(handle, poolId);

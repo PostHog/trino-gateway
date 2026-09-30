@@ -110,10 +110,10 @@ public class JdbcConnectionManager
                     try {
                         log.info("Performing query history cleanup task");
                         long created = System.currentTimeMillis() - TimeUnit.HOURS.toMillis(this.configuration.getQueryHistoryHoursRetention());
-                        jdbi.onDemand(QueryHistoryDao.class).deleteOldHistory(created);
+                        GatewayDatabase.dao(jdbi, QueryHistoryDao.class, GatewayDatabase.Operation.HISTORY_DAO).deleteOldHistory(created);
                     }
                     catch (RuntimeException e) {
-                        log.warn(e, "Query history cleanup failed; the next scheduled run will retry");
+                        log.warn("Query history cleanup failed; the next scheduled run will retry");
                     }
                 },
                 1,

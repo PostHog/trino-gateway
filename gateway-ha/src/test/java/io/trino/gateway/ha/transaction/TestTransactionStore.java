@@ -14,6 +14,7 @@
 package io.trino.gateway.ha.transaction;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.trino.gateway.ha.persistence.GatewayDatabase;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
 import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
 import io.trino.gateway.ha.transaction.TransactionStore.ErrorCode;
@@ -21,6 +22,9 @@ import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
 import io.trino.gateway.ha.transaction.TransactionStore.StoreException;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.sqlobject.SqlObjectPlugin;
+import org.jdbi.v3.sqlobject.statement.SqlQuery;
+import org.jdbi.v3.sqlobject.statement.SqlUpdate;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -31,7 +35,14 @@ import org.junit.jupiter.api.parallel.Isolated;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.SQLTransientConnectionException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -40,6 +51,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.CONFLICT;
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.NOT_ACTIVE;
@@ -68,6 +80,9 @@ class TestTransactionStore
     private TransactionStore first;
     private TransactionStore second;
     private boolean schemaCreated;
+    private String fixtureUrl;
+    private String fixtureUsername;
+    private String fixturePassword;
 
     @BeforeAll
     void setupDatabase()
@@ -90,7 +105,10 @@ class TestTransactionStore
         admin = Jdbi.create(url, username, password);
         admin.useHandle(handle -> handle.execute("CREATE SCHEMA " + schema));
         schemaCreated = true;
-        database = Jdbi.create(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema, username, password);
+        fixtureUrl = url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema;
+        fixtureUsername = username;
+        fixturePassword = password;
+        database = Jdbi.create(fixtureUrl, username, password);
         for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql", "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql", "V11__pool_tenant_principals.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -99,6 +117,7 @@ class TestTransactionStore
         }
         first = new TransactionStore(database);
         second = new TransactionStore(database);
+        database.useHandle(handle -> handle.execute("CREATE TABLE retry_fixture (id integer PRIMARY KEY)"));
     }
 
     @AfterAll
@@ -122,6 +141,213 @@ class TestTransactionStore
         database.useHandle(handle -> handle.execute("TRUNCATE pool_tenant_principal, pool_publication_receipt, pool_publication, pool_tenant_admission, pool_failure_receipt, pool_member_certificate, pool_operation, pool, transaction_rollout, transaction_route, transaction_admission, transaction_query_capability, transaction_query, transaction_binding, transaction_backend"));
         first.ensureBackend("blue", "http://blue.example.test", "http://blue.example.test", "group", "blue-node", "blue-process");
         first.ensureBackend("green", "http://green.example.test", "http://green.example.test", "group", "green-node", "green-process");
+        database.useHandle(handle -> handle.execute("TRUNCATE retry_fixture"));
+    }
+
+    @Test
+    void committedResponseWithLostAcknowledgementRetriesWithoutChangingItsObservation()
+    {
+        Admission admission = first.admitNew("blue", "owner", "group");
+        AtomicInteger commits = new AtomicInteger();
+        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, true));
+        ResponseObservation observation = new ResponseObservation("query", null, false, true, 120);
+        flaky.recordResponse(admission.id(), observation);
+        assertThat(commits).hasValue(2);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        int queries = database.withHandle(handle -> handle.createQuery("SELECT count(*) FROM transaction_query").mapTo(Integer.class).one());
+        assertThat(queries).isEqualTo(1);
+        first.recordResponse(admission.id(), observation);
+        assertThatThrownBy(() -> first.recordResponse(admission.id(), new ResponseObservation("query", null, false, false, 120)))
+                .isInstanceOf(StoreException.class);
+    }
+
+    @Test
+    void uncertaintyWriteWithLostAcknowledgementIsIdempotentAndStillBlocksDrain()
+    {
+        Admission admission = first.admitNew("blue", "owner", "group");
+        AtomicInteger commits = new AtomicInteger();
+        new TransactionStore(commitFailureDatabase(commits, true)).markUncertain(admission.id());
+        assertThat(commits).hasValue(2);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+        String state = database.withHandle(handle -> handle.createQuery("SELECT state FROM transaction_admission WHERE admission_id = :id").bind("id", admission.id()).mapTo(String.class).one());
+        assertThat(state).isEqualTo("UNCERTAIN");
+    }
+
+    @Test
+    void rejectedAdmissionWithLostAcknowledgementIsSettledOnce()
+    {
+        Admission admission = first.admitNew("blue", "owner", "group");
+        AtomicInteger commits = new AtomicInteger();
+        new TransactionStore(commitFailureDatabase(commits, true)).rejectAdmission(admission.id());
+        assertThat(commits).hasValue(2);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        first.rejectAdmission(admission.id());
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void responseConnectionFailureBeforeCommitRetriesTheSameAdmission()
+    {
+        Admission admission = first.admitNew("blue", "owner", "group");
+        AtomicInteger commits = new AtomicInteger();
+        new TransactionStore(commitFailureDatabase(commits, false, "08006"))
+                .recordResponse(admission.id(), new ResponseObservation("query", null, false, true, 120));
+        assertThat(commits).hasValue(2);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    public interface RetryDao
+    {
+        @SqlUpdate("INSERT INTO retry_fixture VALUES (:id)")
+        void insert(int id);
+
+        @SqlQuery("SELECT count(*) FROM retry_fixture")
+        int count();
+
+        default int countViaDefault()
+        {
+            return count();
+        }
+    }
+
+    @Test
+    void daoAutocommitWriteWithLostAcknowledgementIsNotReplayed()
+    {
+        AtomicInteger executed = new AtomicInteger();
+        RetryDao dao = GatewayDatabase.dao(statementFailureDatabase(executed), RetryDao.class, GatewayDatabase.Operation.HISTORY_DAO);
+        assertThatThrownBy(() -> dao.insert(1)).isInstanceOf(RuntimeException.class);
+        assertThat(executed).hasValue(1);
+        int count = database.withHandle(handle -> handle.createQuery("SELECT count(*) FROM retry_fixture").mapTo(Integer.class).one());
+        assertThat(count).isEqualTo(1);
+    }
+
+    @Test
+    void daoDefaultMethodUsesReadRetryAndFreshConnection()
+    {
+        AtomicInteger executed = new AtomicInteger();
+        RetryDao dao = GatewayDatabase.dao(statementFailureDatabase(executed), RetryDao.class, GatewayDatabase.Operation.HISTORY_DAO);
+        assertThat(dao.countViaDefault()).isZero();
+        assertThat(executed).hasValue(2);
+        assertThat(dao.equals(dao)).isTrue();
+    }
+
+    @Test
+    void daoWriteRetriesConnectionAcquisitionBeforeDispatch()
+    {
+        AtomicInteger opened = new AtomicInteger();
+        Jdbi flaky = Jdbi.create(() -> {
+            if (opened.incrementAndGet() == 1) {
+                throw new SQLTransientConnectionException("synthetic acquisition failure", "08001");
+            }
+            return DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+        }).installPlugin(new SqlObjectPlugin());
+        RetryDao dao = GatewayDatabase.dao(flaky, RetryDao.class, GatewayDatabase.Operation.HISTORY_DAO);
+        dao.insert(1);
+        assertThat(opened).hasValue(2);
+        assertThat(dao.count()).isEqualTo(1);
+    }
+
+    @Test
+    void closeFailureAfterSuccessfulCommitDoesNotRepeatTheWrite()
+    {
+        AtomicInteger opened = new AtomicInteger();
+        Jdbi flaky = Jdbi.create(() -> {
+            opened.incrementAndGet();
+            Connection delegate = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (_, method, args) -> {
+                try {
+                    Object result = method.invoke(delegate, args);
+                    if (method.getName().equals("close")) {
+                        throw new SQLException("synthetic pool reset failure after commit", "40001");
+                    }
+                    return result;
+                }
+                catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        });
+        assertThatThrownBy(() -> new TransactionStore(flaky).admitNew("blue", "owner", "group")).isInstanceOf(RuntimeException.class);
+        assertThat(opened).hasValue(1);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    private Jdbi statementFailureDatabase(AtomicInteger executed)
+    {
+        return Jdbi.create(() -> {
+            Connection delegate = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (_, method, args) -> {
+                try {
+                    Object result = method.invoke(delegate, args);
+                    if (method.getName().equals("prepareStatement")) {
+                        return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(), new Class<?>[] {PreparedStatement.class}, (_, statementMethod, statementArgs) -> {
+                            try {
+                                Object statementResult = statementMethod.invoke(result, statementArgs);
+                                if (statementMethod.getName().equals("execute") && executed.incrementAndGet() == 1) {
+                                    throw new SQLException("synthetic statement acknowledgement loss", "08006");
+                                }
+                                return statementResult;
+                            }
+                            catch (InvocationTargetException e) {
+                                throw e.getCause();
+                            }
+                        });
+                    }
+                    return result;
+                }
+                catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        }).installPlugin(new SqlObjectPlugin());
+    }
+
+    @Test
+    void ambiguousAdmissionCommitIsNotRetriedOrDuplicated()
+    {
+        AtomicInteger commits = new AtomicInteger();
+        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, true));
+        assertThatThrownBy(() -> flaky.admitNew("blue", "owner", "group")).isInstanceOf(RuntimeException.class);
+        assertThat(commits).hasValue(1);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void knownTransactionAbortRetriesFromTheBeginning()
+    {
+        AtomicInteger commits = new AtomicInteger();
+        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, false));
+        flaky.admitNew("blue", "owner", "group");
+        assertThat(commits).hasValue(2);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    private Jdbi commitFailureDatabase(AtomicInteger commits, boolean committed)
+    {
+        return commitFailureDatabase(commits, committed, committed ? "08006" : "40001");
+    }
+
+    private Jdbi commitFailureDatabase(AtomicInteger commits, boolean committed, String state)
+    {
+        return Jdbi.create(() -> {
+            Connection delegate = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (_, method, args) -> {
+                if (method.getName().equals("commit") && commits.incrementAndGet() == 1) {
+                    if (committed) {
+                        delegate.commit();
+                        throw new SQLException("synthetic acknowledgement loss", state);
+                    }
+                    delegate.rollback();
+                    throw new SQLException("synthetic serialization abort", state);
+                }
+                try {
+                    return method.invoke(delegate, args);
+                }
+                catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        });
     }
 
     @Test

@@ -238,20 +238,25 @@ class TestPoolLifecycleService
     @Test
     void anUnreachableCoordinatorCannotBeRegisteredOnAnOperatorAssertionAlone()
     {
-        PoolLifecycleService service = service(true);
-        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
-        backend.setName("backend-i-1");
-        backend.setProxyTo("http://i-1.example.test");
-        backend.setRoutingGroup("pool-a");
-        when(backendManager.getBackendByName("backend-i-1")).thenReturn(Optional.of(backend));
-        when(httpClient.execute(any(), any())).thenThrow(new IllegalStateException("synthetic probe failure"));
-        // No step was recorded, so the replay lookup finds nothing and the probe still decides.
-        when(jdbi.inTransaction(any())).thenReturn(Optional.empty());
-        expect(503, null, () -> service.registerMember("pool-a", body(
-                """
-                {"operationId":"op-1","stepId":"register","controllerEpoch":1,"instanceId":"i-1",
-                 "backendName":"backend-i-1","podUid":"pod","bootId":"boot","configRevision":"r-1"}
-                """)));
+        try (var construction = mockConstruction(PoolStore.class)) {
+            PoolLifecycleService service = service(true);
+            PoolStore store = construction.constructed().getLast();
+            ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+            backend.setName("backend-i-1");
+            backend.setProxyTo("http://i-1.example.test");
+            backend.setRoutingGroup("pool-a");
+            when(backendManager.getBackendByName("backend-i-1")).thenReturn(Optional.of(backend));
+            when(httpClient.execute(any(), any())).thenThrow(new IllegalStateException("synthetic probe failure"));
+            when(store.replayedMember(anyString(), any())).thenReturn(Optional.empty());
+            expect(503, null, () -> service.registerMember("pool-a", body(
+                    """
+                    {"operationId":"op-1","stepId":"register","controllerEpoch":1,"instanceId":"i-1",
+                     "backendName":"backend-i-1","podUid":"pod","bootId":"boot","configRevision":"r-1"}
+                    """)));
+            verify(store).replayedMember(anyString(), any());
+            verifyNoMoreInteractions(store);
+            verify(httpClient).execute(any(), any());
+        }
     }
 
     @Test

@@ -17,6 +17,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.trino.gateway.ha.persistence.GatewayDatabase;
 import jakarta.annotation.Nullable;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
@@ -33,7 +34,7 @@ public final class RolloutStore
 {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final List<String> PHASES = List.of("CLAIMED", "WARMED", "VERIFIED", "CUTOVER", "DRAINING", "SEALED", "STOPPED", "COMPLETE");
-    private final Jdbi jdbi;
+    private final GatewayDatabase jdbi;
 
     public record Guard(String operationId, long version) {}
 
@@ -43,7 +44,7 @@ public final class RolloutStore
 
     public RolloutStore(Jdbi jdbi)
     {
-        this.jdbi = jdbi;
+        this.jdbi = new GatewayDatabase(jdbi, GatewayDatabase.Operation.ROLLOUT_STORE);
     }
 
     public Operation acquire(String group, String operationId, Plan plan)
