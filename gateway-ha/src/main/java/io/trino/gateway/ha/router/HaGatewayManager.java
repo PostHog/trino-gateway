@@ -24,6 +24,7 @@ import io.airlift.stats.CounterStat;
 import io.trino.gateway.ha.config.DatabaseCacheConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.config.RoutingConfiguration;
+import io.trino.gateway.ha.persistence.GatewayDatabase;
 import io.trino.gateway.ha.persistence.dao.GatewayBackend;
 import io.trino.gateway.ha.persistence.dao.GatewayBackendDao;
 import org.jdbi.v3.core.Jdbi;
@@ -66,7 +67,7 @@ public class HaGatewayManager
     @VisibleForTesting
     public HaGatewayManager(Jdbi jdbi, RoutingConfiguration routingConfiguration, DatabaseCacheConfiguration databaseCacheConfiguration, Ticker ticker)
     {
-        dao = requireNonNull(jdbi, "jdbi is null").onDemand(GatewayBackendDao.class);
+        dao = GatewayDatabase.dao(requireNonNull(jdbi, "jdbi is null"), GatewayBackendDao.class, GatewayDatabase.Operation.BACKEND_DAO);
         defaultRoutingGroup = routingConfiguration.getDefaultRoutingGroup();
 
         Caffeine<Object, Object> caffeineBuilder = Caffeine.newBuilder()
@@ -102,7 +103,7 @@ public class HaGatewayManager
         }
         catch (Exception e) {
             backendLookupFailures.update(1);
-            log.warn(e, "Failed to fetch backends");
+            log.warn("Failed to fetch backends; see sanitized database diagnostics");
             throw e;
         }
     }
@@ -147,7 +148,7 @@ public class HaGatewayManager
             return getActiveBackends(defaultRoutingGroup);
         }
         catch (Exception e) {
-            log.info("Error fetching backends for default routing group: %s", e.getLocalizedMessage());
+            log.info("Error fetching backends for default routing group; see sanitized database diagnostics");
         }
         return ImmutableList.of();
     }

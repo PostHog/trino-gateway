@@ -15,6 +15,8 @@ package io.trino.gateway.ha.persistence;
 
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.persistence.dao.QueryHistoryDao;
+import org.jdbi.v3.core.Handle;
+import org.jdbi.v3.core.HandleCallback;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -37,7 +39,10 @@ final class TestJdbcConnectionManager
     {
         Jdbi database = Mockito.mock(Jdbi.class);
         QueryHistoryDao history = Mockito.mock(QueryHistoryDao.class);
-        when(database.onDemand(QueryHistoryDao.class)).thenReturn(history);
+        Handle handle = Mockito.mock(Handle.class);
+        when(handle.attach(QueryHistoryDao.class)).thenReturn(history);
+        when(database.withHandle(Mockito.<HandleCallback<Object, RuntimeException>>any()))
+                .thenAnswer(call -> call.<HandleCallback<Object, RuntimeException>>getArgument(0).withHandle(handle));
         CountDownLatch recovered = new CountDownLatch(1);
         Mockito.doThrow(new IllegalStateException("synthetic database timeout"))
                 .doAnswer(_ -> {

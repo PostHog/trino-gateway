@@ -34,7 +34,12 @@ import org.junit.jupiter.api.parallel.Isolated;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -42,6 +47,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_APIMODE;
 import static io.trino.gateway.ha.transaction.PoolStore.PoolErrorCode.POOL_EVIDENCE_REQUIRED;
@@ -97,6 +103,9 @@ class TestPoolStore
     private TransactionStore transactions;
     private boolean schemaCreated;
     private long epoch;
+    private String fixtureUrl;
+    private String fixtureUsername;
+    private String fixturePassword;
 
     @BeforeAll
     void setupDatabase()
@@ -120,6 +129,9 @@ class TestPoolStore
         admin.useHandle(handle -> handle.execute("CREATE SCHEMA " + schema));
         schemaCreated = true;
         database = Jdbi.create(url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema, username, password);
+        fixtureUrl = url + (url.contains("?") ? "&" : "?") + "currentSchema=" + schema;
+        fixtureUsername = username;
+        fixturePassword = password;
         for (String version : new String[] {
                 "V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql",
                 "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql",
@@ -178,6 +190,33 @@ class TestPoolStore
         assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner"))
                 .isInstanceOfSatisfying(TransactionStore.StoreException.class,
                         failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.NOT_ACTIVE));
+    }
+
+    @Test
+    void committedPoolStepWithLostAcknowledgementReplaysItsReceipt()
+    {
+        AtomicInteger commits = new AtomicInteger();
+        Jdbi flaky = Jdbi.create(() -> {
+            Connection delegate = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            return (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (_, method, args) -> {
+                if (method.getName().equals("commit") && commits.incrementAndGet() == 1) {
+                    delegate.commit();
+                    throw new SQLException("synthetic acknowledgement loss", "08006");
+                }
+                try {
+                    return method.invoke(delegate, args);
+                }
+                catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        });
+        Guard guard = guard("op-lost-ack", "register");
+        Member member = new PoolStore(flaky).registerMember(POOL, guard, registration("i-1"));
+        assertThat(commits).hasValue(2);
+        assertThat(second.registerMember(POOL, guard, registration("i-1"))).isEqualTo(member);
+        long count = database.withHandle(handle -> handle.createQuery("SELECT count(*) FROM transaction_backend").mapTo(Long.class).one());
+        assertThat(count).isEqualTo(1);
     }
 
     @Test
