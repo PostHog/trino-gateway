@@ -100,6 +100,10 @@ public class ProxyRequestHandler
     private final boolean forwardedHeadersEnabled;
     private final Optional<String> forwardedProto;
     private final Optional<String> forwardedPort;
+    // With an asserted external hop the Gateway is the trust boundary for forwarded metadata on every
+    // route: a client-supplied Forwarded or X-Forwarded-* header must not reach Trino, where a
+    // process-forwarded coordinator could prefer it over the Gateway's own value.
+    private final boolean assertsForwarded;
     private final List<String> statementPaths;
     private final boolean includeClusterInfoInResponse;
     private final ProxyResponseConfiguration proxyResponseConfiguration;
@@ -127,6 +131,8 @@ public class ProxyRequestHandler
         forwardedProto = Optional.ofNullable(haGatewayConfiguration.getRouting().getForwardedProto());
         forwardedProto.ifPresent(proto -> checkArgument(proto.equals("http") || proto.equals("https"), "routing.forwardedProto must be http or https, got %s", proto));
         forwardedPort = Optional.ofNullable(haGatewayConfiguration.getRouting().getForwardedPort()).map(String::valueOf);
+        assertsForwarded = forwardedProto.isPresent() || forwardedPort.isPresent();
+        checkArgument(!assertsForwarded || forwardedHeadersEnabled, "routing.forwardedProto and routing.forwardedPort require routing.forwardedHeadersEnabled");
         statementPaths = haGatewayConfiguration.getStatementPaths();
         this.includeClusterInfoInResponse = haGatewayConfiguration.isIncludeClusterHostInResponse();
         proxyResponseConfiguration = haGatewayConfiguration.getProxyResponseConfiguration();
@@ -477,7 +483,7 @@ public class ProxyRequestHandler
                 return false;
             }
         }
-        if (isForwardedHeader(name) && !forwardedHeadersEnabled) {
+        if (isForwardedHeader(name) && (!forwardedHeadersEnabled || assertsForwarded)) {
             return false;
         }
         return true;

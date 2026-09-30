@@ -254,6 +254,11 @@ routing:
   forwardedPort: 443
 ```
 
+When either setting is present, the Gateway is the trust boundary for
+forwarded metadata on every route: it drops client-supplied `Forwarded` and
+`X-Forwarded-*` headers before adding its own, so a client cannot describe a
+different host or protocol to Trino than the one the Gateway routed.
+
 ## Configure larger proxy response size
 
 Trino Gateway reads the response from Trino in bytes (up to 32MB by default).
