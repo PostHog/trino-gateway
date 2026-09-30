@@ -74,8 +74,10 @@ import static org.junit.jupiter.api.parallel.ExecutionMode.SAME_THREAD;
  * metadata, credentials are neither verified nor weakened by the Gateway, and query and transaction
  * continuations stay pinned to their member.
  * <p>
- * The Gateway under test listens on plain HTTP, so its own forwarded protocol here is {@code http};
- * in the deployed shape TLS terminates at the Gateway and the same code path sends {@code https}.
+ * The Gateway under test listens on plain HTTP, as it does in the deployed shape behind a
+ * TLS-terminating load balancer. {@code routing.forwardedProto} and {@code routing.forwardedPort}
+ * make it assert the external {@code https} and {@code 443} to the coordinator instead of its own
+ * connection scheme and port.
  * What is verified is that the value the coordinator sees is the Gateway's, never the client's.
  */
 @TestInstance(PER_CLASS)
@@ -192,6 +194,9 @@ class TestPooledTransportHttp
         // Pooled members are reached over internal HTTP, so their probe asserts the original protocol.
         // The setting is off by default and never applies to a legacy backend probe.
         configuration.getTransactionAwareness().getPool().setForwardedProtoHttps(true);
+        // TLS terminates in front of the Gateway: the proxy asserts the external protocol and port.
+        configuration.getRouting().setForwardedProto("https");
+        configuration.getRouting().setForwardedPort(443);
         configuration.validate();
         FlywayMigration.migrate(dataStore);
 
@@ -307,8 +312,11 @@ class TestPooledTransportHttp
                 .isEqualTo(200);
 
         Exchange statement = lastStatementExchange();
-        // Exactly one forwarded protocol reaches the coordinator, and it is the Gateway's own scheme.
-        assertThat(statement.headers().get("X-forwarded-proto")).containsExactly(gateway.getScheme());
+        // Exactly one forwarded protocol and port reach the coordinator: the configured external ones,
+        // not the plain-HTTP scheme and ephemeral port of the connection the Gateway received.
+        assertThat(gateway.getScheme()).isEqualTo("http");
+        assertThat(statement.headers().get("X-forwarded-proto")).containsExactly("https");
+        assertThat(statement.headers().get("X-forwarded-port")).containsExactly("443");
         assertThat(statement.headers().get("X-forwarded-host")).hasSize(1);
         assertThat(statement.headers()).doesNotContainKey("Forwarded");
         // The credential is forwarded byte for byte: the Gateway does not verify it and does not weaken it.
@@ -354,7 +362,8 @@ class TestPooledTransportHttp
 
         Exchange statement = lastStatementExchange();
         assertThat(statement.headers()).doesNotContainKey("Forwarded");
-        assertThat(statement.headers().get("X-forwarded-proto")).containsExactly(gateway.getScheme());
+        // The proxy substitutes the configured external protocol, not the client's claim.
+        assertThat(statement.headers().get("X-forwarded-proto")).containsExactly("https");
         assertThat(statement.headers().get("X-forwarded-host")).doesNotContain("warehouse-nine." + DOMAIN);
     }
 

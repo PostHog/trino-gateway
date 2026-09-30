@@ -55,6 +55,7 @@ import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.util.concurrent.Futures.addCallback;
 import static com.google.common.util.concurrent.Futures.nonCancellationPropagating;
@@ -97,6 +98,8 @@ public class ProxyRequestHandler
     private final QueryHistoryManager queryHistoryManager;
     private final boolean cookiesEnabled;
     private final boolean forwardedHeadersEnabled;
+    private final Optional<String> forwardedProto;
+    private final Optional<String> forwardedPort;
     private final List<String> statementPaths;
     private final boolean includeClusterInfoInResponse;
     private final ProxyResponseConfiguration proxyResponseConfiguration;
@@ -121,6 +124,9 @@ public class ProxyRequestHandler
         cookiesEnabled = GatewayCookieConfigurationPropertiesProvider.getInstance().isEnabled();
         asyncTimeout = haGatewayConfiguration.getRouting().getAsyncTimeout();
         forwardedHeadersEnabled = haGatewayConfiguration.getRouting().isForwardedHeadersEnabled();
+        forwardedProto = Optional.ofNullable(haGatewayConfiguration.getRouting().getForwardedProto());
+        forwardedProto.ifPresent(proto -> checkArgument(proto.equals("http") || proto.equals("https"), "routing.forwardedProto must be http or https, got %s", proto));
+        forwardedPort = Optional.ofNullable(haGatewayConfiguration.getRouting().getForwardedPort()).map(String::valueOf);
         statementPaths = haGatewayConfiguration.getStatementPaths();
         this.includeClusterInfoInResponse = haGatewayConfiguration.isIncludeClusterHostInResponse();
         proxyResponseConfiguration = haGatewayConfiguration.getProxyResponseConfiguration();
@@ -477,11 +483,14 @@ public class ProxyRequestHandler
         return true;
     }
 
-    private static void addForwardedHeaders(HttpServletRequest servletRequest, Request.Builder requestBuilder)
+    private void addForwardedHeaders(HttpServletRequest servletRequest, Request.Builder requestBuilder)
     {
         requestBuilder.addHeader(X_FORWARDED_FOR, servletRequest.getRemoteAddr());
-        requestBuilder.addHeader(X_FORWARDED_PROTO, servletRequest.getScheme());
-        requestBuilder.addHeader(X_FORWARDED_PORT, String.valueOf(servletRequest.getServerPort()));
+        // Behind a TLS-terminating load balancer the connection scheme and port are the internal
+        // ones; the configured values assert what the client used, which is what a coordinator
+        // running with process-forwarded needs to authenticate and to build reachable next URIs.
+        requestBuilder.addHeader(X_FORWARDED_PROTO, forwardedProto.orElseGet(servletRequest::getScheme));
+        requestBuilder.addHeader(X_FORWARDED_PORT, forwardedPort.orElseGet(() -> String.valueOf(servletRequest.getServerPort())));
         String serverName = servletRequest.getServerName();
         if (serverName != null) {
             requestBuilder.addHeader(X_FORWARDED_HOST, serverName);

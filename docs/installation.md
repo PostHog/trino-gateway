@@ -238,6 +238,22 @@ serverConfig:
   http-server.process-forwarded: true
 ```
 
+If the load balancer terminates TLS and the Gateway listens on plain HTTP,
+but you do not want the Gateway to trust client-supplied forwarded headers
+(`http-server.process-forwarded: ignore`), configure the protocol and port the
+proxy asserts to Trino instead of the scheme and port of the connection it
+received. Trino clusters running `http-server.process-forwarded=true` refuse
+password authentication over a request that does not carry a forwarded HTTPS
+scheme, and they build next URIs from the forwarded protocol and port:
+
+```yaml
+serverConfig:
+  http-server.process-forwarded: ignore
+routing:
+  forwardedProto: https
+  forwardedPort: 443
+```
+
 ## Configure larger proxy response size
 
 Trino Gateway reads the response from Trino in bytes (up to 32MB by default).

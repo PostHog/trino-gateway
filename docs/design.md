@@ -25,6 +25,10 @@ Flow of request forwarding:
    headers case-insensitively, and skips adding its own proxy headers. This 
    allows the Trino backend to respond with `nextUri` values that point directly 
    to the backend instead of routing back through the load balancer or gateway.
+   `routing.forwardedProto` and `routing.forwardedPort` replace the connection
+   scheme and port in the Gateway's own `X-Forwarded-Proto` and
+   `X-Forwarded-Port` headers, for deployments where a load balancer in front
+   of the Gateway terminates TLS.
 3. Some request URI require special handling. For example, a
    request which submit a new query, Trino Gateway retrieves the queryId from the
    response from Trino. Some requests to the web UI require setting a session
