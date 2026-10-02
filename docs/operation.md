@@ -159,6 +159,27 @@ scrape_configs:
         - gateway1.example.com:8080
 ```
 
+## Pooled members and legacy administration
+
+Pooled members use `/gateway/v1/pools/...` for lifecycle administration. The older
+`/gateway/transactions/backends/...` and route-management APIs administer non-pooled
+backends. These are administration interfaces, not the client SQL protocol.
+
+Changing a pool's `apiMode` to `LEGACY` does not convert its former members into
+legacy backends. Their identities remain pooled permanently, including after
+retirement or loss. Legacy registration, routing, resume, and other lifecycle
+calls against those identities return `CONFLICT`. This prevents a retired member
+from becoming routable again through another administration interface.
+
+If you intentionally return a routing group to legacy mode, register a new
+non-pooled backend with a fresh name, endpoint, and process identity. Do not reuse
+a former pool member or delete its ledger rows to bypass the restriction. The
+mode change requires no live pooled members; it does not authorize destructive
+retirement or settle any unresolved obligations.
+
+See [pooled cordon coordination](design/pooled-cordon-coordination.md) for lock
+behavior, rolling-upgrade prerequisites, and recovery limits.
+
 ## Transaction lifecycle diagnostics
 
 With transaction-aware routing, the existing `/metrics` endpoint exports fixed-name

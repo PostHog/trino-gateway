@@ -18,7 +18,6 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import io.airlift.log.Logger;
 import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
-import org.jdbi.v3.core.transaction.TransactionIsolationLevel;
 import org.jdbi.v3.sqlobject.statement.SqlQuery;
 
 import java.lang.reflect.InvocationHandler;
@@ -167,8 +166,12 @@ public final class GatewayDatabase
             completed.set(false);
             return jdbi.withHandle(handle -> {
                 entered.set(true);
-                T result = readCommitted ? handle.inTransaction(TransactionIsolationLevel.READ_COMMITTED, action::apply) :
-                        transaction ? handle.inTransaction(action::apply) : action.apply(handle);
+                T result = transaction ? handle.inTransaction(transactionHandle -> {
+                    if (readCommitted) {
+                        transactionHandle.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+                    }
+                    return action.apply(transactionHandle);
+                }) : action.apply(handle);
                 completed.set(true);
                 return result;
             });

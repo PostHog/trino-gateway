@@ -34,6 +34,9 @@ barrier where their decisions require admission exclusion. Cordon and suspicion
 use a shared route lock; the pool row still serializes authority and membership
 changes.
 
+The first statement sets transaction-local isolation. It does not read, change,
+or restore the connection's session isolation setting on every request.
+
 Completion still serializes updates to its admission, query, and transaction.
 Removing its lifecycle lock does not remove these ownership checks or make
 completion lock-free. An outstanding admission remains visible until the same
@@ -81,6 +84,9 @@ The current schema's unique backend keys cover identity, not lifecycle state.
 A pooled incarnation remains pooled after retirement or a group-mode change.
 Legacy admission, route selection, and lifecycle administration reject that
 identity rather than reactivating it through the legacy API.
+Returning a group to legacy mode requires a new non-pooled backend with a fresh
+name, endpoint, and process identity. See the
+[operator guidance](../operation.md#pooled-members-and-legacy-administration).
 
 ## Recovery remains conservative
 
