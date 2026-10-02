@@ -1064,6 +1064,32 @@ class TestTransactionStore
         }
     }
 
+    @Test
+    void legacySealTakesAFreshSnapshotAfterAnAdmissionCommits()
+            throws Exception
+    {
+        var draining = first.beginDrain("blue");
+        Jdbi repeatableReadDatabase = Jdbi.create(() -> {
+            Connection connection = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            return connection;
+        });
+        try (var executor = Executors.newSingleThreadExecutor(); Handle admission = database.open()) {
+            admission.begin();
+            int pid = admission.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            admission.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR SHARE")
+                    .bind("id", draining.incarnation()).mapTo(UUID.class).one();
+            var seal = executor.submit(() -> new TransactionStore(repeatableReadDatabase).seal("blue", draining.generation()));
+            awaitDatabaseWaiter(pid);
+            admission.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state) VALUES (:id, :backend, 'owner', 'PENDING')")
+                    .bind("id", UUID.randomUUID()).bind("backend", draining.incarnation()).execute();
+            admission.commit();
+            assertThatThrownBy(() -> seal.get(5, TimeUnit.SECONDS)).satisfies(failure ->
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(StoreException.class, error -> assertThat(error.code()).isEqualTo(NOT_DRAINED)));
+        }
+        assertThat(first.drainStatus("blue").state()).isEqualTo("DRAINING");
+    }
+
     private void awaitDatabaseWaiter(int fencePid)
             throws InterruptedException
     {

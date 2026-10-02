@@ -148,16 +148,17 @@ read-then-write decisions:
    admissions, live transactions, query/result obligations, and unresolved
    observations are settled under the same generation fence.
 
-The selected implementation uses a durable row per admission and locks the
-backend-incarnation row for each state transition. Admission, response recording,
-drain initiation and final sealing share that lock. This removes the need for an
-all-replica acknowledgement protocol. Local reference counts or an elapsed replica
-lease alone cannot establish safe drain. Do not hold a database transaction open
-across a remote HTTP request.
+The selected implementation uses a durable row per admission. Pooled backends
+separate admission and final sealing from response completion; see
+[pooled cordon coordination](pooled-cordon-coordination.md). Legacy backend
+operations retain their existing row-lock protocol. Neither protocol requires
+all-replica acknowledgements. Local reference counts or an elapsed replica lease
+alone cannot establish safe drain. Do not hold a database transaction open across
+a remote HTTP request.
 
 Reading drain status must not change state. Report `readyToSeal` when no blocking
-obligations remain. Report `drained` only after an explicit seal operation locks
-the same backend row, rechecks all obligations, and commits SEALED. A sealed
+obligations remain. Report `drained` only after an explicit seal operation excludes
+admissions, rechecks all obligations, and commits SEALED. A sealed
 backend rejects late continuation admission as well as new statements. This
 prevents a late GET racing between a zero-count observation and backend teardown.
 Seal and resume require the caller's expected generation. Drain, seal and resume advance

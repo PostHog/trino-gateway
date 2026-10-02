@@ -23,7 +23,10 @@ import io.trino.gateway.ha.transaction.PoolStore.PoolSpec;
 import io.trino.gateway.ha.transaction.PoolStore.Termination;
 import io.trino.gateway.ha.transaction.PoolStore.ValidationReceipt;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
+import org.jdbi.v3.core.Handle;
 import org.jdbi.v3.core.Jdbi;
+import org.jdbi.v3.core.statement.SqlLogger;
+import org.jdbi.v3.core.statement.StatementContext;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -31,6 +34,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
@@ -1208,6 +1213,12 @@ class TestPoolStore
         Member sealed = seal("i-1");
         assertThat(sealed.phase()).isEqualTo("SEALED");
         assertThat(sealed.drained()).isTrue();
+        var observed = first.obligations(POOL, "i-1").orElseThrow();
+        assertThat(observed.readyToSeal()).isEqualTo(sealed.readyToSeal()).isFalse();
+        assertThat(observed.drained()).isEqualTo(sealed.drained()).isTrue();
+        assertThat(observed.pendingRequests()).isEqualTo(sealed.pendingRequests()).isZero();
+        assertThat(observed.openTransactions()).isEqualTo(sealed.openTransactions()).isZero();
+        assertThat(observed.activeQueries()).isEqualTo(sealed.activeQueries()).isZero();
     }
 
     @Test
@@ -1668,12 +1679,14 @@ class TestPoolStore
     }
 
     @Test
-    void anAdmissionCannotCommitAgainstAConcurrentlyDrainingMember()
+    void cordonRejectsLaterWorkAndPreservesEveryRacingAdmission()
             throws Exception
     {
         configure(1, 3, 1, 1);
         serving("i-keep");
         serving("i-1");
+        transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        int totalAccepted;
         try (var executor = Executors.newFixedThreadPool(2)) {
             CountDownLatch admitting = new CountDownLatch(1);
             var drainAttempt = executor.submit(() -> {
@@ -1695,16 +1708,13 @@ class TestPoolStore
                 return accepted;
             });
             assertThat(drainAttempt.get(30, TimeUnit.SECONDS)).isEqualTo("DRAINING");
-            admissions.get(30, TimeUnit.SECONDS);
+            totalAccepted = 1 + admissions.get(30, TimeUnit.SECONDS);
         }
-        // Whatever interleaving occurred, no admission may exist that started after the drain committed.
-        long admittedAfterDrain = database.withHandle(handle -> handle.createQuery(
-                """
-                SELECT count(*) FROM transaction_admission a JOIN transaction_backend b USING (incarnation)
-                WHERE b.instance_id = 'i-1' AND b.state <> 'ACTIVE'
-                  AND a.created_at > (SELECT max(recorded_at) FROM pool_operation WHERE step_id = 'drain')
-                """).mapTo(Long.class).one());
-        assertThat(admittedAfterDrain).isZero();
+        assertThatThrownBy(() -> transactions.admitPooledMember(POOL, "backend-i-1", "owner"))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.NOT_ACTIVE));
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(totalAccepted);
+        assertThatThrownBy(() -> seal("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
     }
 
     @Test
@@ -2063,5 +2073,316 @@ class TestPoolStore
     {
         Member member = first.member(POOL, instanceId).orElseThrow();
         return first.retiredMember(POOL, instanceId, guard("op-" + instanceId + "-retired", "retired"), member.generation(), true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"response", "uncertain", "rejected"})
+    void completionDoesNotWaitForThePooledLifecycleRow(String outcome)
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        Member member = serving("i-1");
+        var admission = transactions.admitPooledMember(POOL, member.backendName(), "owner");
+        try (var executor = Executors.newSingleThreadExecutor(); Handle lifecycle = database.open()) {
+            lifecycle.begin();
+            lifecycle.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR NO KEY UPDATE")
+                    .bind("id", member.incarnation()).mapTo(UUID.class).one();
+            TransactionStore.admissionBarrier(lifecycle, member.incarnation(), true);
+            var completion = executor.submit(() -> {
+                switch (outcome) {
+                    case "response" -> transactions.recordResponse(admission.id(), new ResponseObservation("query-before-drain", "transaction-before-drain", false, false, 120));
+                    case "uncertain" -> transactions.markUncertain(admission.id());
+                    case "rejected" -> transactions.rejectAdmission(admission.id());
+                    default -> throw new IllegalArgumentException("Unknown test outcome");
+                }
+            });
+            completion.get(2, TimeUnit.SECONDS);
+            lifecycle.rollback();
+        }
+        var obligations = first.obligations(POOL, "i-1").orElseThrow();
+        assertThat(obligations.pendingRequests()).isEqualTo(outcome.equals("uncertain") ? 1 : 0);
+        assertThat(obligations.openTransactions()).isEqualTo(outcome.equals("response") ? 1 : 0);
+        assertThat(obligations.activeQueries()).isEqualTo(outcome.equals("response") ? 1 : 0);
+    }
+
+    @Test
+    void cordonAllowsAnAlreadyAdmittedTransactionToCommit()
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        Member member = serving("i-1");
+        try (var executor = Executors.newSingleThreadExecutor(); Handle admission = database.open()) {
+            admission.begin();
+            admission.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = :pool FOR SHARE")
+                    .bind("pool", POOL).mapTo(String.class).one();
+            admission.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR KEY SHARE")
+                    .bind("id", member.incarnation()).mapTo(UUID.class).one();
+            admission.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state) VALUES (:id, :backend, 'owner', 'PENDING')")
+                    .bind("id", UUID.randomUUID()).bind("backend", member.incarnation()).execute();
+            var cordon = executor.submit(() -> second.drainMember(POOL, "i-1", guard("op-cordon-race", "drain"), member.generation()));
+            assertThat(cordon.get(2, TimeUnit.SECONDS).phase()).isEqualTo("DRAINING");
+            admission.commit();
+        }
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
+        assertThatThrownBy(() -> transactions.admitPooledMember(POOL, member.backendName(), "owner"))
+                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.NOT_ACTIVE));
+        assertThatThrownBy(() -> seal("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sealTakesAFreshSnapshotAfterWaitingForOldOrNewAdmission(boolean oldGateway)
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        Member member = drain(first, "i-1", "op-before-snapshot");
+        PoolStore repeatableReadDefault = new PoolStore(repeatableReadDatabase());
+        try (var executor = Executors.newSingleThreadExecutor(); Handle admission = database.open()) {
+            admission.begin();
+            int pid = admission.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            admission.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR " + (oldGateway ? "SHARE" : "KEY SHARE"))
+                    .bind("id", member.incarnation()).mapTo(UUID.class).one();
+            if (!oldGateway) {
+                TransactionStore.admissionBarrier(admission, member.incarnation(), false);
+            }
+            var seal = executor.submit(() -> repeatableReadDefault.sealMember(POOL, "i-1", guard("op-snapshot-seal", "seal"), member.generation()));
+            awaitDatabaseWaiter(pid);
+            admission.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state) VALUES (:id, :backend, 'owner', 'PENDING')")
+                    .bind("id", UUID.randomUUID()).bind("backend", member.incarnation()).execute();
+            admission.commit();
+            assertThatThrownBy(() -> seal.get(5, TimeUnit.SECONDS)).satisfies(failure ->
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(PoolException.class, error -> assertThat(error.code()).isEqualTo(POOL_NOT_DRAINED)));
+        }
+        assertThat(first.member(POOL, "i-1").orElseThrow().phase()).isEqualTo("DRAINING");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void admissionRechecksTheCommittedSealWithAnOldOrNewSealer(boolean oldGateway)
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        Member member = serving("i-1");
+        var firstAdmission = transactions.admitPooledMember(POOL, member.backendName(), "owner");
+        transactions.recordResponse(firstAdmission.id(), new ResponseObservation("expired-query", null, false, true, 0));
+        drain(first, "i-1", "op-before-late-poll");
+        TransactionStore repeatableReadDefault = new TransactionStore(repeatableReadDatabase());
+        try (var executor = Executors.newSingleThreadExecutor(); Handle seal = database.open()) {
+            seal.begin();
+            int pid = seal.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            seal.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR " + (oldGateway ? "UPDATE" : "NO KEY UPDATE"))
+                    .bind("id", member.incarnation()).mapTo(UUID.class).one();
+            if (!oldGateway) {
+                TransactionStore.admissionBarrier(seal, member.incarnation(), true);
+            }
+            var admission = executor.submit(() -> repeatableReadDefault.admitQuery("expired-query", Optional.of("owner"), Optional.empty()));
+            awaitDatabaseWaiter(pid);
+            seal.createUpdate("UPDATE transaction_backend SET state = 'SEALED', generation = generation + 1 WHERE incarnation = :id")
+                    .bind("id", member.incarnation()).execute();
+            seal.commit();
+            assertThatThrownBy(() -> admission.get(5, TimeUnit.SECONDS)).satisfies(failure ->
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(TransactionStore.StoreException.class, error -> assertThat(error.code()).isEqualTo(TransactionStore.ErrorCode.SEALED)));
+        }
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().pendingRequests()).isZero();
+    }
+
+    @Test
+    void candidateEnumerationFencesAdmissionsBetweenPendingAndCountSnapshots()
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        Member member = serving("i-1");
+        var admission = transactions.admitPooledMember(POOL, member.backendName(), "owner");
+        transactions.recordResponse(admission.id(), new ResponseObservation("candidate-query", null, false, false, 120));
+        drain(first, "i-1", "op-before-enumeration");
+        CountDownLatch checkedPending = new CountDownLatch(1);
+        CountDownLatch resumeScan = new CountDownLatch(1);
+        AtomicInteger scannerPid = new AtomicInteger();
+        Jdbi pausedDatabase = Jdbi.create(fixtureUrl, fixtureUsername, fixturePassword);
+        pausedDatabase.setSqlLogger(new SqlLogger()
+        {
+            @Override
+            public void logAfterExecution(StatementContext context)
+            {
+                if (context.getRawSql().equals(TransactionStore.DRAIN_STATUS_SQL)) {
+                    try (var statement = context.getConnection().createStatement(); var result = statement.executeQuery("SELECT pg_backend_pid()")) {
+                        result.next();
+                        scannerPid.set(result.getInt(1));
+                        checkedPending.countDown();
+                        if (!resumeScan.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("Candidate scan was not released");
+                        }
+                    }
+                    catch (SQLException | InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        });
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            try {
+                var candidates = executor.submit(() -> new PoolStore(pausedDatabase).drainCandidates(POOL, "i-1", ""));
+                assertThat(checkedPending.await(5, TimeUnit.SECONDS)).isTrue();
+                var poll = executor.submit(() -> transactions.admitQuery("candidate-query", Optional.of("owner"), Optional.empty()));
+                awaitDatabaseWaiter(scannerPid.get());
+                resumeScan.countDown();
+                assertThat(candidates.get(5, TimeUnit.SECONDS)).containsExactly(new PoolStore.DrainCandidate("candidate-query", 1));
+                transactions.rejectAdmission(poll.get(5, TimeUnit.SECONDS).id());
+            }
+            finally {
+                resumeScan.countDown();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void oldSealerStillObservesAnObligationDuringNewCompletion(boolean createsQuery)
+            throws Exception
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        Member member = serving("i-1");
+        var initial = transactions.admitPooledMember(POOL, member.backendName(), "owner");
+        if (!createsQuery) {
+            transactions.recordResponse(initial.id(), new ResponseObservation("mixed-query", null, false, false, 120));
+        }
+        var request = createsQuery ? initial : transactions.admitQuery("mixed-query", Optional.of("owner"), Optional.empty());
+        drain(first, "i-1", "op-before-old-seal");
+        try (var executor = Executors.newSingleThreadExecutor(); Handle oldSealer = database.open()) {
+            oldSealer.begin();
+            int pid = oldSealer.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            oldSealer.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR UPDATE")
+                    .bind("id", member.incarnation()).mapTo(UUID.class).one();
+            var completion = executor.submit(() -> transactions.recordResponse(request.id(), new ResponseObservation("mixed-query", null, false, true, 120)));
+            if (createsQuery) {
+                awaitDatabaseWaiter(pid);
+            }
+            else {
+                completion.get(2, TimeUnit.SECONDS);
+            }
+            long obligations = oldSealer.createQuery(TransactionStore.DRAIN_STATUS_SQL).bind("id", member.incarnation())
+                    .map((rs, _) -> rs.getLong("pending") + rs.getLong("transactions") + rs.getLong("queries")).one();
+            assertThat(obligations).isPositive();
+            oldSealer.rollback();
+            completion.get(5, TimeUnit.SECONDS);
+        }
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().activeQueries()).isEqualTo(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"RETIRED", "LOST"})
+    void legacyModeCannotReviveOrRouteAPreviouslyPooledIncarnation(String state)
+    {
+        register("i-1");
+        if (state.equals("RETIRED")) {
+            retire("i-1");
+            retired("i-1");
+        }
+        else {
+            suspect("i-1");
+            lost("i-1");
+        }
+        Member member = first.member(POOL, "i-1").orElseThrow();
+        first.configurePool(POOL, guard("op-switch-legacy", "configure"), new PoolSpec("LEGACY", 1, 1, 1, 1, "r-1", false), false);
+        var route = transactions.routeStatus(POOL);
+        List<Runnable> mutations = List.of(
+                () -> transactions.ensureBackend(member.backendName(), member.url(), member.externalUrl(), POOL, member.nodeId(), member.coordinatorId()),
+                () -> transactions.resume(member.backendName(), member.generation()),
+                () -> transactions.beginDrain(member.backendName()),
+                () -> transactions.seal(member.backendName(), member.generation()),
+                () -> transactions.reincarnate(
+                        member.backendName(),
+                        member.incarnation(),
+                        member.generation(),
+                        new TransactionStore.BackendRef(member.backendName(), UUID.randomUUID(), "http://replacement.example.test", "http://replacement.example.test", POOL, "replacement-node", "replacement-coordinator")),
+                () -> transactions.setRoute(POOL, member.backendName()),
+                () -> transactions.compareAndSetRoute(POOL, route.generation(), route.backendName(), member.backendName(), member.incarnation()),
+                () -> transactions.admitNew(member.backendName(), "owner", POOL));
+        for (Runnable mutation : mutations) {
+            assertThatThrownBy(mutation::run).hasMessageContaining("member lifecycle protocol").isInstanceOfSatisfying(
+                    TransactionStore.StoreException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
+        }
+        assertThat(first.member(POOL, "i-1").orElseThrow().phase()).isEqualTo(state);
+    }
+
+    @Test
+    void configuringLegacyModeSeesAMemberCommittedWhileWaitingForAuthority()
+            throws Exception
+    {
+        CountDownLatch recordedMember = new CountDownLatch(1);
+        CountDownLatch commitMember = new CountDownLatch(1);
+        AtomicInteger registrarPid = new AtomicInteger();
+        Jdbi pausedDatabase = Jdbi.create(fixtureUrl, fixtureUsername, fixturePassword);
+        pausedDatabase.setSqlLogger(new SqlLogger()
+        {
+            @Override
+            public void logAfterExecution(StatementContext context)
+            {
+                if (context.getRawSql().contains("INSERT INTO pool_operation")) {
+                    try (var statement = context.getConnection().createStatement(); var result = statement.executeQuery("SELECT pg_backend_pid()")) {
+                        result.next();
+                        registrarPid.set(result.getInt(1));
+                        recordedMember.countDown();
+                        if (!commitMember.await(10, TimeUnit.SECONDS)) {
+                            throw new AssertionError("Member registration was not released");
+                        }
+                    }
+                    catch (SQLException | InterruptedException e) {
+                        throw new RuntimeException(e);
+                    }
+                }
+            }
+        });
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            try {
+                var registration = executor.submit(() -> new PoolStore(pausedDatabase).registerMember(POOL, guard("op-register-before-mode", "register"), registration("i-1")));
+                assertThat(recordedMember.await(5, TimeUnit.SECONDS)).isTrue();
+                var configuration = executor.submit(() -> new PoolStore(repeatableReadDatabase()).configurePool(
+                        POOL,
+                        guard("op-configure-after-wait", "configure"),
+                        new PoolSpec("LEGACY", 1, 1, 1, 1, "r-1", false),
+                        false));
+                awaitDatabaseWaiter(registrarPid.get());
+                commitMember.countDown();
+                assertThat(registration.get(5, TimeUnit.SECONDS).phase()).isEqualTo("PREPARING");
+                assertThatThrownBy(() -> configuration.get(5, TimeUnit.SECONDS)).satisfies(failure ->
+                        assertThat(failure.getCause()).isInstanceOfSatisfying(PoolException.class, error -> assertThat(error.code()).isEqualTo(POOL_APIMODE)));
+            }
+            finally {
+                commitMember.countDown();
+            }
+        }
+    }
+
+    private Jdbi repeatableReadDatabase()
+    {
+        return Jdbi.create(() -> {
+            Connection connection = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            return connection;
+        });
+    }
+
+    private void awaitDatabaseWaiter(int blockingPid)
+            throws InterruptedException
+    {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (System.nanoTime() < deadline) {
+            boolean blocked = database.withHandle(handle -> handle.createQuery("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE :pid = ANY (pg_blocking_pids(pid)))")
+                    .bind("pid", blockingPid).mapTo(Boolean.class).one());
+            if (blocked) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        throw new AssertionError("The operation did not reach the admission barrier");
     }
 }

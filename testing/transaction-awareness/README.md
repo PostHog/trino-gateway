@@ -7,7 +7,7 @@ fixture. [VALIDATION.md](VALIDATION.md) defines the verification checklist.
 Keep all execution results and deployment outcomes private, including sanitized
 summaries; publish only generic procedures, fixtures, and tests.
 
-This directory contains a Python standard-library black-box test suite and a protocol-focused Trino test double. Python 3.9 or newer is sufficient. The suite deliberately separates baseline controls from the new transaction-awareness contract. Contract failures against upstream are regression evidence, not a successful implementation.
+This directory contains a Python standard-library black-box test suite and a protocol-focused Trino test double. Use Python 3.9 or newer on Linux and Python 3.10 or newer on macOS. The multi-process fixtures require a monotonic clock shared across processes, which macOS Python added in 3.10. The suite deliberately separates baseline controls from the new transaction-awareness contract. Contract failures against upstream are regression evidence, not a successful implementation.
 
 All endpoints must belong to an isolated, disposable test environment. The suite changes backend activation, routing and drain state. It must never target customer services. Fixture control endpoints have no authentication and must remain restricted to the test network.
 
