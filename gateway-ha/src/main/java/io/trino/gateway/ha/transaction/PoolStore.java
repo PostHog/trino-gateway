@@ -385,7 +385,7 @@ public final class PoolStore
         check(!spec.tenantAdmissionEnabled() || verifiedTenantIdentityAvailable,
                 TENANT_IDENTITY_UNVERIFIED,
                 "Tenant admission requires a configured verified tenant identity source");
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             TransactionStore.lockRoute(handle, poolId);
             ensurePoolRow(handle, poolId);
             Row pool = lockedPool(handle, poolId);
@@ -620,7 +620,7 @@ public final class PoolStore
      */
     public Member drainMember(String poolId, String instanceId, Guard guard, long expectedGeneration)
     {
-        return inPool(poolId, guard, Member.class, (handle, pool) -> {
+        return inPool(poolId, guard, Member.class, false, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
             requireGeneration(row, expectedGeneration);
@@ -648,10 +648,11 @@ public final class PoolStore
     {
         validatePoolId(poolId);
         check(after != null && after.length() <= 256, POOL_VALIDATION, "Invalid query cursor");
-        return jdbi.inReadTransaction(handle -> {
+        return jdbi.inReadCommittedReadTransaction(handle -> {
             Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
             check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
             if (obligations(handle, poolId, instanceId).pendingRequests() != 0) {
                 return List.of();
@@ -692,6 +693,7 @@ public final class PoolStore
         return inPool(poolId, guard, ReconciliationResult.class, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
             requireGeneration(row, expectedGeneration);
             check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
             check(Objects.equals(row.nodeId, nodeId) && Objects.equals(row.coordinatorId, coordinatorId),
@@ -721,6 +723,7 @@ public final class PoolStore
         return inPool(poolId, guard, Member.class, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
             requireGeneration(row, expectedGeneration);
             check(!IRREVERSIBLE_PHASES.contains(row.state), POOL_IRREVERSIBLE, "A retiring or retired member cannot be sealed");
             check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be sealed");
@@ -730,7 +733,17 @@ public final class PoolStore
                     "The member still has pending admissions, open transactions or active or retained queries");
             handle.createUpdate("UPDATE transaction_backend SET state = 'SEALED', generation = generation + 1 WHERE incarnation = :id")
                     .bind("id", row.incarnation).execute();
-            return member(handle, poolId, instanceId, pool);
+            return member(handle, poolId, instanceId, pool, new Obligations(
+                    PROTOCOL_VERSION,
+                    instanceId,
+                    row.incarnation,
+                    "SEALED",
+                    row.generation + 1,
+                    0,
+                    0,
+                    0,
+                    false,
+                    true));
         });
     }
 
@@ -740,7 +753,7 @@ public final class PoolStore
     public Member suspectMember(String poolId, String instanceId, Guard guard, long expectedGeneration, String reason)
     {
         check(reason != null && !reason.isBlank() && reason.length() <= 256, POOL_VALIDATION, "reason is required");
-        return inPool(poolId, guard, Member.class, (handle, pool) -> {
+        return inPool(poolId, guard, Member.class, false, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
             requireGeneration(row, expectedGeneration);
@@ -776,6 +789,7 @@ public final class PoolStore
         return inPool(poolId, guard, Member.class, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
             requireGeneration(row, expectedGeneration);
             check(!IRREVERSIBLE_PHASES.contains(row.state), POOL_IRREVERSIBLE, "A retiring or retired member cannot be declared lost");
             check(row.state.equals("SUSPECT"), POOL_PHASE, "Only a suspect member can be declared lost");
@@ -822,6 +836,7 @@ public final class PoolStore
         return inPool(poolId, guard, Member.class, (handle, pool) -> {
             requirePooled(pool);
             Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
             requireGeneration(row, expectedGeneration);
             check(!IRREVERSIBLE_PHASES.contains(row.state), POOL_IRREVERSIBLE, "Retirement was already claimed for this incarnation");
             String kind;
@@ -1254,11 +1269,15 @@ public final class PoolStore
      */
     private <T> T inPool(String poolId, Guard guard, Class<T> resultType, PoolAction<T> action)
     {
+        return inPool(poolId, guard, resultType, true, action);
+    }
+
+    private <T> T inPool(String poolId, Guard guard, Class<T> resultType, boolean exclusiveRoute, PoolAction<T> action)
+    {
         validatePoolId(poolId);
-        return jdbi.inIdempotentTransaction(handle -> {
-            TransactionStore.lockRoute(handle, poolId);
-            Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
-            lockedPool(handle, poolId);
+        return jdbi.inReadCommittedIdempotentTransaction(handle -> {
+            TransactionStore.lockRoute(handle, poolId, exclusiveRoute);
+            Row pool = lockedPool(handle, poolId);
             // An already recorded outcome is resolved before the authority fence, and applies nothing.
             // Otherwise a step committed by a previous leader could never be read back after a takeover
             // raised the epoch, and the operation it belongs to could not be resumed. Reading back a
@@ -1356,7 +1375,7 @@ public final class PoolStore
 
     private static Row lockedMember(Handle handle, String poolId, String instanceId)
     {
-        return handle.createQuery("SELECT * FROM transaction_backend WHERE pool_id = :pool AND instance_id = :instance FOR UPDATE")
+        return handle.createQuery("SELECT * FROM transaction_backend WHERE pool_id = :pool AND instance_id = :instance FOR NO KEY UPDATE")
                 .bind("pool", poolId).bind("instance", instanceId).map((rs, _) -> Row.member(rs)).findOne()
                 .orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool member"));
     }
@@ -1441,8 +1460,12 @@ public final class PoolStore
 
     private static Member member(Handle handle, String poolId, String instanceId, Row pool)
     {
+        return member(handle, poolId, instanceId, pool, obligations(handle, poolId, instanceId));
+    }
+
+    private static Member member(Handle handle, String poolId, String instanceId, Row pool, Obligations obligations)
+    {
         Row row = memberRow(handle, poolId, instanceId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool member"));
-        Obligations obligations = obligations(handle, poolId, instanceId);
         return new Member(
                 PROTOCOL_VERSION,
                 poolId,

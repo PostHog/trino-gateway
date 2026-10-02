@@ -32,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 
 import java.io.IOException;
@@ -52,6 +54,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.CONFLICT;
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.NOT_ACTIVE;
@@ -1062,6 +1065,91 @@ class TestTransactionStore
             assertThat(expected.code()).isIn(CONFLICT, OWNER_MISMATCH);
             return false;
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"WRITE,true", "WRITE,false", "READ,true", "READ,false", "IDEMPOTENT,true", "IDEMPOTENT,false"})
+    void explicitIsolationIsTransactionLocalWithoutSessionRoundTrips(String safety, boolean commit)
+            throws Exception
+    {
+        try (Connection connection = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword)) {
+            connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            AtomicInteger isolationReads = new AtomicInteger();
+            AtomicInteger isolationWrites = new AtomicInteger();
+            Connection observed = (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[] {Connection.class}, (_, method, args) -> {
+                if (method.getName().equals("close")) {
+                    return null;
+                }
+                if (method.getName().equals("getTransactionIsolation")) {
+                    isolationReads.incrementAndGet();
+                }
+                if (method.getName().equals("setTransactionIsolation")) {
+                    isolationWrites.incrementAndGet();
+                }
+                try {
+                    return method.invoke(connection, args);
+                }
+                catch (InvocationTargetException failure) {
+                    throw failure.getCause();
+                }
+            });
+            GatewayDatabase gatewayDatabase = new GatewayDatabase(Jdbi.create(() -> observed), GatewayDatabase.Operation.TRANSACTION_STORE);
+            StoreException rollback = new StoreException(CONFLICT, "Synthetic rollback");
+            Function<Handle, Integer> action = handle -> {
+                assertThat(handle.createQuery("SHOW transaction_isolation").mapTo(String.class).one()).isEqualTo("read committed");
+                handle.execute("INSERT INTO retry_fixture (id) VALUES (1)");
+                if (!commit) {
+                    throw rollback;
+                }
+                return 1;
+            };
+            Runnable operation = switch (safety) {
+                case "WRITE" -> () -> gatewayDatabase.inReadCommittedTransaction(action);
+                case "READ" -> () -> gatewayDatabase.inReadCommittedReadTransaction(action);
+                case "IDEMPOTENT" -> () -> gatewayDatabase.inReadCommittedIdempotentTransaction(action);
+                default -> throw new IllegalArgumentException("Unknown safety");
+            };
+            if (commit) {
+                operation.run();
+            }
+            else {
+                assertThatThrownBy(operation::run).isSameAs(rollback);
+            }
+            assertThat(connection.getAutoCommit()).isTrue();
+            assertThat(connection.getTransactionIsolation()).isEqualTo(Connection.TRANSACTION_REPEATABLE_READ);
+            try (var statement = connection.createStatement(); var result = statement.executeQuery("SELECT count(*) FROM retry_fixture")) {
+                assertThat(result.next()).isTrue();
+                assertThat(result.getInt(1)).isEqualTo(commit ? 1 : 0);
+            }
+            assertThat(isolationReads).hasValue(0);
+            assertThat(isolationWrites).hasValue(0);
+        }
+    }
+
+    @Test
+    void legacySealTakesAFreshSnapshotAfterAnAdmissionCommits()
+            throws Exception
+    {
+        var draining = first.beginDrain("blue");
+        Jdbi repeatableReadDatabase = Jdbi.create(() -> {
+            Connection connection = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
+            connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
+            return connection;
+        });
+        try (var executor = Executors.newSingleThreadExecutor(); Handle admission = database.open()) {
+            admission.begin();
+            int pid = admission.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
+            admission.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR SHARE")
+                    .bind("id", draining.incarnation()).mapTo(UUID.class).one();
+            var seal = executor.submit(() -> new TransactionStore(repeatableReadDatabase).seal("blue", draining.generation()));
+            awaitDatabaseWaiter(pid);
+            admission.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state) VALUES (:id, :backend, 'owner', 'PENDING')")
+                    .bind("id", UUID.randomUUID()).bind("backend", draining.incarnation()).execute();
+            admission.commit();
+            assertThatThrownBy(() -> seal.get(5, TimeUnit.SECONDS)).satisfies(failure ->
+                    assertThat(failure.getCause()).isInstanceOfSatisfying(StoreException.class, error -> assertThat(error.code()).isEqualTo(NOT_DRAINED)));
+        }
+        assertThat(first.drainStatus("blue").state()).isEqualTo("DRAINING");
     }
 
     private void awaitDatabaseWaiter(int fencePid)

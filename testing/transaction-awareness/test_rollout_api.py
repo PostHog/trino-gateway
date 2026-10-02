@@ -35,7 +35,7 @@ def stop_process(process):
 
 
 @contextlib.contextmanager
-def local_gateways(form_auth=False, processes=None, server_config=None, pool=None, backend_names=("blue", "green")):
+def local_gateways(form_auth=False, processes=None, server_config=None, pool=None, backend_names=("blue", "green"), database=None):
     """Two real Gateway processes over one disposable PostgreSQL, with synthetic coordinators.
 
     ``pool`` is the optional ``transactionAwareness.pool`` block; omitted by default, so every
@@ -49,6 +49,9 @@ def local_gateways(form_auth=False, processes=None, server_config=None, pool=Non
         subprocess.run([str(pg_bin / "initdb"), "-D", str(root / "pg"), "-U", "gateway_test", "-A", "trust", "--no-locale"], check=True, stdout=subprocess.DEVNULL)
         subprocess.run([str(pg_bin / "pg_ctl"), "-D", str(root / "pg"), "-l", str(root / "postgres.log"), "-o", f"-h 127.0.0.1 -p {pg_port} -k {directory}", "-w", "start"], check=True, stdout=subprocess.DEVNULL)
         cleanup.callback(subprocess.run, [str(pg_bin / "pg_ctl"), "-D", str(root / "pg"), "-m", "fast", "-w", "stop"], check=True, stdout=subprocess.DEVNULL)
+        if database is not None:
+            database["psql"] = [str(pg_bin / "psql"), "-X", "-qAt", "-v", "ON_ERROR_STOP=1",
+                                "-h", "127.0.0.1", "-p", str(pg_port), "-U", "gateway_test", "postgres"]
         token = secrets.token_hex(32)
         key = secrets.token_hex(32)
         backends = []

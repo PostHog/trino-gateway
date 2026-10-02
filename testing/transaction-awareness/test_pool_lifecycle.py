@@ -8,6 +8,8 @@ backend authentication or any timing property.
 
 import base64
 import json
+import selectors
+import subprocess
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -98,6 +100,55 @@ class PoolLifecycleContract(unittest.TestCase):
         data = [page.json()["data"] for page in pages if page.json().get("data")]
         self.assertTrue(data, "A completed statement returned no data")
         return data[-1][0][0]
+
+    def test_poll_completion_does_not_wait_for_lifecycle_row_lock(self):
+        database = {}
+        with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3], database=database) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            epoch = 3
+            self.successful(self.configure(api, epoch, "configure"))
+            members = {backend.state.identity: self.bootstrap(api, backend, epoch, "boot-" + backend.state.identity)
+                       for backend in backends}
+            initial = request(gateways[0] + "/v1/statement", "POST", "SELECT 1", CREDENTIAL)
+            self.assertEqual(initial.status, 200, initial.body)
+            query_id = initial.json()["id"]
+            backend = next(item for item in backends if query_id.endswith("_" + item.state.coordinator_id))
+            member = members[backend.state.identity]
+            backend.state.poll_release.clear()
+            with backend.state.lock:
+                backend.state.config["hold_poll"] = True
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(request, through_gateway(initial.json()["nextUri"], gateways[1]))
+                try:
+                    self.assertTrue(backend.state.poll_entered.wait(5), "Poll did not reach the coordinator")
+                    # Hold the lifecycle row lock after the other process committed its admission.
+                    locker = subprocess.Popen(database["psql"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE, text=True)
+                    try:
+                        locker.stdin.write("BEGIN;\nSELECT incarnation FROM transaction_backend WHERE incarnation = '" +
+                                           member["incarnation"] + "' FOR NO KEY UPDATE;\n")
+                        locker.stdin.flush()
+                        with selectors.DefaultSelector() as ready:
+                            ready.register(locker.stdout, selectors.EVENT_READ)
+                            self.assertTrue(ready.select(10), "Lifecycle lock was not acquired")
+                            self.assertEqual(locker.stdout.readline().strip(), member["incarnation"])
+                        backend.state.poll_release.set()
+                        response = pending.result(timeout=10)
+                        self.assertEqual(response.status, 200, response.body)
+                        self.assertEqual(self.successful(api("/members/" + backend.state.identity +
+                                                             "/obligations"))["pendingRequests"], 0)
+                    finally:
+                        try:
+                            locker.communicate("ROLLBACK;\n", timeout=10)
+                        finally:
+                            if locker.poll() is None:
+                                locker.kill()
+                                locker.wait(timeout=5)
+                    for page in finish(response, gateways[0]):
+                        self.assertEqual(page.status, 200, page.body)
+                        self.assertNotIn("error", page.json())
+                finally:
+                    backend.state.poll_release.set()
 
     def test_forgotten_executing_query_releases_pool_drain_across_replicas(self):
         with local_gateways(pool=POOL_CONFIG, backend_names=MEMBERS[:3]) as (gateways, backends, token):

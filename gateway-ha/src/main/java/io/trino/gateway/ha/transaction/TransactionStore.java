@@ -33,7 +33,9 @@ public final class TransactionStore
     private static final Pattern SERVICE_PRINCIPAL = Pattern.compile("[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_[0-9a-f]{24}");
     private static final int QUERY_LOCK_NAMESPACE = 0x54585152;
     private static final int TRANSACTION_LOCK_NAMESPACE = 0x54585452;
+    private static final int ADMISSION_BARRIER_NAMESPACE = 0x5458534C;
 
+    // One statement snapshot must cover every obligation transferred atomically by completion.
     static final String DRAIN_STATUS_SQL =
             """
             SELECT b.state, b.generation,
@@ -138,7 +140,7 @@ public final class TransactionStore
                 proposed.routingGroup(),
                 proposed.nodeId(),
                 proposed.coordinatorId());
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, canonical.routingGroup(), false);
             checkLegacyMode(handle, canonical.routingGroup());
             handle.createUpdate(
@@ -152,6 +154,7 @@ public final class TransactionStore
                     .bind("node", canonical.nodeId()).bind("coordinator", canonical.coordinatorId()).execute();
             check(findBackend(handle, canonical.name()).isPresent(), ErrorCode.CONFLICT, "Backend endpoint or process already has another identity");
             BackendRef actual = lockBackend(handle, canonical.name());
+            checkLegacyBackend(actual);
             check(actual.url().equals(canonical.url()) && actual.externalUrl().equals(canonical.externalUrl()) &&
                             actual.routingGroup().equals(canonical.routingGroup()) && Objects.equals(actual.nodeId(), canonical.nodeId()) &&
                             Objects.equals(actual.coordinatorId(), canonical.coordinatorId()),
@@ -195,7 +198,7 @@ public final class TransactionStore
 
     public Admission admitPooledMember(String poolId, String backendName, String ownerHash, @Nullable TenantGate gate)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, poolId, false);
             check(isPooledMode(handle, poolId), ErrorCode.CONFLICT, "Routing group is not in pooled mode");
             checkTenantAdmitted(handle, poolId, gate);
@@ -209,11 +212,12 @@ public final class TransactionStore
 
     public Admission admitNew(String candidateName, String ownerHash, String routingGroup)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, routingGroup, false);
             check(!isPooledMode(handle, routingGroup), ErrorCode.CONFLICT, "Pooled routing groups admit through the member lifecycle protocol");
             String selected = findRoute(handle, routingGroup).orElse(candidateName);
             BackendRef backend = shareBackend(handle, selected);
+            checkLegacyBackend(backend);
             check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
             check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Backend does not accept new statements");
             return insertAdmission(handle, backend, ownerHash, null, null);
@@ -222,9 +226,9 @@ public final class TransactionStore
 
     public Admission admitTransaction(String transactionId, String ownerHash)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             TransactionBinding initial = findTransaction(handle, transactionId).orElseThrow(() -> missing("transaction"));
-            BackendRef backend = shareIncarnation(handle, initial.backend().incarnation());
+            BackendRef backend = shareKnownIncarnation(handle, initial.backend());
             lockIdentity(handle, TRANSACTION_LOCK_NAMESPACE, transactionId);
             TransactionBinding binding = findTransaction(handle, transactionId).orElseThrow(() -> missing("transaction"));
             checkOwner(binding.ownerHash(), ownerHash);
@@ -241,9 +245,9 @@ public final class TransactionStore
 
     public Admission admitQuery(String queryId, Optional<String> ownerHash, Optional<String> transactionId, Optional<String> capabilityHash)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             QueryBinding initial = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
-            BackendRef backend = shareIncarnation(handle, initial.backend().incarnation());
+            BackendRef backend = shareKnownIncarnation(handle, initial.backend());
             lockIdentity(handle, QUERY_LOCK_NAMESPACE, queryId);
             QueryBinding binding = findQuery(handle, queryId).orElseThrow(() -> missing("query"));
             if (binding.transactionId() != null) {
@@ -358,7 +362,7 @@ public final class TransactionStore
 
     public DrainStatus beginDrain(String name, @Nullable UUID expectedIncarnation, @Nullable Long expectedGeneration)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             BackendRef backend = lockAdministrativeBackend(handle, name, "drain");
             if (expectedIncarnation != null || expectedGeneration != null) {
                 DrainStatus before = status(handle, backend);
@@ -374,12 +378,15 @@ public final class TransactionStore
 
     public DrainStatus drainStatus(String name)
     {
-        return jdbi.inReadTransaction(handle -> status(handle, lockBackend(handle, name)));
+        return jdbi.inReadCommittedReadTransaction(handle -> {
+            BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
+            return status(handle, observed.poolId() == null ? lockBackend(handle, name) : observed);
+        });
     }
 
     public DrainStatus seal(String name, long generation)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             BackendRef backend = lockAdministrativeBackend(handle, name, "seal");
             DrainStatus before = status(handle, backend);
             check(before.generation() == generation, ErrorCode.STALE_GENERATION, "Backend generation changed");
@@ -394,7 +401,7 @@ public final class TransactionStore
 
     public DrainStatus resume(String name, long generation)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             BackendRef backend = lockAdministrativeBackend(handle, name, "resume");
             DrainStatus before = status(handle, backend);
             check(before.generation() == generation, ErrorCode.STALE_GENERATION, "Backend generation changed");
@@ -406,12 +413,13 @@ public final class TransactionStore
 
     public long setRoute(String routingGroup, String backendName)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, routingGroup);
             checkLegacyMode(handle, routingGroup);
             RolloutStore.requireGuard(handle, routingGroup, operation);
             check(operation == null, ErrorCode.CONFLICT, "Rollouts must use compare-and-set routing");
             BackendRef backend = lockBackend(handle, backendName);
+            checkLegacyBackend(backend);
             check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
             check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Route target does not accept new statements");
             return handle.createQuery(
@@ -429,7 +437,7 @@ public final class TransactionStore
 
     public RouteStatus compareAndSetRoute(String routingGroup, long expectedGeneration, @Nullable String expectedBackendName, String backendName, UUID backendIncarnation)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, routingGroup);
             checkLegacyMode(handle, routingGroup);
             var owner = RolloutStore.requireGuard(handle, routingGroup, operation);
@@ -442,6 +450,7 @@ public final class TransactionStore
                     ErrorCode.STALE_GENERATION,
                     "Routing group generation or backend changed");
             BackendRef backend = lockBackend(handle, backendName);
+            checkLegacyBackend(backend);
             check(backend.incarnation().equals(backendIncarnation), ErrorCode.STALE_GENERATION, "Destination incarnation changed");
             check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
             check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Route target does not accept new statements");
@@ -470,7 +479,7 @@ public final class TransactionStore
         check(proposed.nodeId() != null && !proposed.nodeId().isBlank() && proposed.coordinatorId() != null && !proposed.coordinatorId().isBlank(),
                 ErrorCode.CONFLICT,
                 "Replacement requires a verified coordinator identity");
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             BackendRef previous = lockAdministrativeBackend(handle, name, "reincarnate");
             DrainStatus before = status(handle, previous);
             check(previous.incarnation().equals(expectedIncarnation) && before.generation() == expectedGeneration,
@@ -502,7 +511,7 @@ public final class TransactionStore
 
     public long clearRoute(String routingGroup)
     {
-        return jdbi.inTransaction(handle -> {
+        return jdbi.inReadCommittedTransaction(handle -> {
             lockRoute(handle, routingGroup);
             checkLegacyMode(handle, routingGroup);
             RolloutStore.requireGuard(handle, routingGroup, operation);
@@ -525,7 +534,7 @@ public final class TransactionStore
         lockRoute(handle, routingGroup, true);
     }
 
-    private static void lockRoute(Handle handle, String routingGroup, boolean exclusive)
+    static void lockRoute(Handle handle, String routingGroup, boolean exclusive)
     {
         handle.createUpdate("INSERT INTO transaction_route (routing_group) VALUES (:group) ON CONFLICT DO NOTHING").bind("group", routingGroup).execute();
         handle.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = :group FOR " + (exclusive ? "UPDATE" : "SHARE"))
@@ -554,8 +563,16 @@ public final class TransactionStore
     private static Admission lockAdmissionBackend(Handle handle, UUID admissionId)
     {
         Admission initial = findAdmission(handle, admissionId, false);
-        shareIncarnation(handle, initial.backend().incarnation());
+        if (initial.backend().poolId() == null) {
+            shareIncarnation(handle, initial.backend().incarnation());
+        }
         return findAdmission(handle, admissionId, true);
+    }
+
+    static void admissionBarrier(Handle handle, UUID incarnation, boolean exclusive)
+    {
+        handle.createQuery("SELECT pg_advisory_xact_lock" + (exclusive ? "" : "_shared") + "(:namespace, :identity)")
+                .bind("namespace", ADMISSION_BARRIER_NAMESPACE).bind("identity", incarnation.hashCode()).mapTo(String.class).one();
     }
 
     private static Admission findAdmission(Handle handle, UUID admissionId, boolean exclusive)
@@ -572,8 +589,8 @@ public final class TransactionStore
 
     private static void lockIdentity(Handle handle, int namespace, String identity)
     {
-        // Acquire the backend fence first, then the admission row, query identity, and transaction identity when applicable.
-        // Separate namespaces prevent query and transaction hash collisions from reversing that order.
+        // Admissions acquire the retirement barrier before query and transaction identities.
+        // Completion locks its admission row, then query and transaction identities without the lifecycle fence.
         handle.createQuery("SELECT pg_advisory_xact_lock(:namespace, :identity)")
                 .bind("namespace", namespace).bind("identity", identity.hashCode()).mapTo(String.class).one();
     }
@@ -641,6 +658,7 @@ public final class TransactionStore
     private BackendRef lockAdministrativeBackend(Handle handle, String name, String action)
     {
         BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
+        checkLegacyBackend(observed);
         lockRoute(handle, observed.routingGroup());
         checkLegacyMode(handle, observed.routingGroup());
         var owner = RolloutStore.requireGuard(handle, observed.routingGroup(), operation);
@@ -657,6 +675,7 @@ public final class TransactionStore
             check(allowed, ErrorCode.CONFLICT, "Rollout backend mutation is out of phase");
         }
         BackendRef locked = lockBackend(handle, name);
+        checkLegacyBackend(locked);
         check(locked.routingGroup().equals(observed.routingGroup()), ErrorCode.CONFLICT, "Backend routing group changed");
         if (owner != null && name.equals(owner.plan().sourceBackend())) {
             check(locked.incarnation().equals(owner.plan().sourceIncarnation()), ErrorCode.STALE_GENERATION, "Rollout source incarnation changed");
@@ -664,16 +683,38 @@ public final class TransactionStore
         return locked;
     }
 
+    private static void checkLegacyBackend(BackendRef backend)
+    {
+        check(backend.poolId() == null, ErrorCode.CONFLICT, "Pooled backend incarnations require the member lifecycle protocol");
+    }
+
     private static BackendRef shareBackend(Handle handle, String name)
     {
+        BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
+        if (observed.poolId() != null) {
+            return shareKnownIncarnation(handle, observed);
+        }
         return handle.createQuery("SELECT * FROM transaction_backend WHERE current_name = :name FOR SHARE").bind("name", name)
                 .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend"));
     }
 
     private static BackendRef shareIncarnation(Handle handle, UUID incarnation)
     {
-        return handle.createQuery("SELECT * FROM transaction_backend WHERE incarnation = :id FOR SHARE").bind("id", incarnation)
+        BackendRef observed = handle.createQuery("SELECT * FROM transaction_backend WHERE incarnation = :id").bind("id", incarnation)
                 .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend incarnation"));
+        return shareKnownIncarnation(handle, observed);
+    }
+
+    private static BackendRef shareKnownIncarnation(Handle handle, BackendRef observed)
+    {
+        UUID incarnation = observed.incarnation();
+        BackendRef locked = handle.createQuery("SELECT * FROM transaction_backend WHERE incarnation = :id FOR " + (observed.poolId() == null ? "SHARE" : "KEY SHARE"))
+                .bind("id", incarnation).map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend incarnation"));
+        if (locked.poolId() != null) {
+            // KEY SHARE also fences older Gateways whose seal still takes FOR UPDATE.
+            admissionBarrier(handle, incarnation, false);
+        }
+        return locked;
     }
 
     private static Optional<BackendRef> findBackend(Handle handle, String name)

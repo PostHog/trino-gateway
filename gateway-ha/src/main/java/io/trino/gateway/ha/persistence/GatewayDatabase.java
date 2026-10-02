@@ -121,6 +121,21 @@ public final class GatewayDatabase
         return run(Safety.IDEMPOTENT, true, action);
     }
 
+    public <T> T inReadCommittedIdempotentTransaction(Function<Handle, T> action)
+    {
+        return run(Safety.IDEMPOTENT, true, action, true);
+    }
+
+    public <T> T inReadCommittedTransaction(Function<Handle, T> action)
+    {
+        return run(Safety.WRITE, true, action, true);
+    }
+
+    public <T> T inReadCommittedReadTransaction(Function<Handle, T> action)
+    {
+        return run(Safety.READ, true, action, true);
+    }
+
     public void useTransaction(Consumer<Handle> action)
     {
         inTransaction(handle -> {
@@ -139,6 +154,11 @@ public final class GatewayDatabase
 
     private <T> T run(Safety safety, boolean transaction, Function<Handle, T> action)
     {
+        return run(safety, transaction, action, false);
+    }
+
+    private <T> T run(Safety safety, boolean transaction, Function<Handle, T> action, boolean readCommitted)
+    {
         AtomicBoolean entered = new AtomicBoolean();
         AtomicBoolean completed = new AtomicBoolean();
         return retry(operation, safety, entered, completed, () -> {
@@ -146,7 +166,12 @@ public final class GatewayDatabase
             completed.set(false);
             return jdbi.withHandle(handle -> {
                 entered.set(true);
-                T result = transaction ? handle.inTransaction(action::apply) : action.apply(handle);
+                T result = transaction ? handle.inTransaction(transactionHandle -> {
+                    if (readCommitted) {
+                        transactionHandle.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+                    }
+                    return action.apply(transactionHandle);
+                }) : action.apply(handle);
                 completed.set(true);
                 return result;
             });
