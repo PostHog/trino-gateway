@@ -98,7 +98,7 @@ class TestTransactionBootstrap
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = true)
+    @ValueSource(booleans = {false, true})
     void productionModulesStartWithoutJustInTimeBindings(boolean enabled)
             throws Exception
     {
@@ -116,6 +116,7 @@ class TestTransactionBootstrap
             monitor.setMonitorType(NOOP);
             configuration.setClusterStatsConfiguration(monitor);
             configuration.getTransactionAwareness().setEnabled(enabled);
+            configuration.getTransactionAwareness().getPool().setEnabled(enabled);
             if (enabled) {
                 configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-bootstrap-only");
                 configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-bootstrap-only");

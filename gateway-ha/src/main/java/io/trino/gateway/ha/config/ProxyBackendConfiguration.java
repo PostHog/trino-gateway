@@ -26,7 +26,7 @@ import static java.util.Objects.requireNonNullElse;
 public class ProxyBackendConfiguration
 {
     private boolean active = true;
-    private String routingGroup;
+    private String routingGroup = "adhoc";
     private String externalUrl;
     private String name;
     private String proxyTo;

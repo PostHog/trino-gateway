@@ -5,15 +5,18 @@ does not claim that the feature, its tests, or a production rollout are complete
 
 ## Scope and guarantees
 
-Gateway requires pooled routing and PostgreSQL. It preserves transaction
-ownership and blocks member retirement while work remains unresolved. Unsupported
-datastores, disabled lifecycle settings, and incomplete security configuration
-fail startup. There is no non-pooled routing path.
+Official upstream functionality is retained. Both `transactionAwareness.enabled`
+and `transactionAwareness.pool.enabled` default to `false`, preserving stock
+upstream routing. Our deployment enables both: it requires hostname-selected
+pools and PostgreSQL, preserves ownership, and blocks member retirement while
+work remains unresolved. Stock selectors, rules, route cookies, and default
+fallback are bypassed in pooled mode, not removed. Unsupported pooled
+datastores and incomplete pooled security configuration fail startup.
 
 This design records the original ledger reasoning. Fixed-backend routing,
 cutover, resume, reincarnation, and rollout sections below are historical. Their
 APIs have been removed. The current hostname and pool contract is in
-[Routing logic](../routing-logic.md) and
+[Pooled routing](../pooled-routing.md) and
 [pooled operation](../../testing/transaction-awareness/OPERATIONS.md).
 
 This is routing, not transaction replication. A transaction cannot move between

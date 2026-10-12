@@ -76,10 +76,9 @@ final class TestHaGatewayResource
     }
 
     @Test
-    void testLegacyActivationUpdatePreservesHealthCache()
+    void testUpdateActiveBackendSetsPendingInHealthCache()
             throws IOException
     {
-        ClusterStats before = getBackendState("update-to-active-test");
         String body = ("{\"name\":\"%s\",\"proxyTo\":\"http://localhost:9999\","
                 + "\"externalUrl\":\"http://localhost:9999\","
                 + "\"routingGroup\":\"adhoc\",\"active\":true}")
@@ -89,17 +88,16 @@ final class TestHaGatewayResource
                 .post(RequestBody.create(body, JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.code()).isEqualTo(409);
+            assertThat(response.isSuccessful()).isTrue();
         }
 
-        assertThat(getBackendState("update-to-active-test")).isEqualTo(before);
+        assertThat(getBackendState("update-to-active-test").trinoStatus()).isEqualTo(TrinoStatus.PENDING);
     }
 
     @Test
-    void testLegacyDeactivationUpdatePreservesHealthCache()
+    void testUpdateInactiveBackendSetsUnhealthyInHealthCache()
             throws IOException
     {
-        ClusterStats before = getBackendState("update-to-inactive-test");
         String body = ("{\"name\":\"%s\",\"proxyTo\":\"http://localhost:9999\","
                 + "\"externalUrl\":\"http://localhost:9999\","
                 + "\"routingGroup\":\"adhoc\",\"active\":false}")
@@ -109,24 +107,24 @@ final class TestHaGatewayResource
                 .post(RequestBody.create(body, JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.code()).isEqualTo(409);
+            assertThat(response.isSuccessful()).isTrue();
         }
 
-        assertThat(getBackendState("update-to-inactive-test")).isEqualTo(before);
+        assertThat(getBackendState("update-to-inactive-test").trinoStatus()).isEqualTo(TrinoStatus.UNKNOWN);
     }
 
     @Test
-    void testLegacyRemovalPreservesRegistrationAndHealthCache()
+    void testRemoveBackendCleansUpState()
             throws IOException
     {
-        ClusterStats before = getBackendState("remove-test");
+        assertThat(getBackendState("remove-test").trinoStatus()).isEqualTo(TrinoStatus.PENDING);
 
         Request request = new Request.Builder()
                 .url("http://localhost:%s/gateway/backend/modify/delete".formatted(routerPort))
                 .post(RequestBody.create("remove-test", JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.code()).isEqualTo(409);
+            assertThat(response.isSuccessful()).isTrue();
         }
 
         Request backendRequest = new Request.Builder()
@@ -134,7 +132,7 @@ final class TestHaGatewayResource
                 .get()
                 .build();
         try (Response response = httpClient.newCall(backendRequest).execute()) {
-            assertThat(response.code()).isEqualTo(200);
+            assertThat(response.code()).isEqualTo(404);
         }
 
         Request allBackendsRequest = new Request.Builder()
@@ -143,10 +141,16 @@ final class TestHaGatewayResource
                 .build();
         try (Response response = httpClient.newCall(allBackendsRequest).execute()) {
             assertThat(response.isSuccessful()).isTrue();
-            assertThat(response.body().string()).contains("remove-test");
+            assertThat(response.body().string()).doesNotContain("remove-test");
         }
 
-        assertThat(getBackendState("remove-test")).isEqualTo(before);
+        Request stateRequest = new Request.Builder()
+                .url("http://localhost:%s/api/public/backends/remove-test/state".formatted(routerPort))
+                .get()
+                .build();
+        try (Response response = httpClient.newCall(stateRequest).execute()) {
+            assertThat(response.code()).isEqualTo(404);
+        }
     }
 
     private void addBackend(String name, boolean active)

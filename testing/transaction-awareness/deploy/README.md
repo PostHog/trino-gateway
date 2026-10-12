@@ -69,7 +69,7 @@ contracts are listed in the parent test README. Set `TX_CA_FILE` to the generate
 
 The PostgreSQL fault proxy exposes a separate namespace-only HTTP control port.
 The forward command prints `TX_DATABASE_FAULT_URL` for this endpoint. Before
-testing a compatible pool-only artifact, configure the owned Gateway Secret:
+testing a compatible pooled-mode artifact, configure the owned Gateway Secret:
 
 ```sh
 python3 testing/transaction-awareness/deploy/lab.py \

@@ -88,8 +88,9 @@ nav:
       - Operation: operation.md
       - Security: security.md
   - Reference:
-      - Hostname routing: routing-rules.md
+      - Routing rules: routing-rules.md
       - Routing logic: routing-logic.md
+      - Pooled hostname routing: pooled-routing.md
       - Gateway API: gateway-api.md
       - Backend tags: backend-tags.md
       - Code architecture: design.md

@@ -125,6 +125,7 @@ class TestTransactionPooledCompletion
             database.setConnectionAcquisitionTimeoutMillis(250);
             configuration.setDataStore(database);
             configuration.getTransactionAwareness().setEnabled(true);
+            configuration.getTransactionAwareness().getPool().setEnabled(true);
             configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-pooled-completion");
             configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-pooled-completion");
             configuration.getTransactionAwareness().setMaxInFlightRequests(1);
@@ -150,7 +151,7 @@ class TestTransactionPooledCompletion
                 HttpClient proxy = mock(HttpClient.class);
                 SettableFuture<ProxyResponse> raw = SettableFuture.create();
                 doReturn(new TestingResponseFuture(raw)).when(proxy).executeAsync(any(), any());
-                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), configuration);
+                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(io.trino.gateway.ha.router.RoutingManager.class), mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), configuration);
                 handler.setTransactionAwareness(service);
                 try {
                     HttpServletRequest original = request();

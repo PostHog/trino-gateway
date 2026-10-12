@@ -122,6 +122,8 @@ class TestHostnameRoutingGroupSelector
     void invalidConfigurationFailsAtProviderCreation(String hostname)
     {
         HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.getRouting().setHostnameSuffixToPool(Map.of(hostname, "pool-one"));
         assertThatThrownBy(() -> HaGatewayProviderModule.getRoutingGroupSelector(configuration)).isInstanceOf(IllegalArgumentException.class);
     }
@@ -174,9 +176,11 @@ class TestHostnameRoutingGroupSelector
                     tenant.dw.example.test: pool-two
                 """,
                 HaGatewayConfiguration.class);
+        configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         assertThat(HaGatewayProviderModule.getRoutingGroupSelector(configuration).findRoutingDestination(request(List.of("tenant.dw.example.test"))).routingGroup()).isEqualTo("pool-two");
-        assertThatThrownBy(() -> mapper.readValue("routingRules: {rulesEngineEnabled: true}", HaGatewayConfiguration.class))
-                .hasMessageContaining("routingRules");
+        HaGatewayConfiguration legacy = mapper.readValue("routingRules: {rulesEngineEnabled: true}", HaGatewayConfiguration.class);
+        assertThat(legacy.getRoutingRules().isRulesEngineEnabled()).isTrue();
     }
 
     private static void assertRejected(List<String> hosts, int status)
@@ -205,6 +209,8 @@ class TestHostnameRoutingGroupSelector
     private static RoutingGroupSelector selector()
     {
         HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.setRouting(configuration());
         return HaGatewayProviderModule.getRoutingGroupSelector(configuration);
     }

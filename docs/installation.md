@@ -1,19 +1,38 @@
 # Installation
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 Trino Gateway is distributed as an executable JAR file. The [release
 notes](release-notes.md) contain links to download specific versions.
 
-Every Trino Gateway release includes a [Docker container](docker.md) and a 
+Every Trino Gateway release includes a [Docker container](docker.md) and a
 [Helm chart](installation.md#helm) as alternative deployment methods.
 
 Follow the [development instructions](development.md) to
-build the JAR file and the Docker image instructions  or use the 
+build the JAR file and the Docker image instructions  or use the
 `TrinoGatewayRunner` class for local testing.
 The [quickstart guide](quickstart.md) contains instructions for running the
 application locally.
 
 Following are instructions for installing Trino Gateway for production
 environments.
+
+## Pooled deployment requirements
+
+Build and pin compatible Gateway and coordinator artifacts for this fork's
+pool protocol; stock release artifacts and the quickstart are not a pooled
+deployment. Enable both transaction-awareness and pool flags explicitly.
+Pooled mode requires PostgreSQL, separate runtime identity and administration
+keys, hostname mappings, and certified coordinator process identities. See
+[pooled routing](pooled-routing.md). No stock router module, rule file, cookie,
+or header may bypass pool admission. Keep deployment credentials and execution
+receipts outside this repository.
 
 ## Requirements
 
@@ -23,7 +42,7 @@ Consider the following requirements for your Trino Gateway installation.
 
 Trino Gateway requires a Java 25 runtime. Lower versions of Java can not be
 used. Higher versions are verified in our CI pipelines, but you may run into
-unexpected issues. 
+unexpected issues.
 
 Verify the Java version on your system with `java -version`.
 
@@ -35,7 +54,7 @@ performed with Linux and MacOS.
 ### Processor architecture
 
 No specific processor architecture is required, as long as a suitable Java
-distribution is installed.  
+distribution is installed.
 
 ### Backend database
 
@@ -115,7 +134,7 @@ documentation on [pool
 sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) and
 [configuration](https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby).
 
-`Flyway` uses a transactional lock in databases that support it such as 
+`Flyway` uses a transactional lock in databases that support it such as
 [PostgreSQL](https://documentation.red-gate.com/fd/postgresql-database-235241807.html#).
 In the scenario where multiple Trino Gateway instances are running and sharing
 the same backend database, the first Trino Gateway instance to start will get
@@ -139,11 +158,11 @@ of individual clusters.
 
 ### Trino configuration
 
-From a users perspective Trino Gateway acts as a transparent proxy for one 
-or more Trino clusters. The following Trino configuration tips should be 
+From a users perspective Trino Gateway acts as a transparent proxy for one
+or more Trino clusters. The following Trino configuration tips should be
 taken into account for all clusters behind the Trino Gateway.
 
-If all client and server communication is routed through Trino Gateway, 
+If all client and server communication is routed through Trino Gateway,
 then process forwarded HTTP headers must be enabled:
 
 ```properties
@@ -154,13 +173,13 @@ Without this setting, first requests go from the user to Trino Gateway and then
 to Trino correctly. However, the URL for subsequent next URIs for more results
 in a query provided by Trino is then using the local URL of the Trino cluster,
 and not the URL of the Trino Gateway. This circumvents the Trino Gateway for all
-these requests. In scenarios, where the local URL of the Trino cluster is private 
+these requests. In scenarios, where the local URL of the Trino cluster is private
 to the Trino cluster on the network level, these following calls do not work
 at all for users.
 
-This setting is also required for Trino to authenticate in the case TLS is 
-terminated at the Trino Gateway. Normally it refuses to authenticate plain HTTP 
-requests, but if `http-server.process-forwarded=true` it authenticates over 
+This setting is also required for Trino to authenticate in the case TLS is
+terminated at the Trino Gateway. Normally it refuses to authenticate plain HTTP
+requests, but if `http-server.process-forwarded=true` it authenticates over
 HTTP if the request includes a forwarded HTTPS protocol header, such as `X-Forwarded-Proto: HTTPS`.
 
 To prevent Trino Gateway from sending `X-Forwarded-*` and `Forwarded` headers, add the following configuration:
@@ -192,7 +211,7 @@ You can manually set an environment variable on the command line.
 export DB_PASSWORD=my-super-secret-pwd
 ```
 
-To use this variable in the configuration file, you reference it with the 
+To use this variable in the configuration file, you reference it with the
 syntax `${ENV:VARIABLE}`. For example:
 
 ```yaml
@@ -260,10 +279,10 @@ dataStore:
 
 ### Configure logging <a name="logging">
 
-To configure the logging level for various classes, specify the path to the 
+To configure the logging level for various classes, specify the path to the
 `log.properties` file by setting `log.levels-file` in `serverConfig`.
 
-For additional configurations, use the `log.*` properties from the 
+For additional configurations, use the `log.*` properties from the
 [Trino logging properties documentation](https://trino.io/docs/current/admin/properties-logging.html) and specify
 the properties in `serverConfig`.
 
@@ -291,13 +310,13 @@ extraWhitelistPaths:
 
 ### Configure additional v1/statement-like paths
 
-The Trino client protocol specifies that queries are initiated by a POST to `v1/statement`. 
-The Trino Gateway incorporates this into its routing logic by extracting and recording the 
+The Trino client protocol specifies that queries are initiated by a POST to `v1/statement`.
+The Trino Gateway incorporates this into its routing logic by extracting and recording the
 query id from responses to such requests. If you use an experimental or commercial build of
-Trino that supports additional endpoints, you can cause Trino Gateway to treat them 
+Trino that supports additional endpoints, you can cause Trino Gateway to treat them
 equivalently to `/v1/statement` by adding them under the `additionalStatementPaths`
 configuration node. They must be absolute, and no path can be a prefix to any other path.
-The standard `/v1/statement` path is always included and does not need to be configured. 
+The standard `/v1/statement` path is always included and does not need to be configured.
 For example:
 
 ```yaml
@@ -327,9 +346,9 @@ The following pages are available:
 
 ## Configure behind a load balancer
 
-A possible deployment of Trino Gateway is to run multiple instances of Trino 
-Gateway behind another generic load balancer, such as a load balancer from 
-your cloud hosting provider. In this deployment you must configure the 
+A possible deployment of Trino Gateway is to run multiple instances of Trino
+Gateway behind another generic load balancer, such as a load balancer from
+your cloud hosting provider. In this deployment you must configure the
 `serverConfig` to include enabling process forwarded HTTP headers:
 
 ```yaml
@@ -381,10 +400,10 @@ java -XX:MinRAMPercentage=50 -XX:MaxRAMPercentage=80 \
 ### Helm <a name="helm"></a>
 
 Helm manages the deployment of Kubernetes applications by templating Kubernetes
-resources with a set of Helm charts. The Trino Gateway Helm chart is 
+resources with a set of Helm charts. The Trino Gateway Helm chart is
 available in the [Trino Helm chart project](https://github.com/trinodb/charts).
 
-Configure the charts repository as a Helm chart repository with the 
+Configure the charts repository as a Helm chart repository with the
 following command:
 
 ```shell
@@ -393,12 +412,12 @@ helm repo add trino https://trinodb.github.io/charts/
 The Trino Gateway chart consists of the following components:
 
 * A `config` node for general configuration
-* `dataStoreSecret`, `backendStateSecret` and `authenticationSecret` for 
-  providing sensitive configurations through Kubernetes secrets, 
+* `dataStoreSecret`, `backendStateSecret` and `authenticationSecret` for
+  providing sensitive configurations through Kubernetes secrets,
 * Standard Helm options such as `replicaCount`, `resources` and `ingress`.
 
 The default `values.yaml` found in the `helm/trino-gateway` folder includes
-basic configuration options as an example. For a simple deployment, proceed with 
+basic configuration options as an example. For a simple deployment, proceed with
 the following steps:
 
 Create a yaml file containing the configuration for your `datastore`:
@@ -428,18 +447,18 @@ backendStateSecret:
 ```
 
 When a Secret is created with the `--from-file` option, the filename is used as
-the key. Finally, you can deploy Trino Gateway with the chart from the root 
+the key. Finally, you can deploy Trino Gateway with the chart from the root
 of this repository:
 
 ```shell
-helm install tg --values values-override.yaml trino/trino-gateway 
+helm install tg --values values-override.yaml trino/trino-gateway
 ```
 
 Secrets for `authenticationSecret` and `backendState` can be provisioned
-similarly. Alternatively,  you can directly define the `config.backEndState` 
-node in `values-override.yaml` and leave `backendStateSecret` undefined. 
+similarly. Alternatively,  you can directly define the `config.backEndState`
+node in `values-override.yaml` and leave `backendStateSecret` undefined.
 However, a [Secret](https://kubernetes.io/docs/concepts/configuration/secret/)
-is recommended to protect the database credentials required for this 
+is recommended to protect the database credentials required for this
 configuration.
 
 By default, the Trino Gateway process is started with the following command:
@@ -457,15 +476,40 @@ configuration file names.
 
 #### Additional options
 
-Configure the `routing.hostnameToPool` and `routing.hostnameSuffixToPool` maps
-in the Gateway configuration. See [Hostname routing](routing-rules.md).
-Separate routing-rule files and external selectors are not supported.
+To implement routing rules, create a ConfigMap from your routing rules yaml
+definition:
 
-Standard Helm options such as `replicaCount`, `image`, `imagePullSecrets`, 
-`service`, `ingress` and `resources` are supported. These are defined in 
-`helm/values.yaml`. 
+```shell
+kubectl create cm routing-rules --from-file your-routing-rules.yaml
+```
 
-More detail about the chart are available in the [values 
+Then mount it to your container:
+
+```yaml
+volumes:
+    - name: routing-rules
+      configMap:
+          name: routing-rules
+          items:
+              name: your-routing-rules.yaml
+              path: your-routing-rules.yaml
+
+volumeMounts:
+    - name: routing-rules
+      mountPath: "/etc/routing-rules/your-routing-rules.yaml"
+      subPath: your-routing-rules.yaml
+```
+
+Ensure that the `mountPath` matches the `rulesConfigPath` specified in your
+configuration. Note that the `subPath` is not strictly necessary, and if it
+is not specified the file is mounted at `mountPath/<configMap key>`.
+Kubernetes updates the mounted file when the ConfigMap is updated.
+
+Standard Helm options such as `replicaCount`, `image`, `imagePullSecrets`,
+`service`, `ingress` and `resources` are supported. These are defined in
+`helm/values.yaml`.
+
+More detail about the chart are available in the [values
 reference documentation](https://github.com/trinodb/charts/blob/main/charts/gateway/README.md)
 
 ### Health checks on Trino clusters
@@ -479,15 +523,15 @@ state of a backend. The active/inactive state indicates whether a backend is
 manually turned on or off, whereas TrinoStatus is programmatically determined
 by the health check process.
 
-See [TrinoStatus](routing-rules.md#trinostatus) for more details on 
+See [TrinoStatus](routing-rules.md#trinostatus) for more details on
 what each Trino status means.
 
-Username and password for the health check can be configured by adding 
+Username and password for the health check can be configured by adding
 `backendState` to your configuration. The username and password must be valid
 across all backends.
 
-SSL and xForwardProtoHeader can be configured based on whether the 
-connection between the Trino Gateway and the backend is secure. 
+SSL and xForwardProtoHeader can be configured based on whether the
+connection between the Trino Gateway and the backend is secure.
 By default, both are set to false.
 Find more information in [the related Trino documentation](https://trino.io/docs/current/security/tls.html#use-a-load-balancer-to-terminate-tls-https).
 
@@ -496,7 +540,7 @@ backendState:
   username: "user"
   password: "password"
   ssl: <false/true>
-  xForwardedProtoHeader: <false/true>  
+  xForwardedProtoHeader: <false/true>
 ```
 
 The type of health check is configured by setting
@@ -511,7 +555,7 @@ to one of the following values.
 #### INFO_API (default)
 
 By default Trino Gateway uses the `v1/info` REST endpoint. A successful check is
-defined as a 200 response with `starting: false`. Connection timeout parameters 
+defined as a 200 response with `starting: false`. Connection timeout parameters
 can be defined through the `monitor` node, for example
 
 ```yaml
@@ -550,7 +594,7 @@ monitor:
 ```
 
 This monitor allows customizing health definitions by comparing metrics to fixed
-values. This is configured through two maps: `metricMinimumValues` and 
+values. This is configured through two maps: `metricMinimumValues` and
 `metricMaximumValues`. The keys of these maps are the metric names, and the values
 are the minimum or maximum values (inclusive) that are considered healthy. By default,
 the only metric populated is:
@@ -576,14 +620,14 @@ monitor:
 
 #### JDBC
 
-This uses a JDBC connection to query `system.runtime` tables for cluster 
+This uses a JDBC connection to query `system.runtime` tables for cluster
 information. It is required for the query count based routing strategy. This is
 recommended over `UI_API` since it does not restrict the Web UI authentication
-method of backend clusters. 
+method of backend clusters.
 
 Trino Gateway uses `explicitPrepare=false` by default. This property was introduced
-in Trino 431, and uses a single query for prepared statements, instead of a 
-`PREPARE/EXECUTE` pair. If you are using the JDBC health check option with older 
+in Trino 431, and uses a single query for prepared statements, instead of a
+`PREPARE/EXECUTE` pair. If you are using the JDBC health check option with older
 versions of Trino, set
 ```yaml
 monitor:
@@ -601,8 +645,8 @@ Other timeout parameters are not applicable to the JDBC connection.
 
 #### JMX
 
-The monitor type `JMX` can be used as an alternative to collect cluster information, 
-which is required for the `QueryCountBasedRouterProvider`. This uses the `v1/jmx/mbean` 
+The monitor type `JMX` can be used as an alternative to collect cluster information,
+which is required for the `QueryCountBasedRouterProvider`. This uses the `v1/jmx/mbean`
 endpoint on Trino clusters.
 
 To enable this:
@@ -618,7 +662,7 @@ Allow JMX endpoint access by adding rules to your [file-based access control](ht
 configuration. Example for `user`:
 
 ```json
-{  
+{
   "catalogs": [
     {
       "user": "user",
@@ -652,7 +696,7 @@ queued queries, and worker nodes information.
 #### UI_API
 
 This pulls cluster information from the `ui/api/stats` REST endpoint. This is
-supported for legacy reasons and may be deprecated in the future. It is only 
+supported for legacy reasons and may be deprecated in the future. It is only
 supported for backend clusters with `web-ui.authentication.type=FORM`. Set
 a username and password using `backendState` as with the `JDBC` option.
 

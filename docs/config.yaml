@@ -12,13 +12,8 @@ dataStore:
 clusterStatsConfiguration:
   monitorType: INFO_API
 
+# Stock upstream routing is the default. For pooled configuration, see pooled-routing.md.
 transactionAwareness:
-  enabled: true
-  identityKey: ${ENV:GATEWAY_TRANSACTION_IDENTITY_KEY}
-  adminToken: ${ENV:GATEWAY_TRANSACTION_ADMIN_TOKEN}
+  enabled: false
   pool:
-    enabled: true
-
-routing:
-  hostnameSuffixToPool:
-    dw.example.test: pool-one
+    enabled: false

@@ -118,5 +118,5 @@ python3 -m unittest -v test_load_open_loop test_load_executor_setup \
 ```
 
 The retained externally configured overload/deadline and fault oracles also need
-pooled placement setup before execution against a pool-only artifact. A removed
+pooled placement setup before execution against a pooled-mode artifact. A removed
 legacy API or readiness failure is not a transaction-routing regression.

@@ -19,6 +19,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.http.client.HttpClient;
 import io.trino.gateway.ha.config.ClientCertificateJwtAuthenticationConfiguration;
+import io.trino.gateway.ha.config.GatewayCookieConfiguration;
+import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.RequestAnalyzerConfig;
 import io.trino.gateway.ha.config.SelfSignKeyPairConfiguration;
@@ -28,6 +30,8 @@ import io.trino.gateway.ha.handler.schema.RoutingDestination;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.QueryHistoryManager;
+import io.trino.gateway.ha.router.RoutingGroupSelector;
+import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.security.ClientCertificateIdentityExtractor;
 import io.trino.gateway.ha.security.ClientCertificateJwtRequestAuthenticator;
 import io.trino.gateway.ha.security.LbKeyProvider;
@@ -63,6 +67,7 @@ final class TestRouteToBackendResource
     @Test
     void testPostHandlerDecoratesRoutedQueryRequestWithJwt()
     {
+        initializeCookieConfiguration();
         ProxyHandlerStats proxyHandlerStats = new ProxyHandlerStats();
         RecordingProxyRequestHandler proxyRequestHandler = new RecordingProxyRequestHandler();
         RoutingDestination destination = new RoutingDestination("adhoc", "cluster-a", URI.create("https://cluster-a.example/v1/statement"), "https://cluster-a.example");
@@ -103,6 +108,7 @@ final class TestRouteToBackendResource
     @Test
     void testPostHandlerUsesNoopAuthenticatorWithoutBridge()
     {
+        initializeCookieConfiguration();
         ProxyHandlerStats proxyHandlerStats = new ProxyHandlerStats();
         RecordingProxyRequestHandler proxyRequestHandler = new RecordingProxyRequestHandler();
         RoutingDestination destination = new RoutingDestination("adhoc", "cluster-a", URI.create("https://cluster-a.example/v1/statement"), "https://cluster-a.example");
@@ -163,6 +169,13 @@ final class TestRouteToBackendResource
         return new TestingX509Certificate(dn);
     }
 
+    private static void initializeCookieConfiguration()
+    {
+        GatewayCookieConfiguration cookieConfiguration = new GatewayCookieConfiguration();
+        cookieConfiguration.setEnabled(false);
+        GatewayCookieConfigurationPropertiesProvider.getInstance().initialize(cookieConfiguration);
+    }
+
     @SuppressWarnings("unchecked")
     private static <T> T unsupportedInterface(Class<T> type)
     {
@@ -215,6 +228,7 @@ final class TestRouteToBackendResource
         private RecordingProxyRequestHandler()
         {
             super(unsupportedInterface(HttpClient.class),
+                    unsupportedInterface(RoutingManager.class),
                     unsupportedInterface(QueryHistoryManager.class),
                     unsupportedInterface(OAuth2RoutingStore.class),
                     new HaGatewayConfiguration());
@@ -237,8 +251,9 @@ final class TestRouteToBackendResource
 
         private FixedRoutingTargetHandler(RoutingDestination destination)
         {
-            super(org.mockito.Mockito.mock(io.trino.gateway.ha.transaction.TransactionAwarenessService.class),
+            super(unsupportedInterface(RoutingManager.class),
                     unsupportedInterface(OAuth2RoutingStore.class),
+                    (RoutingGroupSelector) _ -> null,
                     new HaGatewayConfiguration());
             this.destination = destination;
         }

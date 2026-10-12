@@ -99,6 +99,7 @@ class TestTransactionAwarenessService
         database.setJdbcUrl("jdbc:postgresql://localhost/unused_unit_test_database");
         configuration.setDataStore(database);
         configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-adapter-tests");
         configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-adapter-tests");
         backendManager = mock(GatewayBackendManager.class);
@@ -534,11 +535,20 @@ class TestTransactionAwarenessService
     }
 
     @Test
-    void disabledFeatureCannotConstructAService()
+    void disabledFeatureCanConstructAServiceWithoutPooledSecrets()
     {
         configuration.getTransactionAwareness().setEnabled(false);
-        assertThatThrownBy(() -> new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats))
-                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("requires transaction awareness");
+        configuration.getTransactionAwareness().getPool().setEnabled(false);
+        configuration.getTransactionAwareness().setIdentityKey(null);
+        configuration.getTransactionAwareness().setAdminToken(null);
+        TransactionAwarenessService disabled = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats);
+        try {
+            assertThat(disabled.isEnabled()).isFalse();
+            expectStatus(404, () -> disabled.resolve(request("POST", "/v1/statement", Map.of())));
+        }
+        finally {
+            disabled.shutdown();
+        }
     }
 
     @Test

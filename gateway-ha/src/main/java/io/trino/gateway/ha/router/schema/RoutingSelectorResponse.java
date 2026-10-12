@@ -13,7 +13,26 @@
  */
 package io.trino.gateway.ha.router.schema;
 
+import com.google.common.collect.ImmutableMap;
+import jakarta.annotation.Nullable;
+
+import java.util.Map;
+
 /**
- * The pool selected by the request hostname.
+ * Response from the routing service that includes:
+ * - routingGroup: The target routing group for the request (Optional)
+ * - externalHeaders: Headers that can be set in the request (Currently can only be set in ExternalRoutingGroupSelector)
  */
-public record RoutingSelectorResponse(String routingGroup) {}
+public record RoutingSelectorResponse(@Nullable String routingGroup, Map<String, String> externalHeaders)
+        implements RoutingGroupResponse
+{
+    public RoutingSelectorResponse
+    {
+        externalHeaders = ImmutableMap.copyOf(externalHeaders);
+    }
+
+    public RoutingSelectorResponse(String routingGroup)
+    {
+        this(routingGroup, ImmutableMap.of());
+    }
+}

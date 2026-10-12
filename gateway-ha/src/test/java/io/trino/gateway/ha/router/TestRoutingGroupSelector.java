@@ -1,0 +1,740 @@
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package io.trino.gateway.ha.router;
+
+import com.google.common.collect.ImmutableSet;
+import io.airlift.compress.v3.zstd.ZstdCompressor;
+import io.airlift.units.Duration;
+import io.trino.gateway.ha.config.RequestAnalyzerConfig;
+import io.trino.gateway.ha.util.QueryRequestMock;
+import io.trino.sql.tree.QualifiedName;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.ws.rs.HttpMethod;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.MultivaluedMap;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.IOException;
+import java.io.Reader;
+import java.net.URLEncoder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import static com.google.common.io.BaseEncoding.base64Url;
+import static io.trino.gateway.ha.handler.HttpUtils.TRINO_QUERY_PROPERTIES;
+import static io.trino.gateway.ha.router.RoutingGroupSelector.ROUTING_GROUP_HEADER;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import static java.util.concurrent.TimeUnit.HOURS;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+@TestInstance(Lifecycle.PER_CLASS)
+final class TestRoutingGroupSelector
+{
+    public static final String TRINO_SOURCE_HEADER = "X-Trino-Source";
+    public static final String TRINO_CLIENT_TAGS_HEADER = "X-Trino-Client-Tags";
+
+    private static final String DEFAULT_CATALOG = "default_catalog";
+    private static final String DEFAULT_SCHEMA = "default_schema";
+    private final Duration oneHourRefreshPeriod = new Duration(1, HOURS);
+
+    RequestAnalyzerConfig requestAnalyzerConfig = new RequestAnalyzerConfig();
+
+    @BeforeAll
+    void initialize()
+    {
+        requestAnalyzerConfig.setAnalyzeRequest(true);
+    }
+
+    static Stream<String> provideRoutingRuleConfigFiles()
+    {
+        String rulesDir = "src/test/resources/rules/";
+        return Stream.of(
+                rulesDir + "routing_rules_atomic.yml",
+                rulesDir + "routing_rules_priorities.yml",
+                rulesDir + "routing_rules_if_statements.yml",
+                rulesDir + "routing_rules_state.yml");
+    }
+
+    @Test
+    void testByRoutingGroupHeader()
+    {
+        HttpServletRequest mockRequest = prepareMockRequest();
+
+        // If the header is present the routing group is the value of that header.
+        when(mockRequest.getHeader(ROUTING_GROUP_HEADER)).thenReturn("batch_backend");
+        RoutingGroupSelector routingGroupSelector = RoutingGroupSelector.byRoutingGroupHeader();
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isEqualTo("batch_backend");
+
+        // If the header is not present just return null.
+        when(mockRequest.getHeader(ROUTING_GROUP_HEADER)).thenReturn(null);
+        routingGroupSelector = RoutingGroupSelector.byRoutingGroupHeader();
+        routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isNull();
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideRoutingRuleConfigFiles")
+    void testByRoutingRulesEngine(String rulesConfigPath)
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(rulesConfigPath, oneHourRefreshPeriod, requestAnalyzerConfig);
+
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader(TRINO_SOURCE_HEADER, "airflow")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("etl");
+    }
+
+    @Test
+    void testGetUserFromBasicAuth()
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+
+        String encodedUsernamePassword = Base64.getEncoder().encodeToString("will:supersecret".getBytes(UTF_8));
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader("Authorization", "Basic " + encodedUsernamePassword)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isEqualTo("will-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesQueryDetails()
+            throws IOException
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+        String query = "SELECT x.*, y.*, z.* FROM catx.schemx.tblx x, schemy.tbly y, tblz z";
+
+        HttpServletRequest mockRequest = new QueryRequestMock().query(query)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, "cat_default")
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, "schem_\\\"default")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isEqualTo("tbl-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesCatalogSchemas()
+            throws IOException
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+        String query = "SELECT x.*, y.* FROM catx.nondefault.tblx x, caty.default.tbly y";
+
+        HttpServletRequest mockRequest = new QueryRequestMock().query(query)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, "catx")
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, "default")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("catalog-schema-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesSessionDefaults()
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, "other_catalog")
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, "other_schema")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("defaults-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesQueryType()
+            throws IOException
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+        String query = "INSERT INTO foo SELECT 1";
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .query(query)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("type-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesResourceGroupQueryType()
+            throws IOException
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+        String query = "CREATE TABLE cat.schem.foo (c1 int)";
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .query(query)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("resource-group-type-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesAlternateStatementFormat()
+            throws IOException
+    {
+        requestAnalyzerConfig.setClientsUseV2Format(true);
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+        String body = "{\"preparedStatements\" : {\"statement1\":\"INSERT INTO foo SELECT 1\"}, \"query\": \"EXECUTE statement1\"}";
+        HttpServletRequest mockRequest = new QueryRequestMock().query(body)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("type-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesPreparedStatementInHeader()
+            throws IOException
+    {
+        String encodedStatements = "statement1=SELECT+%27s1%27+c%0A%0A,statement2=SELECT+%27s2%27+c%0A%0A,statement3=SELECT%0A++%27%2C%27+comma%0A%2C+%27%3D%27+eq%0A%0A,statement4=SELECT%0A++c1%0A%2C+c2%0AFROM%0A++foo%0A";
+
+        String body = "EXECUTE statement4";
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+
+        MultivaluedMap<String, String> headers = new MultivaluedHashMap<>();
+        headers.addAll(TrinoQueryProperties.TRINO_PREPARED_STATEMENT_HEADER_NAME, Arrays.asList(encodedStatements.split(",")));
+
+        HttpServletRequest mockRequest = new QueryRequestMock().query(body).httpHeaders(headers)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, "cat")
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, "schem")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("statement-header-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesCompressedPreparedStatementInHeader()
+            throws IOException
+    {
+        String routingGroup = routeExecuteOfPreparedStatement(encodeForHeader(compressForHeader("SELECT\n  c1\n, c2\nFROM\n  foo\n")));
+        assertThat(routingGroup).isEqualTo("statement-header-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesCompressedPreparedStatementWithoutBase64Padding()
+            throws IOException
+    {
+        String compressed = compressForHeader("SELECT\n  c1\n, c2\nFROM\n  foo\n");
+        String unpadded = compressed.replaceAll("=+$", "");
+        assertThat(unpadded).isNotEqualTo(compressed); // guard: this statement does need padding
+
+        String routingGroup = routeExecuteOfPreparedStatement(encodeForHeader(unpadded));
+        assertThat(routingGroup).isEqualTo("statement-header-group");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesCompressedPreparedStatementOverBodySizeLimit()
+            throws IOException
+    {
+        // A header sized value can claim a huge decompressed size, so the limit must be enforced before the
+        // buffer is allocated. Valid SQL matching the prepared-statement rule, so the only reason routing can
+        // fall back to the default group is the size guard. 5x clears the 4x byte budget derived from maxBodySize.
+        String oversized = "SELECT '" + "a".repeat(5 * requestAnalyzerConfig.getMaxBodySize()) + "' FROM foo";
+
+        HttpServletRequest mockRequest = executeRequestWithPreparedStatementHeader("statement1=" + encodeForHeader(compressForHeader(oversized)), "statement1");
+        String routingGroup = preparedStatementRulesSelector().findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("no-match");
+
+        TrinoQueryProperties queryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+        assertThat(queryProperties.getErrorMessage()).hasValueSatisfying(message -> assertThat(message)
+                .contains("over the limit")
+                .contains("maxBodySize " + requestAnalyzerConfig.getMaxBodySize()));
+    }
+
+    @Test
+    void testTrinoQueryPropertiesCompressedPreparedStatementWithoutDeclaredSize()
+            throws IOException
+    {
+        // A zstd frame may omit the decompressed size, and then there is no budget to check before allocating.
+        // Minimal frame: magic, then a header descriptor of 0 (no content size, not single segment, no
+        // dictionary) followed by a window descriptor. Trino and Kyuubi never emit this, a hostile client can.
+        byte[] frameWithoutContentSize = {(byte) 0x28, (byte) 0xB5, (byte) 0x2F, (byte) 0xFD, 0x00, 0x00};
+        String headerValue = "$zstd:" + base64Url().encode(frameWithoutContentSize);
+
+        HttpServletRequest mockRequest = executeRequestWithPreparedStatementHeader("statement1=" + encodeForHeader(headerValue), "statement1");
+        String routingGroup = preparedStatementRulesSelector().findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("no-match");
+
+        TrinoQueryProperties queryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+        assertThat(queryProperties.getErrorMessage()).hasValueSatisfying(message -> assertThat(message).contains("does not declare its decompressed size"));
+    }
+
+    @Test
+    void testTrinoQueryPropertiesPreparedStatementWithInvalidBase64()
+            throws IOException
+    {
+        assertPreparedStatementHeaderRejected(encodeForHeader("$zstd:not*base64"), "could not be decoded");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesPreparedStatementWithCorruptFrame()
+            throws IOException
+    {
+        // Keep the frame header, which declares the decompressed size, and cut off the compressed blocks, so
+        // the size check passes and the failure comes from the decompression itself.
+        String compressed = compressForHeader("SELECT\n  c1\n, c2\nFROM\n  foo\n");
+        byte[] frame = base64Url().decode(compressed.substring("$zstd:".length()));
+        String truncated = "$zstd:" + base64Url().encode(frame, 0, frame.length - 8);
+
+        assertPreparedStatementHeaderRejected(encodeForHeader(truncated), "could not be decompressed");
+    }
+
+    @Test
+    void testTrinoQueryPropertiesPreparedStatementWithInvalidUrlEncoding()
+            throws IOException
+    {
+        // "%zz" is not a hexadecimal escape, and the value is deliberately not passed through encodeForHeader
+        assertPreparedStatementHeaderRejected("SELECT%zz1", "not valid URL encoding");
+    }
+
+    private void assertPreparedStatementHeaderRejected(String rawHeaderValue, String expectedMessage)
+            throws IOException
+    {
+        HttpServletRequest mockRequest = executeRequestWithPreparedStatementHeader("statement1=" + rawHeaderValue, "statement1");
+        String routingGroup = preparedStatementRulesSelector().findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("no-match");
+
+        TrinoQueryProperties queryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+        assertThat(queryProperties.getErrorMessage()).hasValueSatisfying(message -> assertThat(message).contains(expectedMessage));
+    }
+
+    @Test
+    void testTrinoQueryPropertiesPreparedStatementHeaderWithWhitespaceAroundEntries()
+            throws IOException
+    {
+        // Proxies that merge repeated headers join them with ", ", and Trino trims both the entries and the
+        // name=value halves (HttpRequestSessionContextFactory). statement2 must still be found.
+        String headerValue = "statement1=" + encodeForHeader("SELECT 1") + " , statement2 = " + encodeForHeader("SELECT c1 FROM foo") + ",";
+
+        HttpServletRequest mockRequest = executeRequestWithPreparedStatementHeader(headerValue, "statement2");
+        String routingGroup = preparedStatementRulesSelector().findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("statement-header-group");
+    }
+
+    private String routeExecuteOfPreparedStatement(String encodedHeaderValue)
+            throws IOException
+    {
+        HttpServletRequest mockRequest = executeRequestWithPreparedStatementHeader("statement1=" + encodedHeaderValue, "statement1");
+        return preparedStatementRulesSelector().findRoutingDestination(mockRequest).routingGroup();
+    }
+
+    private RoutingGroupSelector preparedStatementRulesSelector()
+    {
+        return RoutingGroupSelector.byRoutingRulesEngine(
+                "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                oneHourRefreshPeriod,
+                requestAnalyzerConfig);
+    }
+
+    // EXECUTE <statementName> with the given raw X-Trino-Prepared-Statement header value, against catalog cat / schema schem
+    private HttpServletRequest executeRequestWithPreparedStatementHeader(String headerValue, String statementName)
+            throws IOException
+    {
+        MultivaluedMap<String, String> headers = new MultivaluedHashMap<>();
+        headers.add(TrinoQueryProperties.TRINO_PREPARED_STATEMENT_HEADER_NAME, headerValue);
+
+        return new QueryRequestMock().query("EXECUTE " + statementName).httpHeaders(headers)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, "cat")
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, "schem")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+    }
+
+    // Mirrors io.trino.server.protocol.PreparedStatementEncoder, without its length threshold
+    private static String compressForHeader(String preparedStatement)
+    {
+        ZstdCompressor compressor = ZstdCompressor.create();
+        byte[] input = preparedStatement.getBytes(UTF_8);
+        byte[] compressed = new byte[compressor.maxCompressedLength(input.length)];
+        int compressedSize = compressor.compress(input, 0, input.length, compressed, 0, compressed.length);
+        return "$zstd:" + base64Url().encode(compressed, 0, compressedSize);
+    }
+
+    // Trino clients send prepared statement header values URL encoded, so "$zstd:" arrives as "%24zstd%3A"
+    private static String encodeForHeader(String headerValue)
+    {
+        return URLEncoder.encode(headerValue, UTF_8);
+    }
+
+    @Test
+    void testTrinoQueryPropertiesParsingError()
+            throws IOException
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(
+                        "src/test/resources/rules/routing_rules_trino_query_properties.yml",
+                        oneHourRefreshPeriod,
+                        requestAnalyzerConfig);
+
+        // Invalid SQL that will cause a ParsingException
+        String invalidQuery = "SELECT * FROM table WHERE column = ";
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .query(invalidQuery)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        // When parsing fails, the query should route to the default "no-match" group
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("no-match");
+
+        // Verify that the TrinoQueryProperties indicates a parsing failure
+        TrinoQueryProperties trinoQueryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+        assertThat(trinoQueryProperties).isNotNull();
+        assertThat(trinoQueryProperties.isQueryParsingSuccessful()).isFalse();
+        assertThat(trinoQueryProperties.getErrorMessage()).isPresent();
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideRoutingRuleConfigFiles")
+    void testByRoutingRulesEngineSpecialLabel(String rulesConfigPath)
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(rulesConfigPath, oneHourRefreshPeriod, requestAnalyzerConfig);
+
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader(TRINO_SOURCE_HEADER, "airflow")
+                .httpHeader(TRINO_CLIENT_TAGS_HEADER, "email=test@example.com,label=special")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("etl-special");
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideRoutingRuleConfigFiles")
+    void testByRoutingRulesEngineNoMatch(String rulesConfigPath)
+    {
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(rulesConfigPath, oneHourRefreshPeriod, requestAnalyzerConfig);
+
+        // even though special label is present, query is not from airflow.
+        // should return no match
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader(TRINO_CLIENT_TAGS_HEADER, "email=test@example.com,label=special")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isNull();
+    }
+
+    @Test
+    void testByRoutingRulesEngineFileChange()
+            throws Exception
+    {
+        Path tempPath = Files.createTempFile("routing_rules", ".yml");
+        File file = tempPath.toFile();
+
+        try (BufferedWriter writer = Files.newBufferedWriter(tempPath, UTF_8)) {
+            writer.write(
+                    """
+                    ---
+                    name: "airflow1"
+                    description: "original rule"
+                    condition: "request.getHeader(\\"X-Trino-Source\\") == \\"airflow\\""
+                    actions:
+                    - "result.put(\\"routingGroup\\", \\"etl\\")\"""");
+        }
+
+        Duration refreshPeriod = new Duration(1, MILLISECONDS);
+        RoutingGroupSelector routingGroupSelector =
+                RoutingGroupSelector.byRoutingRulesEngine(file.getPath(), refreshPeriod, requestAnalyzerConfig);
+
+        HttpServletRequest mockRequest = new QueryRequestMock()
+                .httpHeader(TRINO_SOURCE_HEADER, "airflow")
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        String routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+        assertThat(routingGroup).isEqualTo("etl");
+
+        try (BufferedWriter writer = Files.newBufferedWriter(tempPath, UTF_8)) {
+            writer.write(
+                    """
+                    ---
+                    name: "airflow2"
+                    description: "updated rule"
+                    condition: "request.getHeader(\\"X-Trino-Source\\") == \\"airflow\\""
+                    actions:
+                    - "result.put(\\"routingGroup\\", \\"etl2\\")\""""); // change from etl to etl2
+        }
+        Thread.sleep(2 * refreshPeriod.toMillis());
+
+        when(mockRequest.getHeader(TRINO_SOURCE_HEADER)).thenReturn("airflow");
+        routingGroup = routingGroupSelector.findRoutingDestination(mockRequest).routingGroup();
+
+        assertThat(routingGroup).isEqualTo("etl2");
+
+        file.deleteOnExit();
+    }
+
+    private Stream<Arguments> provideTableExtractionQueries()
+    {
+        return Stream.of(
+                Arguments.of(
+                        "ALTER TABLE cat.schem.tbl ADD COLUMN extraInfo VARCHAR WITH (nullable = true, encoding = 'plain')",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "ANALYZE cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of("CREATE CATALOG kat USING iceberg", ImmutableSet.of("kat"), ImmutableSet.of(), ImmutableSet.of()),
+                Arguments.of(
+                        "CREATE MATERIALIZED VIEW cat.mvschem.mv AS SELECT c1, c2 from cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem", "mvschem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"), QualifiedName.of("cat", "mvschem", "mv"))),
+                Arguments.of("CREATE SCHEMA kat.schem", ImmutableSet.of("kat"), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of("CREATE SCHEMA schem", ImmutableSet.of(DEFAULT_CATALOG), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of(
+                        "CREATE TABLE cat.schem.tbl(c1 varchar)",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "CREATE VIEW cat.vwschem.vw AS SELECT c1, c2 from cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem", "vwschem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"), QualifiedName.of("cat", "vwschem", "vw"))),
+                Arguments.of(
+                        "CREATE TABLE cat.schem2.tbl2 AS SELECT c1, c2 from cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem", "schem2"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"), QualifiedName.of("cat", "schem2", "tbl2"))),
+                Arguments.of("DROP CATALOG kat", ImmutableSet.of("kat"), ImmutableSet.of(), ImmutableSet.of()),
+                Arguments.of("DROP SCHEMA kat.schem", ImmutableSet.of("kat"), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of("DROP SCHEMA schem", ImmutableSet.of(DEFAULT_CATALOG), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of(
+                        "DROP TABLE cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "ALTER MATERIALIZED VIEW cat.mvschem.mv RENAME TO cat.mvschem2.mv2",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("mvschem", "mvschem2"),
+                        ImmutableSet.of(QualifiedName.of("cat", "mvschem", "mv"), QualifiedName.of("cat", "mvschem2", "mv2"))),
+                Arguments.of("ALTER SCHEMA kat.schem RENAME TO schem2", ImmutableSet.of("kat"), ImmutableSet.of("schem", "schem2"), ImmutableSet.of()),
+                Arguments.of(
+                        "ALTER TABLE cat.schem.tbl RENAME TO schem2.tbl2",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem", "schem2"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"), QualifiedName.of("cat", "schem2", "tbl2"))),
+                Arguments.of(
+                        "ALTER VIEW cat.schem.vw RENAME TO schem2.vw2",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem", "schem2"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "vw"), QualifiedName.of("cat", "schem2", "vw2"))),
+                Arguments.of(
+                        "ALTER TABLE cat.schem.tbl SET PROPERTIES property_name = 'expression'",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "DESCRIBE cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "SHOW CREATE SCHEMA cat.schem",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of()),
+                Arguments.of(
+                        "SHOW CREATE SCHEMA schem",
+                        ImmutableSet.of(DEFAULT_CATALOG),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of()),
+                Arguments.of(
+                        "SHOW CREATE TABLE cat.schem.tbl",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "SHOW CREATE VIEW cat.schem.vw",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "vw"))),
+                Arguments.of("SHOW SCHEMAS FROM kat", ImmutableSet.of("kat"), ImmutableSet.of(), ImmutableSet.of()),
+                Arguments.of("SHOW SCHEMAS", ImmutableSet.of(DEFAULT_CATALOG), ImmutableSet.of(), ImmutableSet.of()),
+                Arguments.of("SHOW TABLES FROM kat.schem", ImmutableSet.of("kat"), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of("SHOW TABLES", ImmutableSet.of(DEFAULT_CATALOG), ImmutableSet.of(DEFAULT_SCHEMA), ImmutableSet.of()),
+                Arguments.of("ALTER SCHEMA kat.schem SET AUTHORIZATION will", ImmutableSet.of("kat"), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of("ALTER SCHEMA schem SET AUTHORIZATION will", ImmutableSet.of(DEFAULT_CATALOG), ImmutableSet.of("schem"), ImmutableSet.of()),
+                Arguments.of(
+                        "ALTER TABLE cat.schem.tbl SET AUTHORIZATION will",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))),
+                Arguments.of(
+                        "ALTER VIEW cat.schem.vw SET AUTHORIZATION will",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "vw"))),
+                Arguments.of(
+                        "SELECT * FROM TABLE(kat.system.funk(arg => 'expr'))",
+                        ImmutableSet.of("kat"),
+                        ImmutableSet.of("system"),
+                        ImmutableSet.of(QualifiedName.of("kat", "system", "funk"))),
+                Arguments.of(
+                        "EXECUTE IMMEDIATE 'SELECT * FROM cat.schem.tbl'",
+                        ImmutableSet.of("cat"),
+                        ImmutableSet.of("schem"),
+                        ImmutableSet.of(QualifiedName.of("cat", "schem", "tbl"))));
+    }
+
+    @ParameterizedTest
+    @MethodSource("provideTableExtractionQueries")
+    void testTrinoQueryPropertiesTableExtraction(String query, Set<String> catalogs, Set<String> schemas, Set<QualifiedName> tables)
+            throws IOException
+    {
+        HttpServletRequest mockRequest = new QueryRequestMock().query(query)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, DEFAULT_CATALOG)
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, DEFAULT_SCHEMA)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        TrinoQueryProperties trinoQueryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+
+        assertThat(trinoQueryProperties.getTables()).isEqualTo(tables);
+        assertThat(trinoQueryProperties.getSchemas()).isEqualTo(schemas);
+        assertThat(trinoQueryProperties.getCatalogs()).isEqualTo(catalogs);
+    }
+
+    @Test
+    void testWithQueryNameExcluded()
+            throws IOException
+    {
+        String query =
+                """
+                WITH dos AS (SELECT c1 from cat.schem.tbl1),
+                uno as (SELECT c1 FROM dos)
+                SELECT c1 FROM uno, dos
+                """;
+
+        HttpServletRequest mockRequestNoDefaults = new QueryRequestMock().query(query)
+                .httpHeader(TrinoQueryProperties.TRINO_CATALOG_HEADER_NAME, DEFAULT_CATALOG)
+                .httpHeader(TrinoQueryProperties.TRINO_SCHEMA_HEADER_NAME, DEFAULT_SCHEMA)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        TrinoQueryProperties trinoQueryPropertiesWithDefaults = getTrinoQueryProps(mockRequestNoDefaults);
+        Set<QualifiedName> tablesWithDefaults = trinoQueryPropertiesWithDefaults.getTables();
+        assertThat(tablesWithDefaults).containsExactly(QualifiedName.of("cat", "schem", "tbl1"));
+        when(mockRequestNoDefaults.getReader()).thenReturn(new BufferedReader(Reader.of(query)));
+
+        TrinoQueryProperties trinoQueryPropertiesNoDefaults = (TrinoQueryProperties) mockRequestNoDefaults.getAttribute(TRINO_QUERY_PROPERTIES);
+        Set<QualifiedName> tablesNoDefaults = trinoQueryPropertiesNoDefaults.getTables();
+        assertThat(tablesNoDefaults).containsExactly(QualifiedName.of("cat", "schem", "tbl1"));
+    }
+
+    private TrinoQueryProperties getTrinoQueryProps(HttpServletRequest request)
+    {
+        return (TrinoQueryProperties) request.getAttribute(TRINO_QUERY_PROPERTIES);
+    }
+
+    private HttpServletRequest prepareMockRequest()
+    {
+        HttpServletRequest mockRequest = mock(HttpServletRequest.class);
+        when(mockRequest.getMethod()).thenReturn(HttpMethod.POST);
+        return mockRequest;
+    }
+
+    @Test
+    void testLongQuery()
+            throws IOException
+    {
+        String query = Files.readString(Path.of("src/test/resources/wide_select.sql"), UTF_8);
+
+        HttpServletRequest mockRequest = new QueryRequestMock().query(query)
+                .requestAnalyzerConfig(requestAnalyzerConfig)
+                .getHttpServletRequest();
+
+        TrinoQueryProperties trinoQueryProperties = (TrinoQueryProperties) mockRequest.getAttribute(TRINO_QUERY_PROPERTIES);
+        assertThat(trinoQueryProperties.tablesContains("kat.schem.widetable")).isTrue();
+    }
+}

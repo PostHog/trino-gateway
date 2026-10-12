@@ -32,7 +32,8 @@ const en_US = {
     Sider: {
       Dashboard: "Dashboard",
       Cluster: "Cluster",
-      History: "History"
+      History: "History",
+      RoutingRules: "Routing rules"
     }
   },
   Auth: {
@@ -81,7 +82,11 @@ const en_US = {
       ErrorUpdate: "Failed to update cluster",
       ErrorDelete: "Failed to delete cluster",
   },
-
+  RoutingRules: {
+      Update: "Routing rule updated successfully",
+      ErrorUpdate: "Failed to update routing rule",
+      ErrorFetch: "Failed to fetch routing rules"
+  },
 };
 
 type DeepPartial<T> = T extends object

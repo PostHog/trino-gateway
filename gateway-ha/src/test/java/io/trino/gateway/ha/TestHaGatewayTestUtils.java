@@ -33,24 +33,17 @@ class TestHaGatewayTestUtils
             "POSTGRESQL_PASSWORD", "synthetic-fixture-password");
 
     @Test
-    void requiredPoolSettingsPreserveForwardingAndUseExplicitHostnames()
+    void stockFixturesAreNotForcedIntoPooledMode()
             throws Exception
     {
         JsonNode configuration = configuration("test-config-with-forwarded-headers-disabled-template.yml");
         assertThat(configuration.path("routing").path("forwardedHeadersEnabled").asBoolean()).isFalse();
-        assertThat(configuration.path("routing").path("hostnameToPool").path("localhost").asText()).isEqualTo("adhoc");
-        assertThat(configuration.path("routing").path("hostnameToPool").path("scheduled.example.test").asText()).isEqualTo("scheduled");
-        assertThat(configuration.path("transactionAwareness").path("enabled").asBoolean()).isTrue();
-        assertThat(configuration.path("transactionAwareness").path("pool").path("enabled").asBoolean()).isTrue();
-        String identity = configuration.path("transactionAwareness").path("identityKey").asText();
-        String admin = configuration.path("transactionAwareness").path("adminToken").asText();
-        assertThat(identity).hasSizeGreaterThanOrEqualTo(32);
-        assertThat(admin).hasSizeGreaterThanOrEqualTo(32).isNotEqualTo(identity);
+        assertThat(configuration.path("transactionAwareness").isMissingNode()).isTrue();
         assertThat(configuration.path("dataStore").path("jdbcUrl").asText()).isEqualTo(VARIABLES.get("POSTGRESQL_JDBC_URL"));
     }
 
     @Test
-    void mandatorySettingsDoNotReplaceAuthenticationOrAuthorization()
+    void stockFixturePreservesAuthenticationAndAuthorization()
             throws Exception
     {
         JsonNode configuration = configuration("auth/auth-test-config.yml");

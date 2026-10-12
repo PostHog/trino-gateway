@@ -1,5 +1,13 @@
 # Operation
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 The following aspects apply to managing Trino Gateway and the connected Trino
 clusters.
 
@@ -9,76 +17,152 @@ Trino Gateway records history of recent queries and displays links to check quer
 details page in respective trino cluster.
 ![trino.gateway.io](./assets/trinogateway_query_history.png)
 
-## Pool configuration and admission
+## Cluster UI - add and modify cluster information
 
-The cluster UI shows backend registration and monitoring information. Its
-legacy active switch is not authority to admit a pooled coordinator. Lifecycle
-administration uses `/gateway/v1/pools/...` with the required API role and separate
-administration capability. Keep those credentials in runtime secret references.
+The cluster page is used to configure Trino Gateway for multiple Trino clusters.
+Existing cluster information can also be modified using the edit button.
 
-PostgreSQL is authoritative for pool mode, admitted member phase, immutable
-coordinator incarnation, tenant publication/admission, and outstanding request,
-transaction, query, and result obligations. An independent statement must use an
-admitted member of the Host-selected pool. Its admission transaction rechecks
-membership and phase while holding the pool's admission fence.
-
-A member begins unroutable. Before activation, the lifecycle protocol requires a
-fresh validation receipt for the required configuration/catalog/auth revisions
-and verifies the observed coordinator process identity. Publishing a tenant's
-principal binding alone does not open its admission gate: the required member
-publication evidence must also complete. The coordinator remains responsible for
-credential verification and authorization on each statement.
+![trino.gateway.io/entity](./assets/trinogateway_cluster_page.png)
 
 ## Cluster configuration and health status
 
-Persistent backend registration records the member name, pool routing group,
-internal and external URLs, and lifecycle-linked identity. Cached health provides
-monitoring and candidate-ordering hints; it is not a second authority for
-admission. `HEALTHY`, `UNHEALTHY`, `PENDING`, and `UNKNOWN` are observations from
-background probes, not member lifecycle phases or validation certificates.
+Trino Gateway tracks cluster state at two separate layers, each serving a
+different purpose.
 
-The monitor can use info API, JDBC, JMX, or metrics probes according to its
-configuration. Probe freshness and reachability cannot certify a process,
-settle uncertain work, or restore a retired incarnation. An eligible admitted
-member may still be considered when cached health is unknown or unhealthy;
-process verification and authoritative admission checks remain mandatory.
+### Database: source of truth for configuration
 
-## Graceful pool-member shutdown
+All cluster configuration is stored persistently in a database. This includes
+each cluster's name, routing group, proxy URL, external URL, and whether it is
+marked active or inactive.
 
-1. Drain the selected member through the fenced pool lifecycle protocol. This
-   closes admission of new independent statements without moving its existing
-   transactions, queries, or result continuations.
-2. Inspect the authoritative obligation API. Pending or uncertain admissions,
-   open transactions, active queries, and unresolved result delivery block
-   sealing, even when the coordinator reports no queued or running queries.
-3. Seal with the expected generation after all blockers are settled. The
-   lifecycle operation excludes late admission and rechecks durable obligations.
-4. Retire and terminate only through the controller workflow after sealing and
-   any remaining lifecycle requirements are satisfied.
+Any change made through the API or the admin UI — adding, updating, activating,
+deactivating, or deleting a cluster — is written to the database immediately.
+The database represents **what you have configured**: the intended state of the
+system. It persists across restarts.
 
-An idle health/metrics sample, cache expiry, elapsed timeout, or replica-local
-counter is not retirement evidence. If the coordinator is lost with unresolved
-work, stop automatic retirement and use the pool's explicit authorized recovery
-procedure. Never delete ledger rows, reactivate through a legacy API, or claim
-that another member recovered the lost process's in-memory transactions.
+### Health check cache: source of truth for routing
 
-See [pooled cordon coordination](design/pooled-cordon-coordination.md) for lock
-behavior and recovery limits. Worker-only shutdown remains a coordinator/worker
-lifecycle operation, not a Gateway routing change.
+In addition to the database, Trino Gateway maintains an in-memory record of
+each cluster's current health. This cache is separate from the database and is
+used to make all query routing decisions.
+
+Each cluster in the cache has one of four health statuses:
+
+| Status | Meaning |
+|--------|---------|
+| `HEALTHY` | The cluster is reachable and accepting queries |
+| `UNHEALTHY` | The cluster failed its most recent health check |
+| `PENDING` | The cluster was recently added or changed and has not yet been health-checked |
+| `UNKNOWN` | Health status could not be determined |
+
+Only clusters with a `HEALTHY` status receive query traffic, regardless of
+whether the database marks them as active. A cluster in `PENDING` state does not
+receive traffic — it transitions to `HEALTHY` or `UNHEALTHY` once the next
+background health check evaluates it.
+
+The cache is updated by a background health check that runs at a configurable
+interval (default: every 1 minute, set via `monitor.taskDelay`). The health
+check mechanism itself is also configurable — by default it calls the `/v1/info`
+endpoint on each cluster, but JDBC, JMX, and Prometheus metrics are also
+supported.
+
+### How the two layers interact
+
+The database and health cache serve complementary roles:
+
+- **Database** — "what you configured"
+- **Health cache** — "what is actually reachable right now"
+
+When you make a change via the API or admin UI, both layers are updated
+immediately:
+
+| Action | Database | Health cache |
+|--------|----------|-------------|
+| Add a cluster | Written immediately | Set to `PENDING` if active, `UNKNOWN` if inactive |
+| Update a cluster | Written immediately | Reset to `PENDING` if active, `UNKNOWN` if inactive |
+| Activate a cluster | Written immediately | Set to `PENDING` |
+| Deactivate a cluster | Written immediately | Set to `UNKNOWN`; excluded from routing immediately |
+| Delete a cluster | Removed immediately | Removed from cache and JMX; excluded from routing immediately |
+
+Because the database and health cache are not updated atomically, a failure
+during the in-memory update could leave the two layers out of sync. To prevent
+this, each operation uses a compensation pattern: before applying any change,
+the current state is saved (previous health status and backend configuration).
+If the in-memory update fails after the database write succeeds, the database
+change is reverted using the saved state:
+
+| Action | Compensation on failure |
+|--------|------------------------|
+| Add a cluster | Delete the new entry from DB, remove health |
+| Update a cluster | Restore old config in DB, revert health |
+| Activate a cluster | Deactivate in DB, revert health |
+| Deactivate a cluster | Re-activate in DB, revert health |
+| Delete a cluster | Re-add old config to DB, revert health |
+
+For update and delete, compensation is skipped if the old backend configuration
+was not found before the operation, to avoid reverting to an unknown state. If
+the compensation itself fails, the compensation exception is attached to the
+original exception as a suppressed exception — the original is always the one
+thrown to the caller.
+
+A cluster that crashes or becomes unreachable after the last health check will
+remain active in the database but will be marked `UNHEALTHY` in the cache
+within one polling interval. During that window, in-flight queries already
+routed to that cluster may fail, but no new queries will be sent to it once the
+cache is updated.
+
+The health cache is not persisted — it is rebuilt from the database and
+repopulated by health checks each time Trino Gateway starts.
+
+## Graceful shutdown
+
+These stock steps are not sufficient for pooled members. In pooled mode, drain
+through the fenced lifecycle API and settle all authoritative request, query,
+transaction, and result obligations before sealing and retirement. Zero monitor
+query counts or a legacy active switch cannot authorize retirement.
+
+
+Trino Gateway supports graceful shutdown of Trino clusters. Even when a cluster
+is deactivated, any submitted query states can still be retrieved based on the
+Query ID.
+
+To graceful shutdown a trino cluster without query losses, the steps are:
+
+1. Deactivate the cluster by turning off the 'Active' switch. This ensures that no
+   new incoming queries are routed to the cluster.
+2. Poll the Trino cluster coordinator URL until the queued query count and the
+   running query count are both zero.
+3. Terminate the Trino coordinator and worker Java processes.
+
+To gracefully shutdown a single worker process, refer to the [Trino
+documentation](https://trino.io/docs/current/admin/graceful-shutdown.html) for
+more details.
 
 ## Query routing options
 
-Configure [hostname-to-pool placement](routing-rules.md). There is no legacy
-random/load-based router module to choose outside that pool, no default routing
-group, and no cookie-based destination selection. Cached cluster load and health
-cannot override certified pool membership or a durable transaction/query owner.
-Read [routing logic](routing-logic.md) before changing placement or candidate
-ordering.
+- The default router selects the cluster randomly to route the queries.
+- If you want to route the queries to the least loaded cluster for a user
+  so the cluster with the fewest running or queued queries,
+use `QueryCountBasedRouter`. You can enable it by adding the module name
+to the `modules` section of the config file:
+
+```yaml
+modules:
+  - io.trino.gateway.ha.module.QueryCountBasedRouterProvider
+```
+- The router operates based on the stats it receives from the clusters, such as
+the number of queued and running queries. These values are retrieved at regular
+intervals. This interval can be configured by setting `taskDelay` under
+`monitor` section in the config file. The default interval is 1 minute
+```yaml
+monitor:
+  taskDelay: 1m
+```
 
 ## Monitoring <a name="monitoring"></a>
 
-Trino Gateway provides a metrics endpoint that uses the OpenMetrics format at 
-`/metrics`. Use it to monitor Trino Gateway instances with Prometheus and 
+Trino Gateway provides a metrics endpoint that uses the OpenMetrics format at
+`/metrics`. Use it to monitor Trino Gateway instances with Prometheus and
 other compatible systems with the following Prometheus configuration:
 
 ```yaml
@@ -91,10 +175,17 @@ scrape_configs:
 
 ## Pooled administration boundary
 
-Pooled members retain their incarnation history after draining, retirement, or
-loss. Legacy backend or route-management APIs are not a supported route back into
-query service. Use the fenced pool lifecycle and preserve its ledger; neither a
-registration edit nor a healthy probe permits bypassing certified admission.
+For hostname-only pooled deployments, use `/gateway/v1/pools/...` for fenced
+lifecycle administration. Stock backend registration and the cluster UI remain
+available, but neither an active switch nor a healthy probe certifies a member
+for admission. Stock routing selectors and route cookies do not override pool
+membership or durable ownership.
+
+The custom fixed-backend route override, cutover, resume, reincarnation, and
+rollout administration APIs remain removed; they are not upstream functionality.
+Do not reuse retired member identities or clear unresolved ledger rows.
+See [pooled operation](../testing/transaction-awareness/OPERATIONS.md) and
+[pooled cordon coordination](design/pooled-cordon-coordination.md).
 
 ## Transaction lifecycle diagnostics
 
@@ -141,15 +232,35 @@ completed initialization and is ready to serve requests. This means the initial
 connection to the database and the first round of health check on Trino clusters
 are completed. Otherwise, status code 503 is returned.
 
-## Database availability and caches
+## Database cache configuration
 
-Backend registration caches are compatibility/monitoring data, not admission or
-ownership authority. They cannot authorize new work during a PostgreSQL outage,
-create a transaction/query binding, or waive a pool lifecycle fence. Durable
-admission and continuation lookup fail closed when their authoritative state
-cannot be read or committed within the request budget.
+Trino Gateway can cache database queries to improve performance and reduce load
+on the backend database. This also allow gateway to continue routing queries
+when the database is temporarily unavailable. Currently only the list of backend
+Trino clusters used for query routing are being cached.
+The cache can be configured using the `databaseCache` section in the config file.
 
-If a registration cache is configured, its expiration and refresh settings only
-control that cache. Do not interpret retained entries, a successful refresh, or
-cache expiry as completed work or safe retirement. Current obligation counts
-come from the pool API, not from cache contents or historical query UI records.
+```yaml
+databaseCache:
+  enabled: true
+  expireAfterWrite: 1h
+  refreshAfterWrite: 5s
+```
+
+Configuration options:
+
+* `enabled` - Enable or disable the database cache. Default is `false`.
+* `expireAfterWrite` - The maximum time a cached entry is kept since it was last
+  loaded or refreshed. This ensures stale data is eventually removed.
+  If cache is not refreshed before expiration, requests will fail once the entry
+  expires (i.e. cache miss will attempt to reload data, but if the database is unavailable,
+  the request fails because there is no stale value to fall back to after
+  expiration). Default value is `1h`.
+* `refreshAfterWrite` - Duration after which cache entries are eligible for
+  asynchronous refresh. When a refresh is triggered, the existing cached value
+  continues to be served while the refresh happens in the background.
+  This helps keep data fresh while serving slightly stale data to avoid blocking requests.
+  Default value is `5s`.
+
+`expireAfterWrite` and `refreshAfterWrite` can be set to `null` to disable expiration
+or refresh respectively.

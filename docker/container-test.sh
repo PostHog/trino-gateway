@@ -9,11 +9,6 @@ function test_gateway_starts {
     POSTGRES_CONTAINER_ID=
     trap cleanup EXIT
 
-    # Generate disposable keys. Do not store them in the image or print them.
-    export GATEWAY_TRANSACTION_IDENTITY_KEY="$(openssl rand -hex 32)"
-    export GATEWAY_TRANSACTION_ADMIN_TOKEN="$(openssl rand -hex 32)"
-    export TRINO_GATEWAY_IMAGE="$1"
-
     # Ensure compose state is starting fresh before the test
     cleanup
 

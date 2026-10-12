@@ -25,6 +25,8 @@ public class RoutingConfiguration
 
     private boolean forwardedHeadersEnabled = true;
 
+    private String defaultRoutingGroup = "adhoc";
+
     private Map<String, String> hostnameToPool = Map.of();
     private Map<String, String> hostnameSuffixToPool = Map.of();
 
@@ -71,6 +73,16 @@ public class RoutingConfiguration
     public void setForwardedHeadersEnabled(boolean forwardedHeadersEnabled)
     {
         this.forwardedHeadersEnabled = forwardedHeadersEnabled;
+    }
+
+    public String getDefaultRoutingGroup()
+    {
+        return defaultRoutingGroup;
+    }
+
+    public void setDefaultRoutingGroup(String defaultRoutingGroup)
+    {
+        this.defaultRoutingGroup = defaultRoutingGroup;
     }
 
     public Map<String, String> getHostnameToPool()

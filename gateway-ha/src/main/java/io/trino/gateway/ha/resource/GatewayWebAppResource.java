@@ -18,8 +18,11 @@ import io.trino.gateway.ha.clustermonitor.ClusterStats;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
+import io.trino.gateway.ha.config.RoutingRulesConfiguration;
+import io.trino.gateway.ha.config.RulesType;
 import io.trino.gateway.ha.config.UIConfiguration;
 import io.trino.gateway.ha.domain.Result;
+import io.trino.gateway.ha.domain.RoutingRule;
 import io.trino.gateway.ha.domain.TableData;
 import io.trino.gateway.ha.domain.request.QueryDistributionRequest;
 import io.trino.gateway.ha.domain.request.QueryHistoryRequest;
@@ -29,6 +32,7 @@ import io.trino.gateway.ha.router.BackendStateManager;
 import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.HaGatewayManager;
 import io.trino.gateway.ha.router.QueryHistoryManager;
+import io.trino.gateway.ha.router.RoutingRulesManager;
 import jakarta.annotation.security.RolesAllowed;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.GET;
@@ -40,6 +44,7 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.SecurityContext;
 
+import java.io.IOException;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
@@ -60,20 +65,30 @@ public class GatewayWebAppResource
     private final GatewayBackendManager gatewayBackendManager;
     private final QueryHistoryManager queryHistoryManager;
     private final BackendStateManager backendStateManager;
+    private final boolean isRulesEngineEnabled;
+    private final boolean hostnameRoutingEnabled;
+    private final RulesType ruleType;
     // TODO Avoid putting mutable objects in fields
     private final UIConfiguration uiConfiguration;
+    private final RoutingRulesManager routingRulesManager;
 
     @Inject
     public GatewayWebAppResource(
             GatewayBackendManager gatewayBackendManager,
             QueryHistoryManager queryHistoryManager,
             BackendStateManager backendStateManager,
+            RoutingRulesManager routingRulesManager,
             HaGatewayConfiguration configuration)
     {
         this.gatewayBackendManager = requireNonNull(gatewayBackendManager, "gatewayBackendManager is null");
         this.queryHistoryManager = requireNonNull(queryHistoryManager, "queryHistoryManager is null");
         this.backendStateManager = requireNonNull(backendStateManager, "backendStateManager is null");
         this.uiConfiguration = configuration.getUiConfiguration();
+        this.routingRulesManager = requireNonNull(routingRulesManager, "routingRulesManager is null");
+        RoutingRulesConfiguration routingRules = configuration.getRoutingRules();
+        hostnameRoutingEnabled = configuration.getTransactionAwareness().isEnabled();
+        isRulesEngineEnabled = !hostnameRoutingEnabled && routingRules.isRulesEngineEnabled();
+        ruleType = routingRules.getRulesType();
     }
 
     @POST
@@ -204,6 +219,41 @@ public class GatewayWebAppResource
     {
         ((HaGatewayManager) gatewayBackendManager).deleteBackend(backend.getName());
         return Response.ok(Result.ok(true)).build();
+    }
+
+    @GET
+    @RolesAllowed("ADMIN")
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("/getRoutingRules")
+    public Response getRoutingRules()
+            throws IOException
+    {
+        if (hostnameRoutingEnabled) {
+            return Response.status(Response.Status.NO_CONTENT)
+                    .entity(Result.fail("Routing rules are disabled for hostname-only pooled routing")).build();
+        }
+        if (isRulesEngineEnabled && ruleType == RulesType.EXTERNAL) {
+            return Response.status(Response.Status.NO_CONTENT)
+                    .entity(Result.fail("Routing rules are managed by an external service")).build();
+        }
+        List<RoutingRule> routingRulesList = routingRulesManager.getRoutingRules();
+        return Response.ok(Result.ok(routingRulesList)).build();
+    }
+
+    @POST
+    @RolesAllowed("ADMIN")
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("/updateRoutingRules")
+    public Response updateRoutingRules(RoutingRule routingRule)
+            throws IOException
+    {
+        if (hostnameRoutingEnabled) {
+            return Response.status(Response.Status.CONFLICT)
+                    .entity(Result.fail("Routing rules are disabled for hostname-only pooled routing")).build();
+        }
+        List<RoutingRule> routingRulesList = routingRulesManager.updateRoutingRule(routingRule);
+        return Response.ok(Result.ok(routingRulesList)).build();
     }
 
     @GET

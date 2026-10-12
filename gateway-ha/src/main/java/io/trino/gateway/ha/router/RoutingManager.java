@@ -15,52 +15,113 @@ package io.trino.gateway.ha.router;
 
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
+import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
-/**
- * Local observations of backend health and load. Pool membership and durable lifecycle state, not
- * this cache, determine routing eligibility. This class never selects or discovers a query owner.
- */
-public class RoutingManager
+public interface RoutingManager
 {
-    private final Map<String, TrinoStatus> backendToStatus = new HashMap<>();
-    private final Map<String, ClusterStats> clusterStats = new HashMap<>();
-
-    public synchronized Optional<TrinoStatus> getBackEndHealth(String backendId)
-    {
-        return Optional.ofNullable(backendToStatus.get(backendId));
-    }
-
-    public synchronized void updateBackEndHealth(String backendId, TrinoStatus value)
-    {
-        backendToStatus.put(backendId, value);
-        // A lifecycle update invalidates the previous load observation until monitoring refreshes it.
-        clusterStats.remove(backendId);
-    }
-
-    public synchronized void removeBackEndHealth(String backendId)
-    {
-        backendToStatus.remove(backendId);
-        clusterStats.remove(backendId);
-    }
-
-    public synchronized void updateClusterStats(List<ClusterStats> stats)
-    {
-        for (ClusterStats stat : stats) {
-            backendToStatus.put(stat.clusterId(), stat.trinoStatus());
-            clusterStats.put(stat.clusterId(), stat);
-        }
-    }
+    /**
+     * Returns the current health status of a backend cluster.
+     *
+     * @param backendId the unique identifier of the backend cluster
+     * @return the health status, or empty if the backend is not tracked
+     */
+    Optional<TrinoStatus> getBackEndHealth(String backendId);
 
     /**
      * Returns the last monitoring observation for advisory ordering within an eligible pool.
      */
-    public synchronized Optional<ClusterStats> getClusterStats(String backendId)
-    {
-        return Optional.ofNullable(clusterStats.get(backendId));
-    }
+    Optional<ClusterStats> getClusterStats(String backendId);
+
+    /**
+     * Updates the health status of a backend cluster.
+     *
+     * @param backendId the unique identifier of the backend cluster
+     * @param value the health status of the backend (UP, DOWN, etc.)
+     */
+    void updateBackEndHealth(String backendId, TrinoStatus value);
+
+    /**
+     * Removes a backend cluster from health tracking entirely.
+     *
+     * @param backendId the unique identifier of the backend cluster to remove
+     */
+    void removeBackEndHealth(String backendId);
+
+    /**
+     * Updates the statistics for all backend clusters.
+     *
+     * @param stats a list of ClusterStats objects representing the current state of each backend cluster
+     */
+    void updateClusterStats(List<ClusterStats> stats);
+
+    /**
+     * Associates a backend cluster with a specific query ID for sticky routing.
+     *
+     * @param queryId the unique identifier of the query
+     * @param backend the backend cluster to associate with the query
+     */
+    void setBackendForQueryId(String queryId, String backend);
+
+    /**
+     * Associates a routing group with a specific query ID.
+     *
+     * @param queryId the unique identifier of the query
+     * @param routingGroup the routing group to associate with the query
+     */
+    void setRoutingGroupForQueryId(String queryId, String routingGroup);
+
+    /**
+     * Associates an external URL with a specific query ID for routing.
+     *
+     * @param queryId the unique identifier of the query
+     * @param externalUrl the external URL to associate with the query
+     */
+    void setExternalUrlForQueryId(String queryId, String externalUrl);
+
+    /**
+     * Finds the backend cluster associated with a given query ID.
+     *
+     * @param queryId the unique identifier of the query
+     * @return the backend cluster ID, or null if not found
+     */
+    String findBackendForQueryId(String queryId);
+
+    /**
+     * Finds the external URL for the backend cluster associated with a given query ID.
+     *
+     * @param queryId the unique identifier of the query
+     * @return the external URL, or null if not found
+     */
+    String findExternalUrlForQueryId(String queryId);
+
+    /**
+     * Finds the routing group associated with a given query ID.
+     *
+     * @param queryId the unique identifier of the query
+     * @return the routing group, or null if not found
+     */
+    String findRoutingGroupForQueryId(String queryId);
+
+    /**
+     * Provides the backend configuration for a given routing group and user.
+     *
+     * @param routingGroup the routing group to use for backend selection
+     * @param user the user requesting the backend
+     * @return the backend configuration for the selected cluster
+     */
+    ProxyBackendConfiguration provideBackendConfiguration(String routingGroup, String user);
+
+    /**
+     * Whether {@code backendUrl} currently maps to an active, healthy backend. Matching is by scheme
+     * and authority (host/port) only and is case-insensitive, so a proxy-to URL that carries a base
+     * path or differs in host case still resolves to its backend (e.g. an OAuth2 pin, which is a
+     * bare {@code scheme://authority}).
+     *
+     * @param backendUrl the backend URL to resolve
+     * @return true if an active backend with the same scheme and authority is healthy
+     */
+    boolean isBackendActiveAndHealthy(String backendUrl);
 }

@@ -23,12 +23,13 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestTransactionAwarenessConfiguration
 {
     @Test
-    void testDisabledConfigurationIsRejected()
+    void testDisabledConfigurationPreservesUpstreamDefaults()
     {
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
-        config.setEnabled(false);
-        assertThatThrownBy(() -> config.validate(null)).isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("requires transaction awareness");
+        assertThat(config.isEnabled()).isFalse();
+        assertThat(config.getPool().isEnabled()).isFalse();
+        config.validate(null);
+        config.validate(database("jdbc:mysql://localhost/test"));
     }
 
     @Test
@@ -36,6 +37,7 @@ class TestTransactionAwarenessConfiguration
     {
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
         config.setEnabled(true);
+        config.getPool().setEnabled(true);
         config.setIdentityKey("synthetic-identity-key-for-tests-only");
         config.setAdminToken("synthetic-admin-token-for-tests-only");
         config.getPool().setEnabled(false);
@@ -49,6 +51,7 @@ class TestTransactionAwarenessConfiguration
         DataStoreConfiguration database = database("jdbc:postgresql://localhost/test");
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
         config.setEnabled(true);
+        config.getPool().setEnabled(true);
         assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
         config.setIdentityKey("synthetic-identity-key-for-tests-only");
         assertThatThrownBy(() -> config.validate(database)).isInstanceOf(IllegalArgumentException.class);
@@ -63,6 +66,7 @@ class TestTransactionAwarenessConfiguration
     {
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
         config.setEnabled(true);
+        config.getPool().setEnabled(true);
         config.setIdentityKey("synthetic-identity-key-for-tests-only");
         config.setAdminToken("synthetic-admin-token-for-tests-only");
         assertThatThrownBy(() -> config.validate(database("jdbc:mysql://localhost/test"))).isInstanceOf(IllegalArgumentException.class);
@@ -77,6 +81,7 @@ class TestTransactionAwarenessConfiguration
     {
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
         config.setEnabled(true);
+        config.getPool().setEnabled(true);
         config.setIdentityKey("synthetic-identity-key-for-tests-only");
         config.setAdminToken("synthetic-admin-token-for-tests-only");
         DataStoreConfiguration database = database("jdbc:postgresql://localhost/test");

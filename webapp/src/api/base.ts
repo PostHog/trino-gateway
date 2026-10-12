@@ -17,6 +17,10 @@ export class ClientApi {
     if (res.status === 401 || res.status === 403) {
       this.authErrorHandler()
     }
+    else if (res.status === 204) {
+      // handle the case of Response.Status.NO_CONTENT when External Routing Service is used
+      return { isExternalRouting: true };
+    }
     else if (res.status >= 500) {
       const resJson = await res.json();
       this.serverErrorHandler(resJson.msg);

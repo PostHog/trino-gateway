@@ -20,29 +20,28 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 final class TestRoutingManagerHealth
 {
     @Test
-    void testOnlyHealthAndAdvisoryStatsRemain()
+    void testUpstreamRoutingAndAdvisoryStatsRemain()
     {
-        assertThat(RoutingManager.class.isInterface()).isFalse();
+        assertThat(RoutingManager.class.isInterface()).isTrue();
         assertThat(RoutingManager.class.getDeclaredMethods())
                 .filteredOn(method -> !method.isSynthetic())
                 .extracting(method -> method.getName())
-                .containsExactlyInAnyOrder("getBackEndHealth", "updateBackEndHealth", "removeBackEndHealth", "updateClusterStats", "getClusterStats");
+                .contains("getBackEndHealth", "updateBackEndHealth", "removeBackEndHealth", "updateClusterStats", "getClusterStats", "provideBackendConfiguration");
     }
 
     @Test
-    void testLegacySelectorsAreUnavailable()
+    void testUpstreamSelectorsRemainAvailable()
     {
         for (String name : List.of(
                 "io.trino.gateway.ha.router.BaseRoutingManager",
                 "io.trino.gateway.ha.router.StochasticRoutingManager",
                 "io.trino.gateway.ha.router.QueryCountBasedRouter",
                 "io.trino.gateway.ha.module.QueryCountBasedRouterProvider")) {
-            assertThatThrownBy(() -> Class.forName(name)).isInstanceOf(ClassNotFoundException.class);
+            org.assertj.core.api.Assertions.assertThatCode(() -> Class.forName(name)).doesNotThrowAnyException();
         }
     }
 
@@ -50,7 +49,7 @@ final class TestRoutingManagerHealth
     void testHealthIsUnknownUntilObservedAndCanBeRemoved()
             throws ReflectiveOperationException
     {
-        RoutingManager manager = RoutingManager.class.getConstructor().newInstance();
+        RoutingManager manager = manager();
         assertThat(manager.getBackEndHealth("backend-a")).isEmpty();
         manager.updateBackEndHealth("backend-a", TrinoStatus.HEALTHY);
         assertThat(manager.getBackEndHealth("backend-a")).contains(TrinoStatus.HEALTHY);
@@ -64,7 +63,7 @@ final class TestRoutingManagerHealth
     void testStatsUpdateHealth()
             throws ReflectiveOperationException
     {
-        RoutingManager manager = RoutingManager.class.getConstructor().newInstance();
+        RoutingManager manager = manager();
         ClusterStats stats = ClusterStats.builder("backend-a").trinoStatus(TrinoStatus.HEALTHY).runningQueryCount(7).queuedQueryCount(2).build();
         manager.updateClusterStats(List.of(stats));
         assertThat(manager.getBackEndHealth("backend-a")).contains(TrinoStatus.HEALTHY);
@@ -79,10 +78,15 @@ final class TestRoutingManagerHealth
     void testLifecycleHealthUpdateInvalidatesOldLoadObservation()
             throws ReflectiveOperationException
     {
-        RoutingManager manager = RoutingManager.class.getConstructor().newInstance();
+        RoutingManager manager = manager();
         manager.updateClusterStats(List.of(ClusterStats.builder("backend-a").trinoStatus(TrinoStatus.HEALTHY).runningQueryCount(7).build()));
         manager.updateBackEndHealth("backend-a", TrinoStatus.PENDING);
         assertThat(manager.getClusterStats("backend-a")).isEmpty();
         assertThat(manager.getBackEndHealth("backend-a")).contains(TrinoStatus.PENDING);
+    }
+
+    private static RoutingManager manager()
+    {
+        return new StochasticRoutingManager(org.mockito.Mockito.mock(GatewayBackendManager.class), org.mockito.Mockito.mock(QueryHistoryManager.class), new io.trino.gateway.ha.config.RoutingConfiguration());
     }
 }

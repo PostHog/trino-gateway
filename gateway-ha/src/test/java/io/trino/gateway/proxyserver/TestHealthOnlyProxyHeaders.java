@@ -61,6 +61,8 @@ final class TestHealthOnlyProxyHeaders
     void testLegacyRouteCookieCannotOverrideHostname()
     {
         HaGatewayConfiguration config = new HaGatewayConfiguration();
+        config.getTransactionAwareness().setEnabled(true);
+        config.getTransactionAwareness().getPool().setEnabled(true);
         config.getRouting().setHostnameToPool(Map.of("pool-a.example", "pool-a", "pool-b.example", "pool-b"));
         HostnameRoutingGroupSelector selector = new HostnameRoutingGroupSelector(config.getRouting());
         TestingHttpServletRequest request = new TestingHttpServletRequest("/v1/statement")
@@ -88,6 +90,8 @@ final class TestHealthOnlyProxyHeaders
     void testCoordinatorAuthCookiesPassThroughWithoutGatewayRouteCookie()
     {
         HaGatewayConfiguration config = new HaGatewayConfiguration();
+        config.getTransactionAwareness().setEnabled(true);
+        config.getTransactionAwareness().getPool().setEnabled(true);
         AtomicReference<Request> forwarded = new AtomicReference<>();
         try (TestingHttpClient client = new TestingHttpClient(request -> {
             forwarded.set(request);
@@ -96,7 +100,7 @@ final class TestHealthOnlyProxyHeaders
                     ImmutableListMultimap.of(HeaderName.of("Set-Cookie"), "Trino-UI-Token=synthetic; Secure; HttpOnly"),
                     "{}".getBytes(UTF_8));
         })) {
-            ProxyRequestHandler handler = new ProxyRequestHandler(client, mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), config);
+            ProxyRequestHandler handler = new ProxyRequestHandler(client, mock(io.trino.gateway.ha.router.RoutingManager.class), mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), config);
             try {
                 TestingHttpServletRequest request = new TestingHttpServletRequest("/oauth2/token/initiate/HASH");
                 request.addHeader("Cookie", "Trino-UI-Token=synthetic; TG.OAUTH2=obsolete");
@@ -121,9 +125,11 @@ final class TestHealthOnlyProxyHeaders
     void testQueryHistoryRemainsIndependentOfRouting()
     {
         HaGatewayConfiguration config = new HaGatewayConfiguration();
+        config.getTransactionAwareness().setEnabled(true);
+        config.getTransactionAwareness().getPool().setEnabled(true);
         QueryHistoryManager history = mock(QueryHistoryManager.class);
         try (TestingHttpClient client = new TestingHttpClient(_ -> TestingResponse.mockResponse(HttpStatus.OK, JSON_UTF_8, "{\"id\":\"query-a\"}"))) {
-            ProxyRequestHandler handler = new ProxyRequestHandler(client, history, mock(OAuth2RoutingStore.class), config);
+            ProxyRequestHandler handler = new ProxyRequestHandler(client, mock(io.trino.gateway.ha.router.RoutingManager.class), history, mock(OAuth2RoutingStore.class), config);
             try {
                 TestingHttpServletRequest request = new TestingHttpServletRequest("/v1/statement");
                 request.setAttribute(TRINO_REQUEST_USER, new TrinoRequestUser(Optional.of("alice"), null));
@@ -160,6 +166,8 @@ final class TestHealthOnlyProxyHeaders
             throws InterruptedException
     {
         HaGatewayConfiguration config = new HaGatewayConfiguration();
+        config.getTransactionAwareness().setEnabled(true);
+        config.getTransactionAwareness().getPool().setEnabled(true);
         config.getRouting().setForwardedHeadersEnabled(forwardedEnabled);
         if (forwardedEnabled) {
             config.getRouting().setForwardedProto("https");
@@ -172,7 +180,7 @@ final class TestHealthOnlyProxyHeaders
             dispatched.countDown();
             return TestingResponse.mockResponse(HttpStatus.OK, JSON_UTF_8, "{}");
         })) {
-            ProxyRequestHandler handler = new ProxyRequestHandler(client, mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), config);
+            ProxyRequestHandler handler = new ProxyRequestHandler(client, mock(io.trino.gateway.ha.router.RoutingManager.class), mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), config);
             try {
                 TestingHttpServletRequest request = new TestingHttpServletRequest("/v1/custom")
                 {

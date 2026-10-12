@@ -29,9 +29,12 @@ import io.airlift.units.Duration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.ProxyResponseConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingDestination;
+import io.trino.gateway.ha.router.GatewayCookie;
+import io.trino.gateway.ha.router.OAuth2GatewayCookie;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.OAuth2RoutingUtils;
 import io.trino.gateway.ha.router.QueryHistoryManager;
+import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService.RequestContext;
@@ -46,6 +49,7 @@ import jakarta.ws.rs.core.Response;
 
 import java.io.IOException;
 import java.net.URI;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
@@ -54,6 +58,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.google.common.net.HttpHeaders.WWW_AUTHENTICATE;
 import static com.google.common.util.concurrent.Futures.addCallback;
@@ -89,14 +94,16 @@ public class ProxyRequestHandler
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
     private static final List<String> PRESERVED_HEADERS_TO_SKIP = List.of(
             "Accept-Encoding",
-            "Host",
-            "X-Trino-Routing-Group");
+            "Host");
 
     private final Duration asyncTimeout;
     private final ExecutorService executor = newCachedThreadPool(daemonThreadsNamed("proxy-%s"));
     private final HttpClient httpClient;
+    private final RoutingManager routingManager;
     private final QueryHistoryManager queryHistoryManager;
     private final OAuth2RoutingStore oauth2RoutingStore;
+    private final boolean cookiesEnabled;
+    private final boolean pooledRouting;
     private final boolean oauth2RoutingEnabled;
     private final boolean forwardedHeadersEnabled;
     private final Optional<String> forwardedProto;
@@ -119,13 +126,17 @@ public class ProxyRequestHandler
     @Inject
     public ProxyRequestHandler(
             @ForProxy HttpClient httpClient,
+            RoutingManager routingManager,
             QueryHistoryManager queryHistoryManager,
             OAuth2RoutingStore oauth2RoutingStore,
             HaGatewayConfiguration haGatewayConfiguration)
     {
         this.httpClient = requireNonNull(httpClient, "httpClient is null");
+        this.routingManager = requireNonNull(routingManager, "routingManager is null");
         this.queryHistoryManager = requireNonNull(queryHistoryManager, "queryHistoryManager is null");
         this.oauth2RoutingStore = requireNonNull(oauth2RoutingStore, "oauth2RoutingStore is null");
+        pooledRouting = haGatewayConfiguration.getTransactionAwareness().isEnabled();
+        cookiesEnabled = !pooledRouting && haGatewayConfiguration.getGatewayCookieConfiguration().isEnabled();
         oauth2RoutingEnabled = haGatewayConfiguration.getRouting().isOauth2RoutingEnabled();
         asyncTimeout = haGatewayConfiguration.getRouting().getAsyncTimeout();
         forwardedHeadersEnabled = haGatewayConfiguration.getRouting().isForwardedHeadersEnabled();
@@ -208,6 +219,7 @@ public class ProxyRequestHandler
             setupRequestHeaders(servletRequest, requestBuilder);
 
             ImmutableList.Builder<NewCookie> cookieBuilder = ImmutableList.builder();
+            cookieBuilder.addAll(getOAuth2GatewayCookie(remoteUri, servletRequest));
 
             Request request = requestBuilder
                     .setFollowRedirects(false)
@@ -238,7 +250,7 @@ public class ProxyRequestHandler
 
             if (statementPaths.stream().anyMatch(request.getUri().getPath()::startsWith) && request.getMethod().equals(HttpMethod.POST)) {
                 Optional<String> username = ((TrinoRequestUser) servletRequest.getAttribute(TRINO_REQUEST_USER)).getUser();
-                future = future.transform(response -> recordQueryHistory(request, response, username, routingDestination), executor);
+                future = future.transform(response -> recordBackendForQueryId(request, response, username, routingDestination), executor);
                 if (includeClusterInfoInResponse) {
                     cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(remoteUri.getHost()).build());
                 }
@@ -312,7 +324,7 @@ public class ProxyRequestHandler
                     Response result = transactionAwareness.completionPhase(() -> {
                         ProxyResponse recorded = transactionAwareness.recordResponse(context, response);
                         if (request.getMethod().equals(HttpMethod.POST)) {
-                            recorded = recordQueryHistory(request, recorded, context.username(), destination);
+                            recorded = recordBackendForQueryId(request, recorded, context.username(), destination);
                             if (includeClusterInfoInResponse) {
                                 cookieBuilder.add(new NewCookie.Builder("trinoClusterHost").value(request.getUri().getHost()).build());
                             }
@@ -345,6 +357,28 @@ public class ProxyRequestHandler
         bindAsyncResponse(asyncResponse, nonCancellationPropagating(completed), directExecutor())
                 .withTimeout(clientTimeout, () -> Response.status(BAD_GATEWAY).type(TEXT_PLAIN_TYPE)
                         .entity("Transaction-aware response deadline expired; outcome processing remains bounded and retained").build());
+    }
+
+    private ImmutableList<NewCookie> getOAuth2GatewayCookie(URI remoteUri, HttpServletRequest servletRequest)
+    {
+        if (cookiesEnabled) {
+            if (remoteUri.getPath().startsWith(OAuth2GatewayCookie.OAUTH2_PATH)
+                    && !(servletRequest.getCookies() != null
+                    && Arrays.stream(servletRequest.getCookies()).anyMatch(c -> c.getName().equals(OAuth2GatewayCookie.NAME)))) {
+                GatewayCookie oauth2Cookie = new OAuth2GatewayCookie(getRemoteTarget(remoteUri));
+                return ImmutableList.of(oauth2Cookie.toNewCookie());
+            }
+            else if (servletRequest.getCookies() != null) {
+                return Arrays.stream(servletRequest.getCookies())
+                        .filter(c -> c.getName().startsWith(GatewayCookie.PREFIX))
+                        .map(GatewayCookie::fromCookie)
+                        .filter(c -> !c.isValid() || c.matchesDeletePath(remoteUri.getPath()))
+                        .map(GatewayCookie::toNewCookie)
+                        .map(newCookie -> new NewCookie.Builder(newCookie).value("delete").maxAge(0).build())
+                        .collect(toImmutableList());
+            }
+        }
+        return ImmutableList.of();
     }
 
     private static String getRemoteTarget(URI remoteUri)
@@ -390,7 +424,7 @@ public class ProxyRequestHandler
                         .build());
     }
 
-    private ProxyResponse recordQueryHistory(
+    private ProxyResponse recordBackendForQueryId(
             Request request,
             ProxyResponse response,
             Optional<String> username,
@@ -406,6 +440,11 @@ public class ProxyRequestHandler
             try {
                 HashMap<String, String> results = OBJECT_MAPPER.readValue(response.body(), HashMap.class);
                 queryDetail.setQueryId(results.get("id"));
+                if (!pooledRouting) {
+                    routingManager.setBackendForQueryId(queryDetail.getQueryId(), queryDetail.getBackendUrl());
+                    routingManager.setRoutingGroupForQueryId(queryDetail.getQueryId(), routingDestination.routingGroup());
+                    routingManager.setExternalUrlForQueryId(queryDetail.getQueryId(), routingDestination.externalUrl());
+                }
                 log.debug("QueryId [%s] mapped with proxy [%s]", queryDetail.getQueryId(), queryDetail.getBackendUrl());
             }
             catch (IOException e) {
@@ -488,6 +527,9 @@ public class ProxyRequestHandler
     // TODO: decide what else should and shouldn't be forwarded
     private boolean shouldForwardHeader(String name)
     {
+        if (pooledRouting && name.equalsIgnoreCase("X-Trino-Routing-Group")) {
+            return false;
+        }
         for (String headerToSkip : PRESERVED_HEADERS_TO_SKIP) {
             if (name.equalsIgnoreCase(headerToSkip)) {
                 return false;

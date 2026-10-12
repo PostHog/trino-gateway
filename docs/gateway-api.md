@@ -1,5 +1,13 @@
 # Gateway API
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 The REST API for Trino Gateway can be used to update routing configuration for
 the Trino clusters. Note that the API calls do not perform actions on the
 clusters themselves.
@@ -11,6 +19,12 @@ If there are duplicate `proxyTo` URLs in the configuration, the `Name` in the
 **Query History** page of the UI might not show correctly.
 
 ## Create a Trino cluster
+
+In pooled mode, these stock APIs manage registration metadata only. Register,
+validate, certify, and admit members using `/gateway/v1/pools/...`; setting
+`active: true` does not open pool admission. Custom fixed-backend cutover and
+rollout endpoints remain removed.
+
 
 ```shell
 curl -X POST http://localhost:8080/gateway/backend/modify/add \
@@ -129,9 +143,27 @@ Returns a JSON array of active Trino clusters:
 curl -X POST http://localhost:8080/gateway/backend/activate/trino-2
 ```
 
-## Hostname routing configuration
+## Update routing rules
 
-Hostname-to-pool placement is configured through `routing.hostnameToPool` and
-`routing.hostnameSuffixToPool`. See [Hostname routing](routing-rules.md).
-The legacy `/webapp/getRoutingRules` and `/webapp/updateRoutingRules` endpoints
-are no longer available.
+This endpoint is part of the `/webapp` endpoint family and requires the
+`ADMIN` role.
+
+The API can be used to programmatically update the routing rules. Rule are
+updated based on the rule name. Storage of the rules must use a writeable file
+and the configuration 'rulesType: FILE'.
+
+For this feature to work with multiple replicas of the Trino Gateway, you must
+provide a shared storage that supports file locking for the routing rules file.
+If multiple replicas are used with local storage, then rules get out of
+sync when updated.
+
+```shell
+curl -X POST http://localhost:8080/webapp/updateRoutingRules \
+ -H 'Content-Type: application/json' \
+ -d '{  "name": "trino-rule",
+        "description": "updated rule description",
+        "priority": 0,
+        "actions": ["updated action"],
+        "condition": "updated condition"
+    }'
+```

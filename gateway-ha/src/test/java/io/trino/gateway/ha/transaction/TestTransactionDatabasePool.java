@@ -104,6 +104,7 @@ class TestTransactionDatabasePool
         configuration.getDataStore().setUser(username);
         configuration.getDataStore().setPassword(password);
         configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         return configuration;
     }
 
@@ -288,6 +289,7 @@ class TestTransactionDatabasePool
             monitor.setMonitorType(NOOP);
             configuration.setClusterStatsConfiguration(monitor);
             configuration.getTransactionAwareness().setEnabled(true);
+            configuration.getTransactionAwareness().getPool().setEnabled(true);
             {
                 configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-bootstrap-only");
                 configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-bootstrap-only");

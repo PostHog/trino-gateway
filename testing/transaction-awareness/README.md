@@ -85,7 +85,7 @@ python3 -m unittest -v test_fault_recovery
 The remaining externally configured protocol, adversarial, fault, restart, and
 real-client modules retain useful individual regression oracles. Their historical
 blue/green placement setup is not the supported pooled fixture and must be
-adapted before executing them against a pool-only Gateway. Do not treat a missing
+adapted before executing them against a pooled-mode Gateway. Do not treat a missing
 legacy administration endpoint, bootstrap error, or configuration rejection as
 transaction-affinity evidence. The former rollout/cutover clients and fixed
 blue/green load-checkpoint drivers have been removed rather than exported as

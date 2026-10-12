@@ -34,7 +34,7 @@ public class PoolLifecycleConfiguration
 
     public static final List<String> TENANT_IDENTITY_SOURCES = List.of(TENANT_IDENTITY_NONE, TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
 
-    private boolean enabled = true;
+    private boolean enabled;
     private String tenantIdentitySource = TENANT_IDENTITY_NONE;
     private List<String> hostQualificationDomains = List.of();
     private List<String> excludedHostLabels = List.of();
@@ -153,7 +153,7 @@ public class PoolLifecycleConfiguration
     public void validate(boolean transactionAwarenessEnabled, boolean forwardedHeadersEnabled)
     {
         if (!enabled) {
-            throw new IllegalArgumentException("Gateway requires pooled member lifecycle");
+            return;
         }
         if (!transactionAwarenessEnabled) {
             throw new IllegalArgumentException("Pooled member lifecycle requires transaction awareness to be enabled");

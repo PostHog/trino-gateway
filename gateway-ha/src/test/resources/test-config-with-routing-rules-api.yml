@@ -18,9 +18,21 @@ extraWhitelistPaths:
   - '/v1/custom.*'
   - '/custom/logout.*'
 
+gatewayCookieConfiguration:
+  enabled: true
+  cookieSigningSecret: "kjlhbfrewbyuo452cds3dc1234ancdsjh"
+
+oauth2GatewayCookieConfiguration:
+  deletePaths:
+    - "/custom/logout"
+
 requestAnalyzerConfig:
   analyzeRequest: true
 
 uiConfiguration:
   disablePages:
     - 'routing-rules'
+
+routingRules:
+  rulesEngineEnabled: true
+  rulesConfigPath: "${ENV:RESOURCES_DIR}/rules/routing_rules_update.yml"

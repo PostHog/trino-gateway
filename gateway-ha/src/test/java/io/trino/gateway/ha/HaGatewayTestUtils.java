@@ -13,9 +13,6 @@
  */
 package io.trino.gateway.ha;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.google.common.collect.ImmutableMap;
 import io.airlift.json.JsonCodec;
 import io.airlift.log.Logger;
@@ -94,27 +91,6 @@ public class HaGatewayTestUtils
                 .putAll(additionalVars)
                 .buildOrThrow();
         String configStr = replaceEnvironmentVariables(getResourceFileContent(configFile), vars);
-        ObjectMapper mapper = new ObjectMapper(new YAMLFactory());
-        ObjectNode configuration = (ObjectNode) mapper.readTree(configStr);
-        ObjectNode transactions = configuration.withObject("/transactionAwareness");
-        transactions.put("enabled", true);
-        if (!transactions.has("identityKey")) {
-            transactions.put("identityKey", "synthetic-test-identity-" + UUID.randomUUID());
-        }
-        if (!transactions.has("adminToken")) {
-            transactions.put("adminToken", "synthetic-test-admin-" + UUID.randomUUID());
-        }
-        transactions.withObject("/pool").put("enabled", true);
-        ObjectNode routing = configuration.withObject("/routing");
-        if (!routing.has("hostnameToPool")) {
-            ObjectNode hosts = routing.putObject("hostnameToPool");
-            hosts.put("localhost", "adhoc");
-            hosts.put("test.host.com", "adhoc");
-            hosts.put("scheduled.example.test", "scheduled");
-            hosts.put("custom.example.test", "custom");
-        }
-        configStr = mapper.writeValueAsString(configuration);
-
         File target = Files.createTempFile("config-" + System.currentTimeMillis(), "config.yaml").toFile();
 
         try (BufferedWriter writer = Files.newBufferedWriter(target.toPath(), UTF_8)) {
@@ -126,7 +102,7 @@ public class HaGatewayTestUtils
     }
 
     /**
-     * Supplies mandatory Gateway settings without connecting to a database, so configuration-only
+     * Supplies pooled Gateway settings without connecting to a database, so configuration-only
      * tests still reach the validation rule they intend to exercise.
      */
     public static void configurePooledValidation(HaGatewayConfiguration configuration)
@@ -137,6 +113,7 @@ public class HaGatewayTestUtils
         database.setDriver("org.postgresql.Driver");
         configuration.setDataStore(database);
         configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.getTransactionAwareness().setIdentityKey("synthetic-test-identity-" + UUID.randomUUID());
         configuration.getTransactionAwareness().setAdminToken("synthetic-test-admin-" + UUID.randomUUID());

@@ -7,7 +7,8 @@ import {Dashboard} from './components/dashboard';
 import {Cluster} from './components/cluster';
 import {History} from './components/history';
 import {AccessControlStore, Role} from "./store";
-import {IconHistory} from "@douyinfe/semi-icons";
+import {IconHistory, IconList} from "@douyinfe/semi-icons";
+import {RoutingRules} from "./components/routing-rules.tsx";
 
 export interface SubItemItem extends NavItemPropsWithItems {
   routeProps: RouteProps,
@@ -62,7 +63,16 @@ export const routers: RouterItems = [
       element: < History />
     },
   },
-
+  {
+    itemKey: 'routing-rules',
+    text: Locale.Menu.Sider.RoutingRules,
+    icon: <IconList className={styles.icon}/>,
+    roles: [],
+    routeProps: {
+      path: '/routing-rules',
+      element: < RoutingRules />
+    },
+   }
 ]
 
 export const routersMapper: Record<string | number, RouterItem | SubRouterItem> = routers.reduce((mapper, item) => {

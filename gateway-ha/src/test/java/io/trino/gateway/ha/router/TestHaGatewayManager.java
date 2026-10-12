@@ -18,6 +18,7 @@ import io.airlift.units.Duration;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.DatabaseCacheConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
+import io.trino.gateway.ha.config.RoutingConfiguration;
 import io.trino.gateway.ha.persistence.JdbcConnectionManager;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
@@ -60,37 +61,18 @@ final class TestHaGatewayManager
     }
 
     @Test
-    void testRegistryRequiresExplicitPool()
-    {
-        HaGatewayManager manager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
-        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
-        backend.setName("backend-a");
-        backend.setProxyTo("http://backend-a:8080");
-        for (String group : asList(null, "", "   ")) {
-            backend.setRoutingGroup(group);
-            assertThatThrownBy(() -> manager.addBackend(backend))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("must explicitly identify a pool");
-            assertThatThrownBy(() -> manager.updateBackend(backend))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("must explicitly identify a pool");
-        }
-        assertThat(manager.getAllBackends()).isEmpty();
-    }
-
-    @Test
     void testGatewayManagerWithCache()
     {
         DatabaseCacheConfiguration cacheConfiguration = new DatabaseCacheConfiguration();
         cacheConfiguration.setEnabled(true);
         cacheConfiguration.setRefreshAfterWrite(new Duration(5, SECONDS));
-        testGatewayManager(new HaGatewayManager(jdbi, cacheConfiguration));
+        testGatewayManager(new HaGatewayManager(jdbi, new RoutingConfiguration(), cacheConfiguration));
     }
 
     @Test
     void testGatewayManagerWithoutCache()
     {
-        testGatewayManager(new HaGatewayManager(jdbi, new DatabaseCacheConfiguration()));
+        testGatewayManager(new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration()));
     }
 
     static void testGatewayManager(HaGatewayManager haGatewayManager)
@@ -106,9 +88,11 @@ final class TestHaGatewayManager
 
         // Get backends
         assertThat(haGatewayManager.getAllBackends()).hasSize(1);
-        assertThat(haGatewayManager.getAllActiveBackends()).hasSize(1);
+        assertThat(haGatewayManager.getActiveBackends("adhoc")).hasSize(1);
+        assertThat(haGatewayManager.getActiveBackends("unknown")).isEmpty();
+        assertThat(haGatewayManager.getActiveDefaultBackends()).hasSize(1);
 
-        assertThat(haGatewayManager.getAllActiveBackends().getFirst().getExternalUrl()).isEqualTo("adhoc1.external.trino.gateway.io");
+        assertThat(haGatewayManager.getActiveDefaultBackends().getFirst().getExternalUrl()).isEqualTo("adhoc1.external.trino.gateway.io");
 
         // Update a backend
         ProxyBackendConfiguration adhoc = new ProxyBackendConfiguration();
@@ -118,7 +102,7 @@ final class TestHaGatewayManager
         adhoc.setProxyTo("adhoc1.trino.gateway.io");
         adhoc.setExternalUrl("adhoc1.trino.gateway.io");
         haGatewayManager.updateBackend(adhoc);
-        assertThat(haGatewayManager.getAllActiveBackends()).hasSize(1);
+        assertThat(haGatewayManager.getActiveBackends("adhoc")).hasSize(1);
         assertThat(haGatewayManager.getAllBackends())
                 .extracting(ProxyBackendConfiguration::getRoutingGroup)
                 .containsExactly("adhoc", "adhoc");
@@ -129,7 +113,7 @@ final class TestHaGatewayManager
         adhoc.setProxyTo("adhoc2.trino.gateway.io");
         adhoc.setExternalUrl("adhoc2.trino.gateway.io");
         haGatewayManager.updateBackend(adhoc);
-        assertThat(haGatewayManager.getAllActiveBackends()).isEmpty();
+        assertThat(haGatewayManager.getActiveBackends("adhoc")).isEmpty();
         assertThat(haGatewayManager.getAllBackends())
                 .extracting(ProxyBackendConfiguration::getRoutingGroup)
                 .containsExactly("etl", "adhoc");
@@ -147,7 +131,7 @@ final class TestHaGatewayManager
         adhoc2.setName("adhoc2");
         adhoc2.setProxyTo("adhoc2.trino.gateway.io");
         haGatewayManager.addBackend(adhoc2);
-        ProxyBackendConfiguration backendConfigurationAdhoc2 = haGatewayManager.getBackendByName("adhoc2").orElseThrow();
+        ProxyBackendConfiguration backendConfigurationAdhoc2 = haGatewayManager.getActiveBackends("adhoc2").getFirst();
         assertThat(backendConfigurationAdhoc2.getExternalUrl()).isEqualTo(adhoc2.getExternalUrl());
     }
 
@@ -163,7 +147,7 @@ final class TestHaGatewayManager
         cacheConfiguration.setRefreshAfterWrite(new Duration(3, SECONDS));
         cacheConfiguration.setExpireAfterWrite(new Duration(5, SECONDS));
         TestingTicker ticker = new TestingTicker();
-        HaGatewayManager haGatewayManager = new HaGatewayManager(connectionManager.getJdbi(), cacheConfiguration, ticker);
+        HaGatewayManager haGatewayManager = new HaGatewayManager(connectionManager.getJdbi(), new RoutingConfiguration(), cacheConfiguration, ticker);
 
         ProxyBackendConfiguration etl = new ProxyBackendConfiguration();
         etl.setActive(false);
@@ -192,7 +176,7 @@ final class TestHaGatewayManager
     @Test
     void testAddBackendWithTags()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
 
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("tagged-backend");
@@ -211,7 +195,7 @@ final class TestHaGatewayManager
     @Test
     void testAddBackendWithoutTagsReturnsEmptyList()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("untagged-backend");
         backend.setRoutingGroup("adhoc");
@@ -229,7 +213,7 @@ final class TestHaGatewayManager
     @Test
     void testUpdateBackendTags()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("update-tags-backend");
         backend.setRoutingGroup("adhoc");
@@ -249,7 +233,7 @@ final class TestHaGatewayManager
     @Test
     void testClearBackendTags()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("clear-tags-backend");
         backend.setRoutingGroup("adhoc");
@@ -269,7 +253,7 @@ final class TestHaGatewayManager
     @Test
     void testTagsAreIncludedInGetAllBackends()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("all-backends-tags-backend");
         backend.setRoutingGroup("adhoc");
@@ -290,7 +274,7 @@ final class TestHaGatewayManager
     @Test
     void testAddBackendRejectsTagWithComma()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("comma-tag-backend");
         backend.setRoutingGroup("adhoc");
@@ -308,7 +292,7 @@ final class TestHaGatewayManager
     @Test
     void testAddBackendNormalizesTags()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("normalized-tag-backend");
         backend.setRoutingGroup("adhoc");
@@ -328,7 +312,7 @@ final class TestHaGatewayManager
     @Test
     void testUpdateBackendRejectsTagWithComma()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
         ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
         backend.setName("update-comma-tag-backend");
         backend.setRoutingGroup("adhoc");
@@ -347,7 +331,7 @@ final class TestHaGatewayManager
     @Test
     void testRemoveTrailingSlashInUrl()
     {
-        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
 
         ProxyBackendConfiguration etl = new ProxyBackendConfiguration();
         etl.setActive(false);

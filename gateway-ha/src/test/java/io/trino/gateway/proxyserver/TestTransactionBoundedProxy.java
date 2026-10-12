@@ -93,6 +93,7 @@ class TestTransactionBoundedProxy
         database.setJdbcUrl("jdbc:postgresql://localhost/unused_unit_test_database");
         config.setDataStore(database);
         config.getTransactionAwareness().setEnabled(true);
+        config.getTransactionAwareness().getPool().setEnabled(true);
         config.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-adapter-tests");
         config.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-adapter-tests");
         config.getTransactionAwareness().setMaxInFlightRequests(1);
@@ -113,7 +114,7 @@ class TestTransactionBoundedProxy
         HttpResponseFuture<?> future = new TestingResponseFuture(raw);
         doReturn(future).when(proxy).executeAsync(any(), any());
         history = mock(QueryHistoryManager.class);
-        handler = new ProxyRequestHandler(proxy, history, mock(OAuth2RoutingStore.class), config);
+        handler = new ProxyRequestHandler(proxy, mock(io.trino.gateway.ha.router.RoutingManager.class), history, mock(OAuth2RoutingStore.class), config);
         handler.setTransactionAwareness(service);
     }
 

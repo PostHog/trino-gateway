@@ -18,11 +18,13 @@ import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.github.benmanes.caffeine.cache.Ticker;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
+import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.airlift.log.Logger;
 import io.airlift.stats.CounterStat;
 import io.trino.gateway.ha.config.DatabaseCacheConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
+import io.trino.gateway.ha.config.RoutingConfiguration;
 import io.trino.gateway.ha.persistence.GatewayDatabase;
 import io.trino.gateway.ha.persistence.dao.GatewayBackend;
 import io.trino.gateway.ha.persistence.dao.GatewayBackendDao;
@@ -45,6 +47,7 @@ public class HaGatewayManager
     private static final Object ALL_BACKEND_CACHE_KEY = new Object();
 
     private final GatewayBackendDao dao;
+    private final String defaultRoutingGroup;
     private final LoadingCache<Object, List<GatewayBackend>> backendCache;
     private boolean transactionAwarenessEnabled;
 
@@ -58,15 +61,27 @@ public class HaGatewayManager
     private final CounterStat backendLookupFailures = new CounterStat();
 
     @Inject
+    public HaGatewayManager(Jdbi jdbi, RoutingConfiguration routingConfiguration, DatabaseCacheConfiguration databaseCacheConfiguration)
+    {
+        this(jdbi, routingConfiguration, databaseCacheConfiguration, Ticker.systemTicker());
+    }
+
     public HaGatewayManager(Jdbi jdbi, DatabaseCacheConfiguration databaseCacheConfiguration)
     {
-        this(jdbi, databaseCacheConfiguration, Ticker.systemTicker());
+        this(jdbi, new RoutingConfiguration(), databaseCacheConfiguration);
     }
 
     @VisibleForTesting
     public HaGatewayManager(Jdbi jdbi, DatabaseCacheConfiguration databaseCacheConfiguration, Ticker ticker)
     {
+        this(jdbi, new RoutingConfiguration(), databaseCacheConfiguration, ticker);
+    }
+
+    @VisibleForTesting
+    public HaGatewayManager(Jdbi jdbi, RoutingConfiguration routingConfiguration, DatabaseCacheConfiguration databaseCacheConfiguration, Ticker ticker)
+    {
         dao = GatewayDatabase.dao(requireNonNull(jdbi, "jdbi is null"), GatewayBackendDao.class, GatewayDatabase.Operation.BACKEND_DAO);
+        defaultRoutingGroup = routingConfiguration.getDefaultRoutingGroup();
 
         Caffeine<Object, Object> caffeineBuilder = Caffeine.newBuilder()
                 .initialCapacity(1)
@@ -135,6 +150,28 @@ public class HaGatewayManager
     {
         List<GatewayBackend> proxyBackendList = getAllBackendsInternal().stream()
                 .filter(GatewayBackend::active)
+                .collect(toImmutableList());
+        return upcast(proxyBackendList);
+    }
+
+    @Override
+    public List<ProxyBackendConfiguration> getActiveDefaultBackends()
+    {
+        try {
+            return getActiveBackends(defaultRoutingGroup);
+        }
+        catch (Exception e) {
+            log.info("Error fetching backends for default routing group; see sanitized database diagnostics");
+        }
+        return ImmutableList.of();
+    }
+
+    @Override
+    public List<ProxyBackendConfiguration> getActiveBackends(String routingGroup)
+    {
+        List<GatewayBackend> proxyBackendList = getAllBackendsInternal().stream()
+                .filter(GatewayBackend::active)
+                .filter(backend -> backend.routingGroup().equals(routingGroup))
                 .collect(toImmutableList());
         return upcast(proxyBackendList);
     }
@@ -221,7 +258,7 @@ public class HaGatewayManager
     {
         checkArgument(backend.getName() != null, "Backend name cannot be null");
         checkArgument(backend.getProxyTo() != null, "Backend proxyTo URL cannot be null");
-        checkArgument(backend.getRoutingGroup() != null && !backend.getRoutingGroup().isBlank(), "Backend routing group must explicitly identify a pool");
+        checkArgument(backend.getRoutingGroup() != null, "Backend routing group cannot be null");
         checkArgument(backend.getExternalUrl() != null, "Backend external url cannot be null");
         for (String tag : backend.getTags()) {
             checkArgument(!tag.contains(","), "Backend tag cannot contain ',' character: %s", tag);

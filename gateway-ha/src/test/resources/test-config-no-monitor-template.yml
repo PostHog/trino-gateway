@@ -14,3 +14,7 @@ clusterStatsConfiguration:
 
 monitor:
   taskDelay: 1h
+
+gatewayCookieConfiguration:
+  enabled: true
+  cookieSigningSecret: "kjlhbfrewbyuo452cds3dc1234ancdsjh"

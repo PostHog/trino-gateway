@@ -5,11 +5,9 @@ serverConfig:
   otel.exporter.endpoint: http://localhost:4318/v1/traces
   otel.exporter.protocol: http/protobuf
 
-routing:
-  hostnameSuffixToPool:
-    dw.example.test: pool-one
-  hostnameToPool:
-    warehouse-two.dw.example.test: pool-two
+routingRules:
+  rulesEngineEnabled: False
+  # rulesConfigPath: "src/main/resources/rules/routing_rules.yml"
 
 dataStore:
   jdbcUrl: jdbc:postgresql://localhost:5432/trino_gateway_db
@@ -25,10 +23,3 @@ clusterStatsConfiguration:
 monitor:
   taskDelay: 1m
   clusterMetricsRegistryRefreshPeriod: 30s
-
-transactionAwareness:
-  enabled: true
-  identityKey: ${ENV:GATEWAY_TRANSACTION_IDENTITY_KEY}
-  adminToken: ${ENV:GATEWAY_TRANSACTION_ADMIN_TOKEN}
-  pool:
-    enabled: true

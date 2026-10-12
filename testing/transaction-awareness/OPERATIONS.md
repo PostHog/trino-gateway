@@ -1,7 +1,11 @@
 # Pooled Gateway operation
 
-Gateway supports hostname-selected pools only. This document defines the
-contract, not a deployment or execution receipt.
+This document describes hostname-selected pooled mode, enabled by setting both
+`transactionAwareness.enabled` and `transactionAwareness.pool.enabled` to `true`.
+Official upstream functionality is retained but bypassed for this deployment:
+no client header, route cookie, rules engine, or default fallback selects compute.
+Both flags default to `false` for stock upstream behavior. This document defines
+the pooled contract, not a deployment or execution receipt.
 
 ## Configuration
 
@@ -104,7 +108,7 @@ OAuth affinity does not enable OAuth/Bearer admission through the Basic adapter.
 
 Complete existing work before replacing the old routing version and config.
 Remove routingRules, default-group, router-module, and route-cookie settings.
-Do not mix old routing replicas with pool-only replicas. Do not change host
+Do not mix old routing replicas with pooled-mode replicas. Do not change host
 placement or ownership keys while work is in flight.
 
 See [README.md](README.md) for supported fixtures and commands. Use independent

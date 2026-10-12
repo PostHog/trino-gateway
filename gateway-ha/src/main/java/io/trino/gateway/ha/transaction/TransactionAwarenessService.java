@@ -116,12 +116,12 @@ public class TransactionAwarenessService
         store = new TransactionStore(jdbi);
         pools = new PoolStore(jdbi);
         poolConfig = config.getPool();
-        identity = new TransactionIdentity(config.getIdentityKey());
+        identity = config.isEnabled() ? new TransactionIdentity(config.getIdentityKey()) : null;
         this.backendManager = backendManager;
         this.httpClient = httpClient;
         statementPaths = configuration.getStatementPaths();
         this.routingGroupSelector = routingGroupSelector;
-        capacity = new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout());
+        capacity = config.isEnabled() ? new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout()) : null;
     }
 
     public boolean isEnabled()
@@ -136,6 +136,9 @@ public class TransactionAwarenessService
 
     public RoutingTargetResponse resolve(HttpServletRequest request, Optional<String> pinnedBackend)
     {
+        if (!isEnabled()) {
+            throw error(404, "Pooled routing is disabled");
+        }
         String path = request.getRequestURI();
         if (!canonicalPath(path)) {
             throw error(400, "Proxy requests require a canonical path");
@@ -150,7 +153,7 @@ public class TransactionAwarenessService
         }
         RoutingSelectorResponse selection = routingGroupSelector.findRoutingDestination(request);
         String group = selection.routingGroup();
-        if (group == null || group.isBlank()) {
+        if (group == null || group.isBlank() || !selection.externalHeaders().isEmpty()) {
             throw error(421, "The request hostname does not identify a pool");
         }
         if (!submission && !continuation) {

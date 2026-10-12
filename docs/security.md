@@ -1,23 +1,35 @@
 # Security
 
-Gateway authenticates and authorizes its own UI and administration APIs separately
-from Trino query authentication. A public Host selects only a configured compute
-pool; it is not an authenticated tenant identity. Client routing-group headers,
-query properties, cookies, and forwarded-host claims cannot change that placement.
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
 
-The pooled tenant restriction is deny-only. Its current adapter reads one Basic
-credential principal, qualified exactly as the coordinator will qualify it, and
-looks it up in controller-published admission bindings. Gateway does not verify
-that password or authorize impersonation; the coordinator verifies both on every
-statement. Missing or unsupported claims cannot open an admission gate. Durable
-query/transaction ownership checks are additional restrictions, not authentication
-of a caller-supplied username.
+Trino Gateway has its own security with its own authentication and authorization.
+These features are used only to authenticate and authorize its user interface and
+the APIs. All Trino-related requests are passed through to the Trino cluster
+without any authentication or authorization check in Trino Gateway, unless the
+optional client-certificate JWT bridge is configured.
 
-Keep the public proxy's Host and coordinator qualification aligned. Reject or
-ignore untrusted forwarded headers before server-side request rewriting, then
-strip client `Forwarded` and `X-Forwarded-*` and synthesize trusted forwarding
+## Pooled authentication boundary
+
+In pooled mode, Host selects a configured pool, not an authenticated tenant.
+Headers, query properties, route cookies, and forwarded-host claims cannot
+change placement. The current deny-only tenant adapter reads one Basic
+credential principal qualified as the coordinator will qualify it; the
+coordinator still verifies credentials and authorization on each statement.
+Gateway UI/API OAuth login and certificate-to-JWT transport do not supply a
+supported pooled Basic principal. Do not advertise OAuth/Bearer pooled SQL
+from enabling transport affinity or the bridge alone.
+
+Preserve the public Host at trusted ingress. Reject or ignore untrusted
+forwarded headers before server-side request rewriting; strip client
+`Forwarded` and `X-Forwarded-*` and regenerate trusted coordinator-facing
 metadata. Restrict direct coordinator access. See
-[hostname routing](routing-rules.md) and [routing logic](routing-logic.md).
+[pooled routing](pooled-routing.md) for ownership and continuation boundaries.
 
 ## Client certificate JWT bridge
 
@@ -163,11 +175,6 @@ users. See the [Trino system access control
 documentation](https://trino.io/docs/current/security/file-system-access-control.html)
 for details.
 
-The certificate-to-JWT bridge is a separate protocol feature. It does not add a
-certificate/JWT identity source to the pooled Basic tenant restriction. Do not
-claim pooled query support from enabling the bridge alone; a supported admission
-adapter must agree with the principal the coordinator authenticates.
-
 ## TLS configuration
 
 All authentication and authorization mechanisms require configuring TLS as the
@@ -261,7 +268,7 @@ authentication:
     authorizationEndpoint:
     jwkEndpoint:
     redirectUrl:
-    redirectWebUrl: 
+    redirectWebUrl:
     userIdField:
     scopes:
       - s1
@@ -271,20 +278,23 @@ authentication:
 
 Set the `privilegesField` to retrieve privileges from an OAuth claim.
 
-### Gateway login and Trino OAuth2 transport
+### Note
 
-Gateway UI/API OAuth uses its own client and callback; it is not Trino query
-authentication. Supported upstream `/oauth2` handshakes require coordinator
-identity affinity because the challenge state is coordinator-local. Use the
-shared, pool-constrained handshake binding described in
-[routing logic](routing-logic.md#authentication-protocol-affinity), not a routing
-rule, duplicate backend registration, or a cookie-selected compute pool.
-
-Neither a successful Gateway OAuth login nor Trino handshake transport supplies
-a Basic principal to the current pooled tenant adapter. Do not enable or
-advertise OAuth/Bearer pooled SQL on that basis. A separately supported identity
-adapter would need equivalent verified coordinator identity and deny-only
-admission semantics.
+- For OAuth Trino Gateway uses `oidc/callback` where as Trino uses `oauth2` path
+- Trino Gateway should have its own client id
+- All the Trino clusters should have a single client id.
+- Trino Gateway needs to pass thorugh the Trino Oauth2 requests only to one of the clusters.
+- One way to handle it is to set a special rule like below:
+```yaml
+  ---
+  name: "Oauth requests"
+  description: "Oauth requests need to go to a single backed"
+  condition: "request.getRequestURI.startsWith(\"/oauth2\")"
+  actions:
+    - "result.put(\"routingGroup\", \"oauth2-handler\")"
+```
+- That also means you need to have a cluster with that routing group.
+- It's ok to replicate an existing Trino cluster record with a different name for that purpose.
 
 ### Form/Basic authentication
 
@@ -340,7 +350,7 @@ Trino Gateway supports the following roles in regex string format:
 - api : Allows access to rest apis to configure the clusters
 
 Users with attributes next to the role will be giving those privileges the
-users. You can use the preset users defined in the yaml file. 
+users. You can use the preset users defined in the yaml file.
 LDAP Authorization is also supported by adding user attribute configs in file.
 An OAuth claim can be used by setting the `privilegesField` in the OAuth
 configuration.
@@ -467,21 +477,23 @@ enabled.
 ## Web page permissions
 
 By default, all pages are accessible to all roles.
-To limit page access, you can set page permissions by pages 
+To limit page access, you can set page permissions by pages
 and `_` as separator field.
 
 The following pages are available:
 
 - `dashboard`
 - `cluster`
+- `resource-group`
+- `selector`
 - `history`
 
 ```yaml
 # admin/api can access all pages, while user can only access dashboard/history
 pagePermissions:
-  admin: 
-  user: dashboard_history 
-  api: 
+  admin:
+  user: dashboard_history
+  api:
 ```
 
 ## Extra: Self-signed certificate in Trino Gateway
@@ -503,7 +515,7 @@ Trino Gateway should be added:
 -Djavax.net.ssl.trustStorePassword=<truststore password>
 ```
 
-If you want to skip the hostname validation for a self-signed certificate, 
+If you want to skip the hostname validation for a self-signed certificate,
 the `serverConfig` configuration should contain the following:
 
 ```yaml

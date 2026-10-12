@@ -1,23 +1,24 @@
 # Trino Gateway
 
-A hostname-routing proxy for pooled [Trino](https://trino.io) compute.
-Configured public hostnames select a pool; certified member lifecycle and
-PostgreSQL-backed ownership control admission and transaction/query affinity.
-Client routing-group headers, routing rules, cookies, and default-group fallback
-do not select compute.
+A load balancer, proxy server, and configurable routing gateway for multiple
+[Trino](https://trino.io) clusters.
 
 <img src="./docs/assets/logos/trino-gateway-h.png"/>
 
-Find out more details from our documentation at 
+Find out more details from our documentation at
 [trinodb.github.io/trino-gateway](https://trinodb.github.io/trino-gateway)
 
-See [hostname configuration](docs/routing-rules.md),
-[routing logic](docs/routing-logic.md), and [operation](docs/operation.md).
-The [transaction design](docs/design/transaction-awareness.md),
+This fork retains official upstream functionality and its default behavior.
+Both `transactionAwareness.enabled` and `transactionAwareness.pool.enabled`
+default to `false`. Setting both to `true` enables our strict
+[hostname-only pooled deployment](docs/pooled-routing.md): stock header/rule/
+cookie selectors and default-group fallback remain in the codebase but are
+bypassed. They cannot select compute or provide a fallback in pooled mode.
+
+See the [transaction design](docs/design/transaction-awareness.md),
 [operational boundaries](testing/transaction-awareness/OPERATIONS.md), and
-[repeatable test suite](testing/transaction-awareness/README.md) describe
-ownership and drain safety. These documents do not constitute a production
-deployment or transaction replication: a lost coordinator's in-memory
-transactions cannot migrate to another member.
+[repeatable test suite](testing/transaction-awareness/README.md). This work does
+not constitute a production deployment or transaction replication. Custom
+fixed-backend cutover and rollout administration APIs remain removed.
 
 <img src="./docs/assets/logos/trino-gateway-v.png"/>
