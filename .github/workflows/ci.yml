@@ -84,7 +84,7 @@ jobs:
         run: >-
           ./mvnw -B -ntp -pl gateway-ha -am test
           -Dskip.installnodepnpm -Dskip.pnpm
-          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler,TestDatabaseDeadline,TestJdbcConnectionManager'
+          '-Dtest=TestTransaction*,TestStrictProxyResponseHandler,TestDatabaseDeadline,TestJdbcConnectionManager,TestMigrateFromEnvironment'
           -Dsurefire.failIfNoSpecifiedTests=false
       - name: Protocol and network fault fixture self-tests
         working-directory: testing/transaction-awareness
