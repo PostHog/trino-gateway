@@ -112,7 +112,7 @@ class TestTransactionStore
         fixtureUsername = username;
         fixturePassword = password;
         database = Jdbi.create(fixtureUrl, username, password);
-        for (String version : new String[] {"V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql", "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql", "V11__pool_tenant_principals.sql"}) {
+        for (String version : new String[] {"V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql", "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql", "V13__pool_tenant_principals.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
                 database.useHandle(handle -> handle.createScript(sql).execute());
@@ -1383,7 +1383,7 @@ class TestTransactionStore
             try {
                 handle.execute("CREATE SCHEMA " + upgradeSchema);
                 handle.execute("SET LOCAL search_path TO " + upgradeSchema);
-                try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/V5__transaction_awareness.sql"))) {
+                try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/V7__transaction_awareness.sql"))) {
                     handle.createScript(new String(migration.readAllBytes(), StandardCharsets.UTF_8)).execute();
                 }
                 handle.createUpdate("INSERT INTO transaction_backend (incarnation, name, backend_url, external_url, routing_group, node_id, coordinator_id, state) VALUES (:id, 'blue', 'http://blue.example.test', 'http://blue.example.test', 'group', 'node', 'process', 'ACTIVE')")
@@ -1395,7 +1395,7 @@ class TestTransactionStore
                 handle.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, transaction_id, query_id, state) VALUES (:admission, :id, 'owner', 'transaction', 'query', 'UNCERTAIN')")
                         .bind("admission", UUID.randomUUID()).bind("id", incarnation).execute();
                 handle.execute("INSERT INTO transaction_route (routing_group, backend_name) VALUES ('group', 'blue')");
-                try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/V6__backend_incarnation_history.sql"))) {
+                try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/V8__backend_incarnation_history.sql"))) {
                     handle.createScript(new String(migration.readAllBytes(), StandardCharsets.UTF_8)).execute();
                 }
                 assertThat(handle.createQuery("SELECT current_name FROM transaction_backend WHERE incarnation = :id").bind("id", incarnation).mapTo(String.class).one()).isEqualTo("blue");

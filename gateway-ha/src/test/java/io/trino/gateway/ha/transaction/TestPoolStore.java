@@ -138,9 +138,9 @@ class TestPoolStore
         fixtureUsername = username;
         fixturePassword = password;
         for (String version : new String[] {
-                "V5__transaction_awareness.sql", "V6__backend_incarnation_history.sql", "V7__query_capabilities.sql",
-                "V8__drain_obligation_indexes.sql", "V9__cell_rollout_operations.sql", "V10__pool_member_lifecycle.sql",
-                "V11__pool_tenant_principals.sql",
+                "V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql",
+                "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql",
+                "V13__pool_tenant_principals.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);

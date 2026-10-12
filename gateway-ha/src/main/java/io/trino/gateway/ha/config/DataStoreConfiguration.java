@@ -13,6 +13,8 @@
  */
 package io.trino.gateway.ha.config;
 
+import io.airlift.units.Duration;
+
 public class DataStoreConfiguration
 {
     private String jdbcUrl;
@@ -21,6 +23,7 @@ public class DataStoreConfiguration
     private String driver;
     private boolean queryHistoryEnabled = true;
     private Integer queryHistoryHoursRetention = 4;
+    private Integer queryHistoryMaxQueryTextLength;
     private boolean runMigrationsEnabled = true;
     private boolean connectionPoolEnabled;
     private int maximumPoolSize = 4;
@@ -29,8 +32,24 @@ public class DataStoreConfiguration
     private int socketTimeoutSeconds = 10;
     private int statementTimeoutMillis = 5000;
     private int lockTimeoutMillis = 250;
+    // How long an OAuth2 pin is kept before the periodic DB cleanup may prune it. Pins only need to
+    // outlive an in-flight handshake (minutes), so an hour is ample. Note this is a lower bound: the
+    // cleanup sweep runs on its own fixed cadence, so a pin can linger until the next sweep after this
+    // period elapses.
+    private Duration oauth2RoutingRetention = Duration.valueOf("1h");
+    private Integer maxPoolSize;
+    private Duration keepaliveTime;
+    private Duration maxLifetime;
 
-    public DataStoreConfiguration(String jdbcUrl, String user, String password, String driver, boolean queryHistoryEnabled, Integer queryHistoryHoursRetention, boolean runMigrationsEnabled)
+    public DataStoreConfiguration(
+            String jdbcUrl,
+            String user,
+            String password,
+            String driver,
+            boolean queryHistoryEnabled,
+            Integer queryHistoryHoursRetention,
+            boolean runMigrationsEnabled,
+            Integer maxPoolSize)
     {
         this.jdbcUrl = jdbcUrl;
         this.user = user;
@@ -39,6 +58,7 @@ public class DataStoreConfiguration
         this.queryHistoryEnabled = queryHistoryEnabled;
         this.queryHistoryHoursRetention = queryHistoryHoursRetention;
         this.runMigrationsEnabled = runMigrationsEnabled;
+        this.maxPoolSize = maxPoolSize;
     }
 
     public DataStoreConfiguration() {}
@@ -173,6 +193,16 @@ public class DataStoreConfiguration
         this.queryHistoryHoursRetention = queryHistoryHoursRetention;
     }
 
+    public Integer getQueryHistoryMaxQueryTextLength()
+    {
+        return this.queryHistoryMaxQueryTextLength;
+    }
+
+    public void setQueryHistoryMaxQueryTextLength(Integer queryHistoryMaxQueryTextLength)
+    {
+        this.queryHistoryMaxQueryTextLength = queryHistoryMaxQueryTextLength;
+    }
+
     public boolean isRunMigrationsEnabled()
     {
         return this.runMigrationsEnabled;
@@ -181,5 +211,45 @@ public class DataStoreConfiguration
     public void setRunMigrationsEnabled(boolean runMigrationsEnabled)
     {
         this.runMigrationsEnabled = runMigrationsEnabled;
+    }
+
+    public Duration getOauth2RoutingRetention()
+    {
+        return this.oauth2RoutingRetention;
+    }
+
+    public void setOauth2RoutingRetention(String oauth2RoutingRetention)
+    {
+        this.oauth2RoutingRetention = Duration.valueOf(oauth2RoutingRetention);
+    }
+
+    public Integer getMaxPoolSize()
+    {
+        return maxPoolSize;
+    }
+
+    public void setMaxPoolSize(Integer maxPoolSize)
+    {
+        this.maxPoolSize = maxPoolSize;
+    }
+
+    public Duration getKeepaliveTime()
+    {
+        return keepaliveTime;
+    }
+
+    public void setKeepaliveTime(Duration keepaliveTime)
+    {
+        this.keepaliveTime = keepaliveTime;
+    }
+
+    public Duration getMaxLifetime()
+    {
+        return maxLifetime;
+    }
+
+    public void setMaxLifetime(Duration maxLifetime)
+    {
+        this.maxLifetime = maxLifetime;
     }
 }

@@ -45,7 +45,7 @@ class FingerprintPostgresTests(unittest.TestCase):
         self.environment = dict(os.environ, PGOPTIONS="-c search_path=" + self.schema, PGAPPNAME="synthetic-fingerprint-test")
         self.psql("CREATE SCHEMA " + self.schema)
         migrations = Path(__file__).resolve().parents[3] / "gateway-ha/src/main/resources/postgresql"
-        for version in (5, 6, 7, 8):
+        for version in (1, 7, 8, 9, 10):
             self.psql(next(migrations.glob("V" + str(version) + "__*.sql")).read_text())
         self.first = "00000000-0000-0000-0000-000000000001"
         self.second = "00000000-0000-0000-0000-000000000002"

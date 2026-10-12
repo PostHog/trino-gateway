@@ -13,8 +13,10 @@
  */
 package io.trino.gateway.ha.config;
 
+import io.airlift.units.Duration;
 import org.junit.jupiter.api.Test;
 
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.assertj.core.api.Assertions.assertThat;
 
 final class TestDataStoreConfiguration
@@ -28,6 +30,10 @@ final class TestDataStoreConfiguration
         assertThat(dataStoreConfiguration.getPassword()).isNull();
         assertThat(dataStoreConfiguration.getDriver()).isNull();
         assertThat(dataStoreConfiguration.isQueryHistoryEnabled()).isTrue();
+        assertThat(dataStoreConfiguration.getQueryHistoryMaxQueryTextLength()).isNull();
+        assertThat(dataStoreConfiguration.getMaxPoolSize()).isNull();
+        assertThat(dataStoreConfiguration.getKeepaliveTime()).isNull();
+        assertThat(dataStoreConfiguration.getMaxLifetime()).isNull();
     }
 
     @Test
@@ -49,5 +55,17 @@ final class TestDataStoreConfiguration
 
         dataStoreConfiguration.setQueryHistoryEnabled(false);
         assertThat(dataStoreConfiguration.isQueryHistoryEnabled()).isFalse();
+
+        dataStoreConfiguration.setQueryHistoryMaxQueryTextLength(10000);
+        assertThat(dataStoreConfiguration.getQueryHistoryMaxQueryTextLength()).isEqualTo(10000);
+
+        dataStoreConfiguration.setMaxPoolSize(10);
+        assertThat(dataStoreConfiguration.getMaxPoolSize()).isEqualTo(10);
+
+        dataStoreConfiguration.setKeepaliveTime(new Duration(2, MINUTES));
+        assertThat(dataStoreConfiguration.getKeepaliveTime()).isEqualTo(new Duration(2, MINUTES));
+
+        dataStoreConfiguration.setMaxLifetime(new Duration(30, MINUTES));
+        assertThat(dataStoreConfiguration.getMaxLifetime()).isEqualTo(new Duration(30, MINUTES));
     }
 }
