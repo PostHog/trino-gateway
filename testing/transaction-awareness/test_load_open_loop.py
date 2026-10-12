@@ -196,7 +196,7 @@ class OpenLoopTests(unittest.TestCase):
     def test_sql_groups_round_robin_independently_of_get_arrivals(self):
         transport = Transport()
         result = self.run_load(transport, concurrency=1)
-        groups = [headers["X-Trino-Routing-Group"] for _, method, _, headers in transport.requests if method == "POST"]
+        groups = [headers["Host"] for _, method, _, headers in transport.requests if method == "POST"]
         self.assertEqual(groups, ["group-a" if index % 2 == 0 else "group-b" for index in range(len(groups))])
         self.assertGreaterEqual(len(groups), 2)
         self.assertEqual(len(result["per_gateway_counts"]), 2)

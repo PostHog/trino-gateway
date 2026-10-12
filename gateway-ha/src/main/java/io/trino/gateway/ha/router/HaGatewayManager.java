@@ -66,6 +66,17 @@ public class HaGatewayManager
         this(jdbi, routingConfiguration, databaseCacheConfiguration, Ticker.systemTicker());
     }
 
+    public HaGatewayManager(Jdbi jdbi, DatabaseCacheConfiguration databaseCacheConfiguration)
+    {
+        this(jdbi, new RoutingConfiguration(), databaseCacheConfiguration);
+    }
+
+    @VisibleForTesting
+    public HaGatewayManager(Jdbi jdbi, DatabaseCacheConfiguration databaseCacheConfiguration, Ticker ticker)
+    {
+        this(jdbi, new RoutingConfiguration(), databaseCacheConfiguration, ticker);
+    }
+
     @VisibleForTesting
     public HaGatewayManager(Jdbi jdbi, RoutingConfiguration routingConfiguration, DatabaseCacheConfiguration databaseCacheConfiguration, Ticker ticker)
     {

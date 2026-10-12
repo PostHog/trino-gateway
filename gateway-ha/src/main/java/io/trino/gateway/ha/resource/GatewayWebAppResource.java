@@ -66,6 +66,7 @@ public class GatewayWebAppResource
     private final QueryHistoryManager queryHistoryManager;
     private final BackendStateManager backendStateManager;
     private final boolean isRulesEngineEnabled;
+    private final boolean hostnameRoutingEnabled;
     private final RulesType ruleType;
     // TODO Avoid putting mutable objects in fields
     private final UIConfiguration uiConfiguration;
@@ -85,7 +86,8 @@ public class GatewayWebAppResource
         this.uiConfiguration = configuration.getUiConfiguration();
         this.routingRulesManager = requireNonNull(routingRulesManager, "routingRulesManager is null");
         RoutingRulesConfiguration routingRules = configuration.getRoutingRules();
-        isRulesEngineEnabled = routingRules.isRulesEngineEnabled();
+        hostnameRoutingEnabled = configuration.getTransactionAwareness().isEnabled();
+        isRulesEngineEnabled = !hostnameRoutingEnabled && routingRules.isRulesEngineEnabled();
         ruleType = routingRules.getRulesType();
     }
 
@@ -226,6 +228,10 @@ public class GatewayWebAppResource
     public Response getRoutingRules()
             throws IOException
     {
+        if (hostnameRoutingEnabled) {
+            return Response.status(Response.Status.NO_CONTENT)
+                    .entity(Result.fail("Routing rules are disabled for hostname-only pooled routing")).build();
+        }
         if (isRulesEngineEnabled && ruleType == RulesType.EXTERNAL) {
             return Response.status(Response.Status.NO_CONTENT)
                     .entity(Result.fail("Routing rules are managed by an external service")).build();
@@ -242,6 +248,10 @@ public class GatewayWebAppResource
     public Response updateRoutingRules(RoutingRule routingRule)
             throws IOException
     {
+        if (hostnameRoutingEnabled) {
+            return Response.status(Response.Status.CONFLICT)
+                    .entity(Result.fail("Routing rules are disabled for hostname-only pooled routing")).build();
+        }
         List<RoutingRule> routingRulesList = routingRulesManager.updateRoutingRule(routingRule);
         return Response.ok(Result.ok(routingRulesList)).build();
     }

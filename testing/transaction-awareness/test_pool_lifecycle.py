@@ -16,13 +16,15 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 from protocol import finish, request, through_gateway
-from test_rollout_api import local_gateways
+from gateway_fixture import local_gateways
 
 # The pool identity is the routing group the Gateway backends are registered in.
 POOL = "cell"
 MEMBERS = ("m0", "m1", "m2", "m3", "m4")
 POOL_CONFIG = {"enabled": True}
 CREDENTIAL = [("Authorization", "Basic " + base64.b64encode(b"warehouse:disposable").decode())]
+SPOOFED_PLACEMENT = [("X-Trino-Routing-Group", "unmapped-pool"),
+                    ("X-Forwarded-Host", "unmapped.invalid")]
 
 
 class PoolLifecycleContract(unittest.TestCase):
@@ -89,9 +91,9 @@ class PoolLifecycleContract(unittest.TestCase):
                             "readyWorkers": 3,
                             "checks": ["image", "workers", "catalog-revision", "auth-revision"]}}
 
-    def served_by(self, gateways, statement="SELECT 1", replica=0):
+    def served_by(self, gateways, statement="SELECT 1", replica=0, extra=()):
         """Runs an independent statement to completion and returns the member identity that served it."""
-        submitted = request(gateways[replica] + "/v1/statement", "POST", statement, CREDENTIAL)
+        submitted = request(gateways[replica] + "/v1/statement", "POST", statement, CREDENTIAL + list(extra))
         self.assertEqual(submitted.status, 200, submitted.body)
         pages = finish(submitted, gateways[replica])
         for page in pages:
@@ -100,6 +102,70 @@ class PoolLifecycleContract(unittest.TestCase):
         data = [page.json()["data"] for page in pages if page.json().get("data")]
         self.assertTrue(data, "A completed statement returned no data")
         return data[-1][0][0]
+
+    @staticmethod
+    def statement_dispatches(backends):
+        count = 0
+        for backend in backends:
+            with backend.state.lock:
+                count += sum(item["method"] == "POST" and item["path"] == "/v1/statement"
+                             for item in backend.state.requests)
+        return count
+
+    def test_spoofed_placement_headers_cannot_override_the_host_pool(self):
+        with local_gateways(backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            self.successful(self.configure(api, 3, "configure"))
+            for backend in backends:
+                self.bootstrap(api, backend, 3, "boot-" + backend.state.identity)
+            for replica in (0, 1):
+                # Each independent input and the combination must be harmless. A nonexistent
+                # routing group cannot pass accidentally by selecting another member of cell.
+                for headers in ([("X-Trino-Routing-Group", "unmapped-pool")],
+                                [("X-Forwarded-Host", "unmapped.invalid")],
+                                [("X-Trino-Routing-Group", "unmapped-pool"),
+                                 ("X-Forwarded-Host", "unmapped.invalid")]):
+                    self.assertIn(self.served_by(gateways, replica=replica, extra=headers), MEMBERS[:3])
+
+    def test_unknown_host_rejects_even_with_mapped_spoofed_headers(self):
+        with local_gateways(backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            api = self.pool_api(gateways, token)
+            self.successful(self.configure(api, 3, "configure"))
+            for backend in backends:
+                self.bootstrap(api, backend, 3, "boot-" + backend.state.identity)
+            for replica in (0, 1):
+                self.assertIn(self.served_by(gateways, replica=replica), MEMBERS[:3])
+                dispatched = self.statement_dispatches(backends)
+                refused = request(gateways[replica] + "/v1/statement", "POST", "SELECT 1",
+                                  CREDENTIAL + [("Host", "unmapped.invalid:8080"),
+                                                ("X-Forwarded-Host", "localhost"),
+                                                ("X-Trino-Routing-Group", POOL)])
+                self.assertEqual(refused.status, 421, refused.body)
+                self.assertEqual(self.statement_dispatches(backends), dispatched,
+                                 "Unknown Host reached a coordinator")
+
+    def test_active_registry_entries_never_supply_a_nonpooled_fallback(self):
+        with local_gateways(backend_names=MEMBERS[:3]) as (gateways, backends, token):
+            # local_gateways registers all backends active in cell, but does not admit them.
+            registered = self.successful(request(gateways[0] + "/entity/GATEWAY_BACKEND"))
+            self.assertEqual({backend["name"] for backend in registered}, set(MEMBERS[:3]))
+            self.assertTrue(all(backend["active"] for backend in registered))
+            for replica in (0, 1):
+                dispatched = self.statement_dispatches(backends)
+                rejected = request(gateways[replica] + "/v1/statement", "POST", "SELECT 1", CREDENTIAL)
+                self.assertEqual(rejected.status, 503, rejected.body)
+                self.assertEqual(self.statement_dispatches(backends), dispatched)
+            api = self.pool_api(gateways, token)
+            self.successful(self.configure(api, 3, "configure"))
+            # A configured but empty pool is equally fail-closed.
+            for replica in (0, 1):
+                dispatched = self.statement_dispatches(backends)
+                rejected = request(gateways[replica] + "/v1/statement", "POST", "SELECT 1", CREDENTIAL)
+                self.assertEqual(rejected.status, 503, rejected.body)
+                self.assertEqual(self.statement_dispatches(backends), dispatched)
+            admitted = self.bootstrap(api, backends[0], 3, "boot-admitted")
+            for replica in (0, 1):
+                self.assertEqual(self.served_by(gateways, replica=replica), admitted["instanceId"])
 
     def test_poll_completion_does_not_wait_for_lifecycle_row_lock(self):
         database = {}
@@ -335,7 +401,8 @@ class PoolLifecycleContract(unittest.TestCase):
             by_coordinator = {backend.state.coordinator_id: backend.state.identity for backend in backends}
 
             # A transaction opened through one replica binds one member.
-            started = request(gateways[0] + "/v1/statement", "POST", "START TRANSACTION", CREDENTIAL)
+            started = request(gateways[0] + "/v1/statement", "POST", "START TRANSACTION",
+                              CREDENTIAL + SPOOFED_PLACEMENT)
             self.assertEqual(started.status, 200, started.body)
             transaction = started.values("X-Trino-Started-Transaction-Id")
             self.assertEqual(len(transaction), 1)
@@ -345,7 +412,7 @@ class PoolLifecycleContract(unittest.TestCase):
 
             # An independent statement submitted before the drain leaves a continuation behind.
             pending = request(gateways[0] + "/v1/statement", "POST", "SELECT 1",
-                              CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+                              CREDENTIAL + SPOOFED_PLACEMENT + [("X-Trino-Transaction-Id", transaction[0])])
             self.assertEqual(pending.status, 200, pending.body)
             self.assertEqual(by_coordinator[pending.json()["id"].rsplit("_", 1)[1]], owner)
             continuation = pending.json()["nextUri"]
@@ -359,7 +426,7 @@ class PoolLifecycleContract(unittest.TestCase):
             self.assertFalse(drained["eligible"])
 
             # The retained continuation still completes, through the other replica.
-            page = request(through_gateway(continuation, gateways[1]))
+            page = request(through_gateway(continuation, gateways[1]), headers=SPOOFED_PLACEMENT)
             self.assertEqual(page.status, 200, page.body)
             self.assertEqual(page.json()["id"], pending.json()["id"])
             self.assertNotIn("error", page.json())
@@ -371,7 +438,7 @@ class PoolLifecycleContract(unittest.TestCase):
             # replica, while new independent work never lands there.
             for replica in (1, 0):
                 inside = request(gateways[replica] + "/v1/statement", "POST", "SELECT 2",
-                                 CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+                                 CREDENTIAL + SPOOFED_PLACEMENT + [("X-Trino-Transaction-Id", transaction[0])])
                 self.assertEqual(inside.status, 200, inside.body)
                 self.assertEqual(by_coordinator[inside.json()["id"].rsplit("_", 1)[1]], owner)
                 for page in finish(inside, gateways[replica]):
@@ -383,7 +450,7 @@ class PoolLifecycleContract(unittest.TestCase):
 
             # Committing through the other replica releases the binding, and the member then seals.
             committed = request(gateways[1] + "/v1/statement", "POST", "COMMIT",
-                                CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+                                CREDENTIAL + SPOOFED_PLACEMENT + [("X-Trino-Transaction-Id", transaction[0])])
             self.assertEqual(committed.status, 200, committed.body)
             pages = finish(committed, gateways[1])
             self.assertTrue(any(page.values("X-Trino-Clear-Transaction-Id") for page in pages))
@@ -399,7 +466,7 @@ class PoolLifecycleContract(unittest.TestCase):
             self.assertEqual(sealed["phase"], "SEALED")
             # A sealed member admits nothing further, including inside a transaction it once held.
             refused = request(gateways[0] + "/v1/statement", "POST", "SELECT 3",
-                              CREDENTIAL + [("X-Trino-Transaction-Id", transaction[0])])
+                              CREDENTIAL + SPOOFED_PLACEMENT + [("X-Trino-Transaction-Id", transaction[0])])
             self.assertNotEqual(refused.status, 200)
 
     def test_repairs_restore_an_all_draining_pool_without_losing_pinned_work(self):

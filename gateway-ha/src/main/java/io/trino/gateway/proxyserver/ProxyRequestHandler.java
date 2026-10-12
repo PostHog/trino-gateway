@@ -26,7 +26,6 @@ import io.airlift.http.client.Request;
 import io.airlift.http.client.StaticBodyGenerator;
 import io.airlift.log.Logger;
 import io.airlift.units.Duration;
-import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.ProxyResponseConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingDestination;
@@ -104,6 +103,7 @@ public class ProxyRequestHandler
     private final QueryHistoryManager queryHistoryManager;
     private final OAuth2RoutingStore oauth2RoutingStore;
     private final boolean cookiesEnabled;
+    private final boolean pooledRouting;
     private final boolean oauth2RoutingEnabled;
     private final boolean forwardedHeadersEnabled;
     private final Optional<String> forwardedProto;
@@ -135,7 +135,8 @@ public class ProxyRequestHandler
         this.routingManager = requireNonNull(routingManager, "routingManager is null");
         this.queryHistoryManager = requireNonNull(queryHistoryManager, "queryHistoryManager is null");
         this.oauth2RoutingStore = requireNonNull(oauth2RoutingStore, "oauth2RoutingStore is null");
-        cookiesEnabled = GatewayCookieConfigurationPropertiesProvider.getInstance().isEnabled();
+        pooledRouting = haGatewayConfiguration.getTransactionAwareness().isEnabled();
+        cookiesEnabled = !pooledRouting && haGatewayConfiguration.getGatewayCookieConfiguration().isEnabled();
         oauth2RoutingEnabled = haGatewayConfiguration.getRouting().isOauth2RoutingEnabled();
         asyncTimeout = haGatewayConfiguration.getRouting().getAsyncTimeout();
         forwardedHeadersEnabled = haGatewayConfiguration.getRouting().isForwardedHeadersEnabled();
@@ -439,9 +440,11 @@ public class ProxyRequestHandler
             try {
                 HashMap<String, String> results = OBJECT_MAPPER.readValue(response.body(), HashMap.class);
                 queryDetail.setQueryId(results.get("id"));
-                routingManager.setBackendForQueryId(queryDetail.getQueryId(), queryDetail.getBackendUrl());
-                routingManager.setRoutingGroupForQueryId(queryDetail.getQueryId(), routingDestination.routingGroup());
-                routingManager.setExternalUrlForQueryId(queryDetail.getQueryId(), routingDestination.externalUrl());
+                if (!pooledRouting) {
+                    routingManager.setBackendForQueryId(queryDetail.getQueryId(), queryDetail.getBackendUrl());
+                    routingManager.setRoutingGroupForQueryId(queryDetail.getQueryId(), routingDestination.routingGroup());
+                    routingManager.setExternalUrlForQueryId(queryDetail.getQueryId(), routingDestination.externalUrl());
+                }
                 log.debug("QueryId [%s] mapped with proxy [%s]", queryDetail.getQueryId(), queryDetail.getBackendUrl());
             }
             catch (IOException e) {
@@ -524,6 +527,9 @@ public class ProxyRequestHandler
     // TODO: decide what else should and shouldn't be forwarded
     private boolean shouldForwardHeader(String name)
     {
+        if (pooledRouting && name.equalsIgnoreCase("X-Trino-Routing-Group")) {
+            return false;
+        }
         for (String headerToSkip : PRESERVED_HEADERS_TO_SKIP) {
             if (name.equalsIgnoreCase(headerToSkip)) {
                 return false;

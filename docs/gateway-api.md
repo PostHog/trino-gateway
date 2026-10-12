@@ -1,5 +1,13 @@
 # Gateway API
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 The REST API for Trino Gateway can be used to update routing configuration for
 the Trino clusters. Note that the API calls do not perform actions on the
 clusters themselves.
@@ -11,6 +19,12 @@ If there are duplicate `proxyTo` URLs in the configuration, the `Name` in the
 **Query History** page of the UI might not show correctly.
 
 ## Create a Trino cluster
+
+In pooled mode, these stock APIs manage registration metadata only. Register,
+validate, certify, and admit members using `/gateway/v1/pools/...`; setting
+`active: true` does not open pool admission. Custom fixed-backend cutover and
+rollout endpoints remain removed.
+
 
 ```shell
 curl -X POST http://localhost:8080/gateway/backend/modify/add \

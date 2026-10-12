@@ -1,216 +1,118 @@
-# Transaction-aware Gateway: validation and operation
+# Pooled Gateway operation
 
-This is an opt-in implementation under validation. Read the test receipts before
-using any guarantee. The disposable lab is not a production deployment template.
+This document describes hostname-selected pooled mode, enabled by setting both
+`transactionAwareness.enabled` and `transactionAwareness.pool.enabled` to `true`.
+Official upstream functionality is retained but bypassed for this deployment:
+no client header, route cookie, rules engine, or default fallback selects compute.
+Both flags default to `false` for stock upstream behavior. This document defines
+the pooled contract, not a deployment or execution receipt.
 
-## Supported configuration
+## Configuration
 
-All Gateway replicas must use the same PostgreSQL database and these settings:
+Use one authoritative PostgreSQL writer and consistent settings across replicas.
 
 ```yaml
+routing:
+  hostnameSuffixToPool:
+    dw.example.test: pool-one
 transactionAwareness:
   enabled: true
-  identityKey: <shared-random-key-from-private-runtime-configuration>
-  adminToken: <different-shared-random-token-from-private-runtime-configuration>
+  identityKey: ${ENV:GATEWAY_TRANSACTION_IDENTITY_KEY}
+  adminToken: ${ENV:GATEWAY_TRANSACTION_ADMIN_TOKEN}
   terminalRetentionSeconds: 120
   maxInFlightRequests: 16
   completionThreads: 4
   requestTimeoutMillis: 120000
   processInfoTimeoutMillis: 5000
   completionTimeoutMillis: 10000
+  pool:
+    enabled: true
 ```
 
-Each key must contain at least 32 UTF-8 bytes. Generate them outside source
-control. Do not rotate them while transactions or retained queries remain.
-The lab helper generates and preserves them. The admin endpoints also retain the
-Gateway's existing API-role check and require this separate bearer token.
-All replicas serving this traffic must enable the feature and run compatible
-ledger-aware code. Do not mix feature-disabled or pre-feature replicas into the
-same endpoint: they can forward requests without creating drain obligations.
-Use the same authoritative PostgreSQL writer for ledger reads and writes, not
-asynchronous read replicas. The protocol assumes committed ledger data is durable.
-Database failover and production-scale performance require separate validation.
+Each key must contain at least 32 UTF-8 bytes. The two keys must differ. Generate
+and store them outside source control. Do not rotate them with work in flight.
+The administration token supplements the Gateway API-role check.
 
-### Request capacity and deadlines
+Missing, duplicate, or malformed Host returns 400. Unmapped Host returns 421.
+Exact host mappings override suffix mappings. A suffix matches one tenant label,
+not its apex or nested labels. Never infer a pool from a database name. Do not
+use credentials, SQL, cookies, or X-Trino-Routing-Group for pool selection.
 
-Each replica admits at most `maxInFlightRequests` managed proxy requests. Excess
-requests receive HTTP 503 before durable admission or backend dispatch. This is a
-per-process bound, not a fleet-wide throughput guarantee. Completion work uses
-`completionThreads` fixed workers and a bounded queue reserved by those admissions.
-The worker count must be positive and no greater than the request limit. Shutdown
-rejects new admissions but retains the reserved completion workers for admitted work.
+Preserve Host at the trusted ingress. Do not accept client forwarded headers at
+the HTTP server. The proxy strips untrusted forwarding metadata and emits its
+own coordinator-facing metadata. Trino authenticates the original credentials.
+Host is not proof of authorization.
 
-The admission budget starts before ledger lookup and is the smaller of
-`requestTimeoutMillis` and `routing.asyncTimeout`. Coordinator identity probes
-have a transport timeout capped by both `processInfoTimeoutMillis` and the remaining
-budget. Backend dispatch also uses the remaining request budget. A deadline that
-expires before dispatch rejects the admission; it does not submit the statement.
-After dispatch, client timeout or cancellation does not cancel outcome processing
-or release its capacity slot. The admission remains a drain blocker until its
-actual outcome is recorded. Failures retain uncertainty; Gateway does not resubmit.
+## Admission and ownership
 
-Completion uses a snapshot of the admission, request method, URI and user, plus
-the original capacity lease. It does not read the servlet request after dispatch:
-the server can recycle that object after client timeout or response delivery.
+Register backend metadata and use `/gateway/v1/pools/{pool}` to configure,
+register, certify, and admit members. Only POOLED configuration is accepted.
+Registration, a legacy active flag, and cached health do not grant admission.
+The database serializes certified member admission with lifecycle transitions.
 
-Completion database work receives a fresh `completionTimeoutMillis` budget so it
-can record facts after a client timeout. These are bounded phases, not hard
-real-time cancellation guarantees: JDBC timeout rounding, cancellation delivery,
-connection acquisition and socket timeouts can extend observed latency. Custom
-routing selectors and authentication extensions must also bound their own blocking
-work; the admission deadline is checked again before backend dispatch.
+New independent work uses a randomized eligible-member list. Cached health only
+orders candidates. Reselection is bounded and occurs before dispatch only.
+No request is replayed on another coordinator after dispatch.
 
-If response persistence fails, uncertainty recording receives a second fresh
-completion budget. Waiting in the bounded completion queue is outside these
-budgets; `completionTimeoutMillis` is not a total completion latency bound.
+Transactions and queries retain durable owner and coordinator bindings. Every
+routed hostname must identify the owning pool. Basic credential ownership also
+includes the canonical host. Continuations use owner credentials or their
+recorded result capability as defined by the protocol. Unknown ownership,
+wrong-pool requests, forged capabilities, and changed coordinator identity fail
+closed. Do not search arbitrary coordinators for an unknown query.
 
-### Database capacity
+Coordinators must expose ready node and coordinator process identities through
+`/v1/info`. A compatible coordinator build is required. Stock comparison images
+without this identity contract cannot be admitted as members.
 
-Transaction awareness automatically enables a managed PostgreSQL connection pool.
-Feature-disabled deployments retain their previous connection behavior unless
-they explicitly enable `dataStore.connectionPoolEnabled`.
+## Drain and retirement
 
-```yaml
-dataStore:
-  maximumPoolSize: 4
-  connectionAcquisitionTimeoutMillis: 1000
-  connectTimeoutSeconds: 2
-  socketTimeoutSeconds: 10
-  statementTimeoutMillis: 5000
-  lockTimeoutMillis: 250
-```
+Use the fenced pool lifecycle API. The old route override, fixed-slot cutover,
+resume, reincarnation, and rollout administration APIs have been removed.
 
-These limits apply per replica. One hundred replicas can open up to 400 pooled
-connections with these defaults, plus startup migration and operational connections.
-Size the writer's connection capacity for that fleet and leave operational headroom.
-Admissions can hold at most three of each four pooled connections, leaving space
-for completion work; other background database work can also use that space.
-Configure deadlines through these fields, not JDBC URL overrides. TLS settings
-remain in the JDBC URL. A bounded pool protects connection count; it does not
-establish a throughput guarantee or remove all database contention.
-Statement and lock timeouts constrain Gateway metadata SQL, not the duration of
-Trino queries or transactions.
+Draining stops new independent admissions. Already admitted statements, queries,
+and transactions remain on their original member. Pending or uncertain requests,
+open transactions, and undelivered results remain drain blockers. Cache expiry,
+zero monitor query counts, elapsed time, and a client disconnect do not establish
+completion.
 
-Normal admissions and response processing use shared backend row locks. New
-independent admissions also take a shared routing-group lock. Administrative
-operations use exclusive locks on the affected route or backend, so cutover,
-drain and seal remain ordered against admitted work. These are database-transaction
-locks, not a global request queue or locks held for an entire Trino query.
+Seal only after authoritative obligations permit it. Respect owner epochs,
+operation replay receipts, serving floors, and retirement claims. Preserve
+historical incarnations and ledger rows. Never clear uncertain state to permit
+retirement. Coordinator loss still loses its in-memory transactions; Gateway
+does not recover or migrate them.
 
-Where applicable, acquire locks in this order: routing group, backend, admission
-row, query identity, then transaction identity. Admission updates serialize on
-their own rows. Query and transaction identities use transaction-scoped advisory
-locks with separate, fixed namespaces and stable identity hashes. Hash collisions
-can serialize unrelated identities within a namespace; they do not replace exact
-identity and ownership checks. Keep this order and namespace mapping compatible
-across Gateway replicas.
+## Capacity, timeouts, and failures
 
-The V8 migration adds partial indexes for pending admissions, running queries and
-retained terminal queries. It does not delete history or expire uncertain work.
-Apply this migration during a quiesced, controlled upgrade: ordinary index creation
-can block ledger writes on a large existing database. This is not a validated
-zero-downtime schema migration procedure.
+Each replica bounds managed query requests and reserves completion capacity.
+Excess work is rejected before admission or dispatch. This is not a fleet-wide
+throughput guarantee. The admission budget is bounded by requestTimeoutMillis
+and routing.asyncTimeout. Identity probes and dispatch use the remaining budget.
 
-### Response memory
+After dispatch, timeout or cancellation does not release outcome processing.
+Completion uses a request snapshot, not recycled servlet state. Persistence has
+its own completion budget. A failed persistence attempt retains uncertainty;
+it does not justify replay. Database outages fail admission and owner lookup
+closed. Connection and JDBC timeout rounding can extend observed latency.
 
-Capacity limits do not establish a hard heap bound. With the default 32 MiB
-response limit, 16 admitted responses can retain up to 512 MiB of raw bodies alone.
-Strings, parsed JSON, completion workers and client response buffers require more
-memory. Size the request limit against the configured response limit and measured
-heap usage; small-page load tests do not validate worst-case response memory.
+The PostgreSQL pool reserves connection capacity for completion. Configure its
+connection, socket, statement, and lock timeouts through dataStore. These govern
+Gateway metadata, not Trino query duration. Keep database lock ordering and
+admission barriers compatible across replicas.
 
-The initial identity mode requires stable HTTP Basic credentials and consistent
-effective/original Trino users. Backend authentication and authorization remain
-authoritative. Bearer refresh, browser sessions, external request-header rewrites,
-and credential rotation during a transaction are not supported.
+Auxiliary HTTP requests are not query or transaction completion receipts. Do not
+use them to infer successful query delivery or drain safety. Optional upstream
+OAuth affinity does not enable OAuth/Bearer admission through the Basic adapter.
 
-The Gateway removes the optional `X-Trino-Query-Data-Encoding` advertisement so
-Trino returns inline results. Standard JDBC can consume this fallback without a
-client setting change. Spooling lifecycle guarantees are not implemented.
-Canonical protocol paths are required; alternate encoded, matrix-parameter,
-dot-segment and repeated-slash path spellings are rejected. Query-string values
-are not subject to this path restriction.
+## Upgrade and verification
 
-Result and cancellation paths are capabilities. Before exposing `nextUri` or
-`partialCancelUri`, Gateway stores its path hash with query ownership in the same
-database transaction. A continuation must match an advertised capability; a query
-ID alone is insufficient. Metadata requests without a capability require the
-owner's Basic credentials. These checks do not depend on a replica-local cache.
+Complete existing work before replacing the old routing version and config.
+Remove routingRules, default-group, router-module, and route-cookie settings.
+Do not mix old routing replicas with pooled-mode replicas. Do not change host
+placement or ownership keys while work is in flight.
 
-Existing backend registration still uses Gateway's normal API. Once enabled,
-legacy activation/deactivation, destination changes, and deletion cannot bypass
-the durable transaction controls. A new backend must expose a ready coordinator
-with `nodeId` and `coordinatorId` in `/v1/info`.
-
-## Planned cutover
-
-These operations use the `/gateway/transactions` API prefix. Every administrative
-request needs the configured bearer token. The coordinator's catalogs, data,
-authorization and capacity must already be ready; Gateway does not provision them.
-
-1. Prepare and verify the destination. If its durable state is DRAINING or SEALED,
-   read `GET /backends/{name}/drain` and POST its observed `generation` to
-   `/backends/{name}/resume`. Resume requires the same coordinator process.
-2. POST `/cutover` with `routingGroup` and `backendName`. After this commits, new
-   independent statements use that destination. Previously admitted statements
-   and existing transactions retain their original backend.
-3. POST `/backends/{old}/drain`. Poll GET on the same path. Existing transactions,
-   result polling and heartbeats can continue; new independent statements cannot.
-4. Wait for `readyToSeal: true`. This includes the configured terminal-result
-   retry window, not merely a zero running-query count.
-5. POST `/backends/{old}/seal` with the observed `generation`. Only a successful
-   response with `drained: true` authorizes retirement under this protocol.
-   A stale generation or new outstanding obligation prevents sealing. Use the
-   returned generation for subsequent operations; sealing advances it.
-6. Stop the old coordinator through the external deployment controller.
-
-`readyToSeal` is an observation, not permission to stop a backend. Sealing shares
-the admission lock and rejects later continuations to that incarnation.
-An operation prepared before sealing cannot resume that sealed generation.
-The external deployment controller must serialize retirement with intentional
-resumption: a newly authorized resume explicitly revokes the retirement decision.
-
-To reuse a blue/green slot, first move every durable route away, seal it, then
-replace its coordinator. POST `/backends/{name}/reincarnate` with the old
-`incarnation` and `generation`. Gateway verifies a different process, preserves
-historical bindings and creates a new DRAINING incarnation. Resume that returned
-generation before making the slot a destination again. Old query IDs never bind
-to the replacement. All feature-enabled replicas must understand incarnation
-history before this operation; mixed unreleased V5/V6 prototypes are unsupported.
-
-The V7 capability migration cannot reconstruct result URLs issued by earlier
-unreleased prototypes. Finish those queries before upgrading all replicas to V7;
-old result paths fail closed. This prototype upgrade restriction does not apply
-to a V7-to-V7 Gateway restart, which preserves the database and shared keys.
-
-## Failure boundaries
-
-A coordinator owns its in-memory transactions. Gateway does not replicate them
-or recover them after coordinator loss. Do not retry an ambiguous statement on
-another coordinator. Ordinary cutover can coexist with a busy warehouse, but an
-indefinitely open transaction can prevent finite, zero-abort retirement.
-Query or transaction failure when its coordinator dies is an accepted, separate
-failure scope; the planned-cutover guarantee does not include coordinator recovery.
-
-Transport loss, database failure after admission, ambiguous cancellation and malformed or
-contradictory responses can leave durable uncertainty. There is no automatic
-expiry or reconciliation of these obligations in this implementation. They block
-drain rather than being reported as successful completion. A human deleting such
-state would be an explicit loss-of-guarantee action, not graceful draining; no
-force-clear API is provided.
-
-A successful, bound DELETE with HTTP 204 and no lifecycle headers settles only
-that request's admission. It does not complete the query, clear its transaction,
-or change result retention. An in-flight poll remains independently tracked.
-If a cancelled query never delivers a terminal result, its query obligation still
-blocks retirement; automatic coordinator-side reconciliation is not implemented.
-
-The terminal retry window defaults to 120 seconds and can be 1–86400 seconds.
-Gateway retains affinity, not response bodies. It cannot prove receipt by the
-client or guarantee result replay indefinitely. The original backend must remain
-available during the window. State is retained conservatively; production data
-retention and cleanup policy need a separate design before large-scale use.
-
-The observed coordinator identifiers detect ordinary restarts, not adversarial
-identity collisions or an atomic check-and-send boundary. Direct traffic that
-bypasses these Gateways is outside the drain guarantee.
+See [README.md](README.md) for supported fixtures and commands. Use independent
+Gateway processes sharing PostgreSQL. Mock-only tests do not establish their
+serialization. See [VALIDATION.md](VALIDATION.md) for the checklist and
+[BASELINE.md](BASELINE.md) for comparisons. Keep actual environments, logs,
+deployment results, and performance evidence private.

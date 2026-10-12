@@ -1,80 +1,51 @@
-# Transaction-awareness verification checklist
+# Pooled routing verification
 
-This document defines verification procedures and scope, not an execution
-receipt. Keep all deployment and test results, including sanitized summaries,
-in private artifacts shared directly with the operator.
+This is a checklist, not an execution receipt. Keep actual images, environment
+settings, logs, deployment results, and performance evidence private.
 
-## Bind verification to an implementation
+## Gates
 
-Record the source revision, immutable image digest, runtime configuration,
-database engine, and fixture identities privately. Verify the running image
-through every Gateway process rather than relying only on a deployment manifest.
-If production code changes, identify and rerun the affected verification gates.
+- Run Java formatting, static checks, migrations, and relevant tests with Java 25.
+- Verify strict Host parsing and exact/suffix mapping precedence.
+- Verify that routing headers, forwarded-host headers, and route cookies cannot
+  choose a pool. Unmapped Host must not dispatch to a backend.
+- Reject non-pooled configuration and unknown ownership without legacy fallback.
+- Use real PostgreSQL for admissions, capability publication, uncertainty,
+  terminal retention, member lifecycle, and concurrent ledger operations.
+- Use separate Gateway processes sharing that database for query and transaction
+  affinity, drain races, cancellation, and graceful shutdown.
+- Check canonical paths, duplicate headers/JSON, forged capabilities, conflicting
+  lifecycle signals, and response parsing failures before unsafe settlement.
+- Preserve database owner epochs, generation checks, replay receipts, serving
+  floors, publication fences, and zero-obligation seal requirements.
+- Preserve uncertainty after response loss, database failure, and process loss.
+- Verify HTTP/1.1 and HTTP/2 Host forwarding and original Basic credential bytes.
+- Run supported real-client tests against compatible coordinator builds in an
+  isolated environment. Do not fabricate process identity or rewrite client
+  protocol to hide incompatibility.
 
-Run repository formatting, compilation, unit tests, and container-dependent
-checks. Use a real PostgreSQL fixture for ledger concurrency and migrations.
-Mock-only tests do not establish database locking or multi-process correctness.
+## Reproducible commands
 
-## Required coverage
+Use [README.md](README.md) for the pooled HTTP, Java, and fixture commands.
+The HTTP suites start two Gateway JVMs and disposable PostgreSQL. Snapshot their
+compiled classes before a run; do not rebuild those classes during the run.
 
-| Area | Required assertions |
-| --- | --- |
-| Identity and parsing | Reject unknown ownership, conflicting headers, malformed paths, duplicate JSON fields, and forged capabilities before unsafe forwarding |
-| Ledger | Preserve atomic binding, callback idempotence, rollback on failure, concurrent admission ordering, and historical incarnation identity |
-| Bootstrap | Preserve feature-disabled behavior and initialize the enabled dependency graph and database migrations |
-| HTTP protocol | Retain transaction and result ownership across independent Gateway processes and backend cutover |
-| Lifecycle | Keep pending work and open transactions as drain blockers; enforce generation checks and atomic sealing |
-| Cancellation | Settle only an acknowledged cancellation request while preserving its query and transaction obligations |
-| Faults | Retain uncertainty after database loss, response loss, ambiguous outcomes, and coordinator identity changes |
-| Real clients | Preserve original protocol URLs, verified TLS, transaction affinity, and commit/rollback behavior with a supported client |
-| Process replacement | Retain durable ownership and pre-existing result capabilities after replacing every Gateway process |
+The native client procedure is in [client/README.md](client/README.md). External
+legacy-topology fault oracles need a pooled setup before they are runnable. Their
+presence does not establish that setup or a passing pooled guarantee.
 
-## Ordered disposable-lab runs
+## Limits
 
-Use distinct Gateway process endpoints. Register independent backend processes
-with different identities. Normal and irreversible-fault suites need separate
-databases and credentials; an uncertain fault ledger is not a clean normal fixture.
+The current admission adapter supports stable Basic credentials and inline
+results. Coordinator loss loses in-memory transactions. Gateway provides neither
+transaction replication nor exactly-once execution. Uncertain work and open
+transactions can block retirement indefinitely. Retained result capability
+windows are finite; response bodies are not durable replay storage.
 
-```sh
-cd testing/transaction-awareness
-python3 run_contracts.py --suite normal --list
-python3 run_contracts.py --suite normal
-python3 run_contracts.py --suite fault
-python3 run_contracts.py --suite real
-```
+Hostname mapping is not customer provisioning, authorization, catalog movement,
+or connector correctness. Database failover, mixed-version behavior, and
+performance need separate representative verification. A full Gateway stop is
+not uninterrupted service. Historical Flyway and lock rows remain required.
 
-Complete the native client procedure in [client/README.md](client/README.md).
-Run the all-Gateway restart harness only after other tests using that lab finish.
-It must verify changed Gateway process identities and unchanged database,
-coordinator, configuration, credential, image, and replica snapshots.
-
-For database outages, check recovery through every Gateway under one bounded
-deadline before continuing the original transaction assertion. Preserve both
-the no-forward assertion during the outage and the owner-affinity assertion
-after recovery. Do not substitute an unrelated successful query for either.
-
-See [BASELINE.md](BASELINE.md) for baseline comparisons and
-[REVIEW-REGRESSIONS.md](REVIEW-REGRESSIONS.md) for targeted regression oracles.
-
-## Boundaries
-
-See [OPERATIONS.md](OPERATIONS.md) for the supported protocol and operational
-contract. Important exclusions are:
-
-- Stable Basic credentials and inline results are the initial supported mode.
-- Coordinator loss still loses in-memory transactions. Gateway does not provide
-  transaction replication or exactly-once execution.
-- Ambiguous outcomes and indefinitely open transactions can block retirement
-  indefinitely. Automatic coordinator-side reconciliation is not implemented.
-- Result affinity has a finite retry window; response bodies are not durably
-  replayed forever.
-- Placement-header tests do not establish tenant provisioning, tenant
-  authorization, warehouse data movement, or connector write semantics.
-- Database failover and capacity claims require their own representative tests.
-- Passing process-replacement assertions does not establish uninterrupted
-  availability while all Gateway processes are stopped.
-- Mixed-version compatibility needs explicit tests; do not infer it from
-  single-version verification.
-
-Correctness verification does not establish a throughput target. Follow
-[SCALE-VALIDATION.md](SCALE-VALIDATION.md) for resource and concurrency checks.
+See [OPERATIONS.md](OPERATIONS.md), [BASELINE.md](BASELINE.md), and
+[SCALE-VALIDATION.md](SCALE-VALIDATION.md) for the related boundaries.

@@ -24,6 +24,7 @@ class ProtocolTlsTests(unittest.TestCase):
                         "-keyout", str(key), "-out", str(cls.certificate)],
                        check=True, capture_output=True, timeout=15)
         cls.received = []
+        cls.hosts = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -31,6 +32,7 @@ class ProtocolTlsTests(unittest.TestCase):
 
             def do_GET(self):
                 cls.received.append(self.headers.get_all("X-Test-Repeated"))
+                cls.hosts.append(self.headers.get_all("Host"))
                 self.send_response(200)
                 self.send_header("X-Test-Response", "one")
                 self.send_header("X-Test-Response", "two")
@@ -69,6 +71,18 @@ class ProtocolTlsTests(unittest.TestCase):
             with self.assertRaises(ssl.SSLCertVerificationError):
                 request(self.url)
         self.assertEqual(len(self.received), before)
+
+    def test_explicit_host_replaces_the_automatic_host_without_changing_tls_identity(self):
+        with patch.dict(os.environ, TX_CA_FILE=str(self.certificate), TX_TLS_SERVER_NAME="fixture.test"):
+            result = request(self.url, headers=[("hOsT", "unmapped.invalid:8080")])
+        self.assertEqual(result.status, 200)
+        self.assertEqual(self.hosts[-1], ["unmapped.invalid:8080"])
+
+    def test_url_host_is_emitted_once_by_default(self):
+        with patch.dict(os.environ, TX_CA_FILE=str(self.certificate), TX_TLS_SERVER_NAME="fixture.test"):
+            result = request(self.url)
+        self.assertEqual(result.status, 200)
+        self.assertEqual(self.hosts[-1], ["127.0.0.1:" + str(self.server.server_port)])
 
     def test_default_still_checks_the_url_hostname(self):
         with patch.dict(os.environ, TX_CA_FILE=str(self.certificate)):

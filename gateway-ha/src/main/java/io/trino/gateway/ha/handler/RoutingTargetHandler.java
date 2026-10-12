@@ -15,7 +15,6 @@ package io.trino.gateway.ha.handler;
 
 import com.google.inject.Inject;
 import io.airlift.log.Logger;
-import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingDestination;
@@ -79,16 +78,32 @@ public class RoutingTargetHandler
         statementPaths = requireNonNull(haGatewayConfiguration.getStatementPaths());
         requestAnalyserClientsUseV2Format = haGatewayConfiguration.getRequestAnalyzerConfig().isClientsUseV2Format();
         requestAnalyserMaxBodySize = haGatewayConfiguration.getRequestAnalyzerConfig().getMaxBodySize();
-        cookiesEnabled = GatewayCookieConfigurationPropertiesProvider.getInstance().isEnabled();
+        cookiesEnabled = !haGatewayConfiguration.getTransactionAwareness().isEnabled() && haGatewayConfiguration.getGatewayCookieConfiguration().isEnabled();
         oauth2RoutingEnabled = haGatewayConfiguration.getRouting().isOauth2RoutingEnabled();
     }
 
     public RoutingTargetResponse resolveRouting(HttpServletRequest request)
     {
         if (transactionAwareness != null && transactionAwareness.isEnabled()) {
-            return transactionAwareness.resolve(request, () -> resolveWithoutTransactions(request), selection -> getRoutingTargetResponse(request, selection));
+            return resolvePooledRouting(request);
         }
         return resolveWithoutTransactions(request);
+    }
+
+    private RoutingTargetResponse resolvePooledRouting(HttpServletRequest request)
+    {
+        Optional<String> pinned = Optional.empty();
+        if (oauth2RoutingEnabled) {
+            Optional<String> id = oauth2RoutingId(request);
+            if (id.isPresent()) {
+                pinned = oauth2RoutingStore.findBackend(id.orElseThrow());
+                if (pinned.isEmpty() || !transactionAwareness.isPooledBackendAvailable(request, pinned.orElseThrow())) {
+                    oauth2RoutingStore.removeBackend(id.orElseThrow());
+                    throw new WebApplicationException(OAuth2RoutingUtils.forceReAuthResponse(request.getRequestURI()));
+                }
+            }
+        }
+        return transactionAwareness.resolve(request, pinned);
     }
 
     private RoutingTargetResponse resolveWithoutTransactions(HttpServletRequest request)

@@ -11,3 +11,9 @@ dataStore:
 
 clusterStatsConfiguration:
   monitorType: INFO_API
+
+# Stock upstream routing is the default. For pooled configuration, see pooled-routing.md.
+transactionAwareness:
+  enabled: false
+  pool:
+    enabled: false

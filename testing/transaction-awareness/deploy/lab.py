@@ -66,7 +66,7 @@ def main():
     forward.add_argument("--without-real-trino", action="store_true")
     forward.add_argument("--extra-fixture", action="append", default=[])
     feature = commands.add_parser("configure-transactions", help="Preserve lab credentials and configure the feature before artifact deployment")
-    feature.add_argument("--enabled", action=argparse.BooleanOptionalAction, required=True)
+    feature.add_argument("--enabled", action="store_true", required=True)
     feature.add_argument("--env-file", type=Path, required=True, help="New private file for the test admin token")
     feature.add_argument("--terminal-retention", type=int, default=2)
     artifact = commands.add_parser("artifact", help="Replace lab Gateway processes with a locally built shaded JAR")
@@ -246,7 +246,7 @@ def main():
         try:
             for offset, (target, remote_port) in enumerate(targets):
                 processes.append(subprocess.Popen(base + ["-n", args.namespace, "port-forward", "--address", "127.0.0.1", target, f"{args.base_port + offset}:{remote_port}"]))
-            gateway_urls = ",".join(f"https://127.0.0.1:{args.base_port + index}" for index in range(len(pods)))
+            gateway_urls = ",".join(f"https://localhost:{args.base_port + index}" for index in range(len(pods)))
             fixture_port = args.base_port + len(pods)
             print(f"TX_GATEWAY_URLS={gateway_urls}", flush=True)
             print(f"TX_BACKEND_URLS=http://127.0.0.1:{fixture_port},http://127.0.0.1:{fixture_port + 1}", flush=True)

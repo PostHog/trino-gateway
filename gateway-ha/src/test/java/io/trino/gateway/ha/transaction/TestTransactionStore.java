@@ -16,7 +16,6 @@ package io.trino.gateway.ha.transaction;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.trino.gateway.ha.persistence.GatewayDatabase;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
-import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
 import io.trino.gateway.ha.transaction.TransactionStore.ErrorCode;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
 import io.trino.gateway.ha.transaction.TransactionStore.StoreException;
@@ -62,7 +61,6 @@ import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.NOT_DRA
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.NOT_FOUND;
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.OWNER_MISMATCH;
 import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.SEALED;
-import static io.trino.gateway.ha.transaction.TransactionStore.ErrorCode.STALE_GENERATION;
 import static io.trino.gateway.ha.util.TestcontainersUtils.createPostgreSqlContainer;
 import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -80,8 +78,8 @@ class TestTransactionStore
     private JdbcDatabaseContainer<?> container;
     private Jdbi admin;
     private Jdbi database;
-    private TransactionStore first;
-    private TransactionStore second;
+    private PooledTransactionStoreFixture first;
+    private PooledTransactionStoreFixture second;
     private boolean schemaCreated;
     private String fixtureUrl;
     private String fixtureUsername;
@@ -118,8 +116,8 @@ class TestTransactionStore
                 database.useHandle(handle -> handle.createScript(sql).execute());
             }
         }
-        first = new TransactionStore(database);
-        second = new TransactionStore(database);
+        first = new PooledTransactionStoreFixture(database);
+        second = new PooledTransactionStoreFixture(database);
         database.useHandle(handle -> handle.execute("CREATE TABLE retry_fixture (id integer PRIMARY KEY)"));
     }
 
@@ -152,7 +150,7 @@ class TestTransactionStore
     {
         Admission admission = first.admitNew("blue", "owner", "group");
         AtomicInteger commits = new AtomicInteger();
-        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, true));
+        PooledTransactionStoreFixture flaky = new PooledTransactionStoreFixture(commitFailureDatabase(commits, true));
         ResponseObservation observation = new ResponseObservation("query", null, false, true, 120);
         flaky.recordResponse(admission.id(), observation);
         assertThat(commits).hasValue(2);
@@ -169,7 +167,7 @@ class TestTransactionStore
     {
         Admission admission = first.admitNew("blue", "owner", "group");
         AtomicInteger commits = new AtomicInteger();
-        new TransactionStore(commitFailureDatabase(commits, true)).markUncertain(admission.id());
+        new PooledTransactionStoreFixture(commitFailureDatabase(commits, true)).markUncertain(admission.id());
         assertThat(commits).hasValue(2);
         assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
         String state = database.withHandle(handle -> handle.createQuery("SELECT state FROM transaction_admission WHERE admission_id = :id").bind("id", admission.id()).mapTo(String.class).one());
@@ -181,7 +179,7 @@ class TestTransactionStore
     {
         Admission admission = first.admitNew("blue", "owner", "group");
         AtomicInteger commits = new AtomicInteger();
-        new TransactionStore(commitFailureDatabase(commits, true)).rejectAdmission(admission.id());
+        new PooledTransactionStoreFixture(commitFailureDatabase(commits, true)).rejectAdmission(admission.id());
         assertThat(commits).hasValue(2);
         assertThat(first.drainStatus("blue").pendingRequests()).isZero();
         first.rejectAdmission(admission.id());
@@ -193,7 +191,7 @@ class TestTransactionStore
     {
         Admission admission = first.admitNew("blue", "owner", "group");
         AtomicInteger commits = new AtomicInteger();
-        new TransactionStore(commitFailureDatabase(commits, false, "08006"))
+        new PooledTransactionStoreFixture(commitFailureDatabase(commits, false, "08006"))
                 .recordResponse(admission.id(), new ResponseObservation("query", null, false, true, 120));
         assertThat(commits).hasValue(2);
         assertThat(first.drainStatus("blue").pendingRequests()).isZero();
@@ -270,7 +268,7 @@ class TestTransactionStore
                 }
             });
         });
-        assertThatThrownBy(() -> new TransactionStore(flaky).admitNew("blue", "owner", "group")).isInstanceOf(RuntimeException.class);
+        assertThatThrownBy(() -> new PooledTransactionStoreFixture(flaky).admitNew("blue", "owner", "group")).isInstanceOf(RuntimeException.class);
         assertThat(opened).hasValue(1);
         assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
     }
@@ -309,7 +307,7 @@ class TestTransactionStore
     void ambiguousAdmissionCommitIsNotRetriedOrDuplicated()
     {
         AtomicInteger commits = new AtomicInteger();
-        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, true));
+        PooledTransactionStoreFixture flaky = new PooledTransactionStoreFixture(commitFailureDatabase(commits, true));
         assertThatThrownBy(() -> flaky.admitNew("blue", "owner", "group")).isInstanceOf(RuntimeException.class);
         assertThat(commits).hasValue(1);
         assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
@@ -319,7 +317,7 @@ class TestTransactionStore
     void knownTransactionAbortRetriesFromTheBeginning()
     {
         AtomicInteger commits = new AtomicInteger();
-        TransactionStore flaky = new TransactionStore(commitFailureDatabase(commits, false));
+        PooledTransactionStoreFixture flaky = new PooledTransactionStoreFixture(commitFailureDatabase(commits, false));
         flaky.admitNew("blue", "owner", "group");
         assertThat(commits).hasValue(2);
         assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
@@ -351,148 +349,6 @@ class TestTransactionStore
                 }
             });
         });
-    }
-
-    @Test
-    void unfinishedRolloutNeverExpiresAndConcurrentAcquisitionHasOneOwner()
-            throws Exception
-    {
-        var blue = first.getBackend("blue").orElseThrow();
-        var green = first.getBackend("green").orElseThrow();
-        first.setRoute("group", "blue");
-        var plan = new RolloutStore.Plan("a".repeat(64), 1, "blue", blue.incarnation(), "green", green.incarnation());
-        var operations = new RolloutStore(database);
-        try (var executor = Executors.newFixedThreadPool(2)) {
-            var barrier = new CountDownLatch(1);
-            var attempts = List.of("one", "two").stream().map(id -> executor.submit(() -> {
-                barrier.await();
-                try {
-                    operations.acquire("group", id, plan);
-                    return true;
-                }
-                catch (StoreException e) {
-                    assertThat(e.code()).isEqualTo(CONFLICT);
-                    return false;
-                }
-            })).toList();
-            barrier.countDown();
-            int winners = 0;
-            for (var attempt : attempts) {
-                winners += attempt.get(10, TimeUnit.SECONDS) ? 1 : 0;
-            }
-            assertThat(winners).isEqualTo(1);
-        }
-        database.useHandle(handle -> handle.execute("UPDATE transaction_rollout SET created_at = clock_timestamp() - INTERVAL '100 days'"));
-        expect(CONFLICT, () -> operations.acquire("group", "later", plan));
-        assertThat(operations.current("group").orElseThrow().phase()).isEqualTo("CLAIMED");
-    }
-
-    @Test
-    void durableRolloutOwnershipFencesManualAndStaleOperations()
-    {
-        var blue = first.getBackend("blue").orElseThrow();
-        var green = first.getBackend("green").orElseThrow();
-        first.setRoute("group", "blue");
-        var operations = new RolloutStore(database);
-        var plan = new RolloutStore.Plan("a".repeat(64), 1, "blue", blue.incarnation(), "green", green.incarnation());
-        var claimed = operations.acquire("group", "promotion-one", plan);
-        assertThat(operations.acquire("group", "promotion-one", plan)).isEqualTo(claimed);
-        expect(CONFLICT, () -> operations.acquire("group", "promotion-two", plan));
-        expect(CONFLICT, () -> first.beginDrain("blue"));
-        expect(CONFLICT, () -> first.setRoute("group", "green"));
-        expect(CONFLICT, () -> first.clearRoute("group"));
-        expect(CONFLICT, () -> first.resume("green", first.drainStatus("green").generation()));
-        var guarded = second.withOperation(new RolloutStore.Guard("promotion-one", 0));
-        var drained = guarded.beginDrain("green", green.incarnation(), 0L);
-        assertThat(drained.state()).isEqualTo("DRAINING");
-        var publication = operations.claimPublication("group", "warm", new RolloutStore.Guard("promotion-one", 0), plan.planHash());
-        assertThat(publication.version()).isEqualTo(1);
-        expect(CONFLICT, () -> operations.claimPublication("group", "warm", new RolloutStore.Guard("promotion-one", 1), plan.planHash()));
-        String evidence = "{\"warmPublication\":{\"branch\":\"rollout-one-warm\",\"baseSha\":\"" + "b".repeat(40) + "\",\"headSha\":\"" + "c".repeat(40) + "\",\"pullRequest\":1}}";
-        var warmed = operations.checkpoint("group", "promotion-one", 1, "WARMED", evidence);
-        assertThat(warmed.version()).isEqualTo(2);
-        expect(STALE_GENERATION, () -> guarded.resume("green", drained.generation()));
-        expect(STALE_GENERATION, () -> operations.checkpoint("group", "promotion-one", 0, "WARMED", "{}"));
-        expect(CONFLICT, () -> operations.checkpoint("group", "promotion-one", 2, "COMPLETE", "{}"));
-        expect(CONFLICT, () -> operations.checkpoint("group", "promotion-one", 2, "WARMED", "{\"warmPublication\":{}}"));
-        assertThat(first.admitNew("blue", "owner", "group").backend()).isEqualTo(blue);
-        assertThat(new RolloutStore(database).current("group").orElseThrow()).isEqualTo(warmed);
-    }
-
-    @Test
-    void routeCompareAndSetRejectsLostResponseRetriesAndAba()
-    {
-        var blue = first.getBackend("blue").orElseThrow();
-        var green = first.getBackend("green").orElseThrow();
-        var absent = first.routeStatus("group");
-        assertThat(absent.generation()).isZero();
-        assertThat(absent.backendName()).isNull();
-        var initial = first.compareAndSetRoute("group", 0, null, "blue", blue.incarnation());
-        assertThat(second.routeStatus("group")).isEqualTo(initial);
-        expect(STALE_GENERATION, () -> second.compareAndSetRoute("group", 0, null, "green", green.incarnation()));
-        var moved = second.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation());
-        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation()));
-        var returned = first.compareAndSetRoute("group", moved.generation(), "green", "blue", blue.incarnation());
-        assertThat(returned.generation()).isGreaterThan(initial.generation());
-        expect(STALE_GENERATION, () -> second.compareAndSetRoute("group", initial.generation(), "blue", "green", green.incarnation()));
-        assertThat(first.routeStatus("group")).isEqualTo(returned);
-    }
-
-    @Test
-    void routeCompareAndSetRequiresExactDestinationAndActiveState()
-    {
-        var green = first.getBackend("green").orElseThrow();
-        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", 0, null, "green", UUID.randomUUID()));
-        assertThat(first.routeStatus("group").generation()).isZero();
-        first.beginDrain("green");
-        expect(NOT_ACTIVE, () -> first.compareAndSetRoute("group", 0, null, "green", green.incarnation()));
-        first.resume("green", first.drainStatus("green").generation());
-        expect(STALE_GENERATION, () -> first.compareAndSetRoute("group", 0, "blue", "green", green.incarnation()));
-        first.ensureBackend("other", "http://other.example.test", null, "other-group", "other-node", "other-process");
-        expect(CONFLICT, () -> first.compareAndSetRoute("group", 0, null, "other", first.getBackend("other").orElseThrow().incarnation()));
-    }
-
-    @Test
-    void concurrentRouteCompareAndSetHasExactlyOneWinner()
-            throws Exception
-    {
-        var blue = first.getBackend("blue").orElseThrow();
-        var green = first.getBackend("green").orElseThrow();
-        try (var executor = Executors.newFixedThreadPool(2)) {
-            var start = new CountDownLatch(1);
-            var attempts = List.of(blue, green).stream().map(backend -> executor.submit(() -> {
-                start.await();
-                try {
-                    second.compareAndSetRoute("group", 0, null, backend.name(), backend.incarnation());
-                    return true;
-                }
-                catch (StoreException e) {
-                    assertThat(e.code()).isEqualTo(STALE_GENERATION);
-                    return false;
-                }
-            })).toList();
-            start.countDown();
-            int winners = 0;
-            for (var attempt : attempts) {
-                winners += attempt.get(10, TimeUnit.SECONDS) ? 1 : 0;
-            }
-            assertThat(winners).isEqualTo(1);
-            assertThat(first.routeStatus("group").generation()).isEqualTo(1);
-        }
-    }
-
-    @Test
-    void preconditionedDrainCannotAffectResumedOrReplacedGeneration()
-    {
-        var initial = first.drainStatus("blue");
-        assertThat(initial.nodeId()).isEqualTo("blue-node");
-        assertThat(initial.coordinatorId()).isEqualTo("blue-process");
-        var drained = first.beginDrain("blue", initial.incarnation(), initial.generation());
-        expect(STALE_GENERATION, () -> second.beginDrain("blue", initial.incarnation(), initial.generation()));
-        var resumed = second.resume("blue", drained.generation());
-        expect(STALE_GENERATION, () -> first.beginDrain("blue", initial.incarnation(), drained.generation()));
-        expect(STALE_GENERATION, () -> first.beginDrain("blue", UUID.randomUUID(), resumed.generation()));
-        assertThat(first.drainStatus("blue").state()).isEqualTo("ACTIVE");
     }
 
     @Test
@@ -683,91 +539,6 @@ class TestTransactionStore
     }
 
     @Test
-    void lifecycleGenerationRejectsStaleSealAndResume()
-    {
-        long generation = first.beginDrain("blue").generation();
-        assertThat(second.beginDrain("blue").generation()).isEqualTo(generation);
-        long resumed = second.resume("blue", generation).generation();
-        assertThat(resumed).isGreaterThan(generation);
-        expect(STALE_GENERATION, () -> first.seal("blue", generation));
-        expect(STALE_GENERATION, () -> first.resume("blue", generation));
-        expect(NOT_DRAINED, () -> first.seal("blue", resumed));
-    }
-
-    @Test
-    void sealingInvalidatesPreviouslyPreparedResumeAndSeal()
-    {
-        long draining = first.beginDrain("blue").generation();
-        var sealed = first.seal("blue", draining);
-        expect(STALE_GENERATION, () -> second.resume("blue", draining));
-        expect(STALE_GENERATION, () -> second.seal("blue", draining));
-        assertThat(sealed.generation()).isEqualTo(draining + 1);
-        assertThat(second.seal("blue", sealed.generation())).isEqualTo(sealed);
-        expect(NOT_ACTIVE, () -> first.admitNew("blue", "owner", "group"));
-        assertThat(second.resume("blue", sealed.generation()).generation()).isEqualTo(sealed.generation() + 1);
-        assertThat(first.admitNew("blue", "owner", "group")).isNotNull();
-    }
-
-    @Test
-    void competingSealAndResumeShareOneGenerationFence()
-            throws Exception
-    {
-        try (var executor = Executors.newFixedThreadPool(2)) {
-            for (int iteration = 0; iteration < 20; iteration++) {
-                long generation = first.beginDrain("blue").generation();
-                CountDownLatch start = new CountDownLatch(1);
-                var sealed = executor.submit(() -> attemptLifecycle(start, () -> first.seal("blue", generation)));
-                var resumed = executor.submit(() -> attemptLifecycle(start, () -> second.resume("blue", generation)));
-                start.countDown();
-                boolean sealWon = sealed.get(5, TimeUnit.SECONDS);
-                boolean resumeWon = resumed.get(5, TimeUnit.SECONDS);
-                assertThat(new boolean[] {sealWon, resumeWon}).containsExactlyInAnyOrder(true, false);
-                var current = first.drainStatus("blue");
-                assertThat(current.generation()).isEqualTo(generation + 1);
-                assertThat(current.state()).isEqualTo(sealWon ? "SEALED" : "ACTIVE");
-                if (sealWon) {
-                    expect(NOT_ACTIVE, () -> second.admitNew("blue", "owner", "group"));
-                    second.resume("blue", current.generation());
-                }
-            }
-        }
-    }
-
-    private static boolean attemptLifecycle(CountDownLatch start, Runnable operation)
-            throws InterruptedException
-    {
-        assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
-        try {
-            operation.run();
-            return true;
-        }
-        catch (StoreException failure) {
-            assertThat(failure.code()).isEqualTo(STALE_GENERATION);
-            return false;
-        }
-    }
-
-    @Test
-    void backendConfigurationAndProcessIdentityAreImmutable()
-    {
-        BackendRef original = first.getBackend("blue").orElseThrow();
-        assertThat(second.ensureBackend("blue", original.url(), original.externalUrl(), "group", "blue-node", "blue-process")).isEqualTo(original);
-        expect(CONFLICT, () -> second.ensureBackend("blue", "http://replacement.example.test", original.externalUrl(), "group", "blue-node", "blue-process"));
-        expect(CONFLICT, () -> second.ensureBackend("blue", original.url(), original.externalUrl(), "group", "blue-node", "new-process"));
-        assertThat(first.getBackend("blue").orElseThrow()).isEqualTo(original);
-    }
-
-    @Test
-    void backendAliasesCannotCreateIndependentDrainLedgers()
-    {
-        BackendRef blue = first.getBackend("blue").orElseThrow();
-        expect(CONFLICT, () -> second.ensureBackend("alias", blue.url() + "/", blue.externalUrl(), "group", "another-node", "another-process"));
-        expect(CONFLICT, () -> second.ensureBackend("alias", "http://alias.example.test", blue.externalUrl(), "group", blue.nodeId(), blue.coordinatorId()));
-        assertThat(first.getBackend("alias")).isEmpty();
-        assertThat(second.ensureBackend("blue", blue.url() + "/", blue.externalUrl() + "/", "group", blue.nodeId(), blue.coordinatorId())).isEqualTo(blue);
-    }
-
-    @Test
     void queryCollisionDoesNotRebindOrReleaseAdmission()
     {
         Admission blue = first.admitNew("blue", "owner", "group");
@@ -776,21 +547,6 @@ class TestTransactionStore
         expect(CONFLICT, () -> second.recordResponse(green.id(), new ResponseObservation("collision", null, false, false, 0)));
         assertThat(first.getQuery("collision").orElseThrow().backend().name()).isEqualTo("blue");
         assertThat(first.drainStatus("green").pendingRequests()).isEqualTo(1);
-    }
-
-    @Test
-    void groupOverrideIsSharedAndAdmissionUsesItsTarget()
-    {
-        first.setRoute("group", "green");
-        assertThat(second.getRoute("group")).contains("green");
-        Admission admission = second.admitNew("blue", "owner", "group");
-        assertThat(admission.backend().name()).isEqualTo("green");
-        first.clearRoute("group");
-        assertThat(second.getRoute("group")).isEmpty();
-        assertThat(second.admitNew("blue", "owner", "group").backend().name()).isEqualTo("blue");
-        expect(CONFLICT, () -> first.setRoute("other-group", "blue"));
-        second.beginDrain("green");
-        expect(NOT_ACTIVE, () -> first.setRoute("group", "green"));
     }
 
     @Test
@@ -1011,36 +767,6 @@ class TestTransactionStore
         }
     }
 
-    @Test
-    void drainWaitsForSharedCompletionFenceBeforeSealing()
-            throws Exception
-    {
-        Admission initial = first.admitNew("blue", "owner", "group");
-        first.recordResponse(initial.id(), new ResponseObservation("query", null, false, false, 0));
-        Admission observation = first.admitQuery("query", Optional.empty(), Optional.empty());
-        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
-            fence.begin();
-            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
-            fence.createQuery("SELECT query_id FROM transaction_query WHERE query_id = 'query' FOR UPDATE").mapTo(String.class).one();
-            var completion = executor.submit(() -> first.recordResponse(observation.id(), new ResponseObservation("query", null, false, true, 0)));
-            try {
-                awaitDatabaseWaiter(fencePid);
-                var drain = executor.submit(() -> second.beginDrain("blue"));
-                assertThatThrownBy(() -> drain.get(100, TimeUnit.MILLISECONDS)).isInstanceOf(TimeoutException.class);
-                fence.rollback();
-                completion.get(5, TimeUnit.SECONDS);
-                var status = drain.get(5, TimeUnit.SECONDS);
-                assertThat(status.readyToSeal()).isTrue();
-                assertThat(first.seal("blue", status.generation()).drained()).isTrue();
-            }
-            finally {
-                if (fence.isInTransaction()) {
-                    fence.rollback();
-                }
-            }
-        }
-    }
-
     private void assertOneObservationWins(Admission firstAdmission, ResponseObservation firstObservation, Admission secondAdmission, ResponseObservation secondObservation)
             throws Exception
     {
@@ -1053,7 +779,7 @@ class TestTransactionStore
         }
     }
 
-    private static boolean attemptObservation(CountDownLatch start, TransactionStore store, Admission admission, ResponseObservation observation)
+    private static boolean attemptObservation(CountDownLatch start, PooledTransactionStoreFixture store, Admission admission, ResponseObservation observation)
             throws InterruptedException
     {
         assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
@@ -1126,32 +852,6 @@ class TestTransactionStore
         }
     }
 
-    @Test
-    void legacySealTakesAFreshSnapshotAfterAnAdmissionCommits()
-            throws Exception
-    {
-        var draining = first.beginDrain("blue");
-        Jdbi repeatableReadDatabase = Jdbi.create(() -> {
-            Connection connection = DriverManager.getConnection(fixtureUrl, fixtureUsername, fixturePassword);
-            connection.setTransactionIsolation(Connection.TRANSACTION_REPEATABLE_READ);
-            return connection;
-        });
-        try (var executor = Executors.newSingleThreadExecutor(); Handle admission = database.open()) {
-            admission.begin();
-            int pid = admission.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
-            admission.createQuery("SELECT incarnation FROM transaction_backend WHERE incarnation = :id FOR SHARE")
-                    .bind("id", draining.incarnation()).mapTo(UUID.class).one();
-            var seal = executor.submit(() -> new TransactionStore(repeatableReadDatabase).seal("blue", draining.generation()));
-            awaitDatabaseWaiter(pid);
-            admission.createUpdate("INSERT INTO transaction_admission (admission_id, incarnation, owner_hash, state) VALUES (:id, :backend, 'owner', 'PENDING')")
-                    .bind("id", UUID.randomUUID()).bind("backend", draining.incarnation()).execute();
-            admission.commit();
-            assertThatThrownBy(() -> seal.get(5, TimeUnit.SECONDS)).satisfies(failure ->
-                    assertThat(failure.getCause()).isInstanceOfSatisfying(StoreException.class, error -> assertThat(error.code()).isEqualTo(NOT_DRAINED)));
-        }
-        assertThat(first.drainStatus("blue").state()).isEqualTo("DRAINING");
-    }
-
     private void awaitDatabaseWaiter(int fencePid)
             throws InterruptedException
     {
@@ -1203,26 +903,6 @@ class TestTransactionStore
     }
 
     @Test
-    void admissionWaitsForGroupFenceAndUsesCommittedOverride()
-            throws Exception
-    {
-        first.clearRoute("group");
-        try (Handle fence = database.open(); var executor = Executors.newSingleThreadExecutor()) {
-            fence.begin();
-            fence.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = 'group' FOR UPDATE").mapTo(String.class).one();
-            CountDownLatch started = new CountDownLatch(1);
-            var admission = executor.submit(() -> {
-                started.countDown();
-                return second.admitNew("blue", "owner", "group");
-            });
-            assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
-            fence.execute("UPDATE transaction_route SET backend_name = 'green', generation = generation + 1 WHERE routing_group = 'group'");
-            fence.commit();
-            assertThat(admission.get(5, TimeUnit.SECONDS).backend().name()).isEqualTo("green");
-        }
-    }
-
-    @Test
     void queryTerminalStateCannotRegress()
     {
         Admission admission = first.admitNew("blue", "owner", "group");
@@ -1232,144 +912,6 @@ class TestTransactionStore
         second.recordResponse(terminal.id(), new ResponseObservation("query", null, false, true, 0));
         first.recordResponse(late.id(), new ResponseObservation("query", null, false, false, 0));
         assertThat(first.getQuery("query").orElseThrow().terminal()).isTrue();
-    }
-
-    @Test
-    void sealedSlotCanBeReusedWithoutRebindingHistoricalQueries()
-    {
-        Admission start = startTransaction("transaction", "start");
-        Admission commit = second.admitTransaction("transaction", "owner");
-        second.recordResponse(commit.id(), new ResponseObservation("commit", null, true, true, 0));
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        BackendRef replacement = replacement(old, "new-process");
-        var replaced = second.reincarnate("blue", old.incarnation(), generation, replacement);
-        assertThat(replaced.state()).isEqualTo("DRAINING");
-        assertThat(replaced.generation()).isGreaterThan(generation);
-        assertThat(first.getBackend("blue").orElseThrow().incarnation()).isEqualTo(replacement.incarnation());
-        assertThat(first.getQuery("start").orElseThrow().backend().incarnation()).isEqualTo(old.incarnation());
-        assertThat(first.getTransaction("transaction").orElseThrow().backend().incarnation()).isEqualTo(old.incarnation());
-        expect(SEALED, () -> first.admitQuery("start", Optional.empty(), Optional.empty()));
-        expect(CONFLICT, () -> first.admitTransaction("transaction", "owner"));
-        expect(NOT_ACTIVE, () -> first.admitNew("blue", "owner", "group"));
-        second.resume("blue", replaced.generation());
-        assertThat(first.admitNew("blue", "owner", "group").backend().incarnation()).isEqualTo(replacement.incarnation());
-        first.recordResponse(start.id(), new ResponseObservation("start", "transaction", false, true, 0));
-        first.markUncertain(start.id());
-        assertThat(first.getTransaction("transaction").orElseThrow().state()).isEqualTo("CLOSED");
-    }
-
-    @Test
-    void replacementRequiresSealAndCurrentGeneration()
-    {
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        BackendRef replacement = replacement(old, "new-process");
-        expect(NOT_DRAINED, () -> first.reincarnate("blue", old.incarnation(), 0, replacement));
-        long draining = first.beginDrain("blue").generation();
-        expect(NOT_DRAINED, () -> first.reincarnate("blue", old.incarnation(), draining, replacement));
-        long generation = first.seal("blue", draining).generation();
-        expect(STALE_GENERATION, () -> first.reincarnate("blue", UUID.randomUUID(), generation, replacement));
-        expect(STALE_GENERATION, () -> first.reincarnate("blue", old.incarnation(), generation - 1, replacement));
-        var replaced = first.reincarnate("blue", old.incarnation(), generation, replacement);
-        expect(STALE_GENERATION, () -> second.reincarnate("blue", old.incarnation(), generation, replacement));
-        expect(STALE_GENERATION, () -> second.resume("blue", generation));
-        expect(STALE_GENERATION, () -> second.seal("blue", generation));
-        assertThat(replaced.generation()).isGreaterThan(generation);
-    }
-
-    @Test
-    void replacementRejectsSameProcessAndActiveAliasesAtomically()
-    {
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, replacement(old, old.coordinatorId())));
-        BackendRef green = first.getBackend("green").orElseThrow();
-        BackendRef alias = new BackendRef("blue", UUID.randomUUID(), green.url(), old.externalUrl(), "group", old.nodeId(), "new-process");
-        expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, alias));
-        BackendRef processAlias = new BackendRef("blue", UUID.randomUUID(), old.url(), old.externalUrl(), "group", green.nodeId(), green.coordinatorId());
-        expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, processAlias));
-        assertThat(first.getBackend("blue").orElseThrow()).isEqualTo(old);
-        assertThat(first.drainStatus("blue").state()).isEqualTo("SEALED");
-    }
-
-    @Test
-    void routeMustLeaveOldSlotBeforeReplacement()
-    {
-        first.setRoute("group", "blue");
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        expect(CONFLICT, () -> first.reincarnate("blue", old.incarnation(), generation, replacement(old, "new-process")));
-        first.setRoute("group", "green");
-        assertThat(first.reincarnate("blue", old.incarnation(), generation, replacement(old, "new-process")).state()).isEqualTo("DRAINING");
-        assertThat(first.admitNew("blue", "owner", "group").backend().name()).isEqualTo("green");
-    }
-
-    @Test
-    void concurrentRouteAssignmentCannotRaceSealedBackendReplacement()
-            throws Exception
-    {
-        first.setRoute("group", "green");
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        try (Handle fence = database.open(); var executor = Executors.newFixedThreadPool(2)) {
-            fence.begin();
-            int fencePid = fence.createQuery("SELECT pg_backend_pid()").mapTo(Integer.class).one();
-            fence.createQuery("SELECT current_name FROM transaction_backend WHERE current_name = 'blue' FOR UPDATE").mapTo(String.class).one();
-            var replacement = executor.submit(() -> {
-                return first.reincarnate("blue", old.incarnation(), generation, replacement(old, "replacement-process"));
-            });
-            try {
-                awaitDatabaseWaiter(fencePid);
-                var assignment = executor.submit(() -> second.setRoute("group", "blue"));
-                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                long waiters = 0;
-                while (System.nanoTime() < deadline) {
-                    waiters = database.withHandle(handle -> handle.createQuery(
-                                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' " +
-                                            "AND (query LIKE '%transaction_backend%' OR query LIKE '%transaction_route%')")
-                            .mapTo(Long.class).one());
-                    if (waiters == 2) {
-                        break;
-                    }
-                    Thread.sleep(10);
-                }
-                assertThat(waiters).isEqualTo(2);
-                fence.rollback();
-                assertThat(replacement.get(5, TimeUnit.SECONDS).state()).isEqualTo("DRAINING");
-                assertThatThrownBy(() -> assignment.get(5, TimeUnit.SECONDS)).hasCauseInstanceOf(StoreException.class)
-                        .satisfies(error -> assertThat(((StoreException) error.getCause()).code()).isIn(NOT_ACTIVE, NOT_FOUND));
-            }
-            finally {
-                if (fence.isInTransaction()) {
-                    fence.rollback();
-                }
-            }
-        }
-        assertThat(first.getRoute("group")).contains("green");
-        assertThat(first.getBackend("blue").orElseThrow().incarnation()).isNotEqualTo(old.incarnation());
-    }
-
-    @Test
-    void repeatedBlueGreenCyclesPreserveHistoryAndIncreaseGenerations()
-    {
-        long lastGeneration = -1;
-        for (int cycle = 0; cycle < 3; cycle++) {
-            String name = cycle % 2 == 0 ? "blue" : "green";
-            BackendRef old = first.getBackend(name).orElseThrow();
-            Admission query = first.admitNew(name, "owner", "group");
-            first.recordResponse(query.id(), new ResponseObservation("cycle-" + cycle, null, false, true, 0));
-            long generation = first.seal(name, first.beginDrain(name).generation()).generation();
-            var replaced = first.reincarnate(name, old.incarnation(), generation, replacement(old, "process-" + cycle));
-            assertThat(replaced.generation()).isGreaterThan(generation);
-            if (name.equals("blue")) {
-                assertThat(replaced.generation()).isGreaterThan(lastGeneration);
-                lastGeneration = replaced.generation();
-            }
-            first.resume(name, replaced.generation());
-            expect(SEALED, () -> second.admitQuery(queryId(query.id()), Optional.empty(), Optional.empty()));
-        }
-        long incarnations = database.withHandle(handle -> handle.createQuery("SELECT count(*) FROM transaction_backend").mapTo(Long.class).one());
-        assertThat(incarnations).isEqualTo(5);
     }
 
     @Test
@@ -1407,51 +949,6 @@ class TestTransactionStore
                 handle.rollback();
             }
         }
-    }
-
-    @Test
-    void competingReplacementsCannotRebindAnOldContinuation()
-            throws Exception
-    {
-        BackendRef old = first.getBackend("blue").orElseThrow();
-        Admission query = first.admitNew("blue", "owner", "group");
-        first.recordResponse(query.id(), new ResponseObservation("old-query", null, false, true, 0));
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        CountDownLatch start = new CountDownLatch(1);
-        try (var executor = Executors.newFixedThreadPool(3)) {
-            var replacementOne = executor.submit(() -> attemptReplacement(start, old, generation, "replacement-one"));
-            var replacementTwo = executor.submit(() -> attemptReplacement(start, old, generation, "replacement-two"));
-            var continuation = executor.submit(() -> {
-                assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
-                expect(SEALED, () -> second.admitQuery("old-query", Optional.empty(), Optional.empty()));
-                return first.getQuery("old-query").orElseThrow().backend().incarnation();
-            });
-            start.countDown();
-            assertThat(new boolean[] {replacementOne.get(5, TimeUnit.SECONDS), replacementTwo.get(5, TimeUnit.SECONDS)})
-                    .containsExactlyInAnyOrder(true, false);
-            assertThat(continuation.get(5, TimeUnit.SECONDS)).isEqualTo(old.incarnation());
-            assertThat(first.getBackend("blue").orElseThrow().incarnation()).isNotEqualTo(old.incarnation());
-            assertThat(first.drainStatus("blue").generation()).isEqualTo(generation + 1);
-        }
-    }
-
-    private boolean attemptReplacement(CountDownLatch start, BackendRef old, long generation, String coordinatorId)
-            throws InterruptedException
-    {
-        assertThat(start.await(5, TimeUnit.SECONDS)).isTrue();
-        try {
-            second.reincarnate("blue", old.incarnation(), generation, replacement(old, coordinatorId));
-            return true;
-        }
-        catch (StoreException expected) {
-            assertThat(expected.code()).isIn(STALE_GENERATION, NOT_FOUND);
-            return false;
-        }
-    }
-
-    private String queryId(UUID admissionId)
-    {
-        return database.withHandle(handle -> handle.createQuery("SELECT query_id FROM transaction_admission WHERE admission_id = :id").bind("id", admissionId).mapTo(String.class).one());
     }
 
     @Test
@@ -1551,9 +1048,8 @@ class TestTransactionStore
         String hash = "a".repeat(64);
         Admission initial = first.admitNew("blue", "owner", "group");
         first.recordResponse(initial.id(), new ResponseObservation("query", null, false, true, 0, List.of(hash)));
-        long generation = first.seal("blue", first.beginDrain("blue").generation()).generation();
-        var replaced = first.reincarnate("blue", initial.backend().incarnation(), generation, replacement(initial.backend(), "new-process"));
-        first.resume("blue", replaced.generation());
+        first.seal("blue", first.beginDrain("blue").generation());
+        assertThat(second.admitNew("green", "owner", "group").backend().incarnation()).isNotEqualTo(initial.backend().incarnation());
         expect(SEALED, () -> second.admitQuery("query", Optional.empty(), Optional.empty(), Optional.of(hash)));
         assertThat(capabilities("query")).containsExactly(hash);
         assertThat(first.drainStatus("blue").pendingRequests()).isZero();
@@ -1669,11 +1165,6 @@ class TestTransactionStore
     {
         return database.withHandle(handle -> handle.createQuery("SELECT capability_hash FROM transaction_query_capability WHERE query_id = :query ORDER BY capability_hash")
                 .bind("query", queryId).mapTo(String.class).list());
-    }
-
-    private static BackendRef replacement(BackendRef old, String coordinatorId)
-    {
-        return new BackendRef(old.name(), UUID.randomUUID(), old.url(), old.externalUrl(), old.routingGroup(), old.nodeId(), coordinatorId);
     }
 
     private Admission startTransaction(String transactionId, String queryId)

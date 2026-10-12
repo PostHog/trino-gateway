@@ -7,13 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlsplit
 
 from protocol import finish, request, through_gateway
-from test_rollout_api import local_gateways
+from gateway_fixture import bootstrap_pool, local_gateways
 
 
 class GracefulShutdownContract(unittest.TestCase):
     def test_inflight_continuation_completes_before_process_exits(self):
         processes = []
-        with local_gateways(processes=processes, server_config={"http-server.stop-timeout": "10s"}) as (gateways, backends, _token):
+        with local_gateways(processes=processes, server_config={"http-server.stop-timeout": "10s"}) as (gateways, backends, token):
+            bootstrap_pool(gateways, backends, token)
             headers = [("Authorization", "Basic " + base64.b64encode(b"fixture:disposable").decode())]
             started = request(gateways[0] + "/v1/statement", "POST", "START TRANSACTION", headers)
             self.assertEqual(started.status, 200, started.body)

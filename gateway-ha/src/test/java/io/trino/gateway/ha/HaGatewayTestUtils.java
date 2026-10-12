@@ -18,6 +18,8 @@ import io.airlift.json.JsonCodec;
 import io.airlift.log.Logger;
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
+import io.trino.gateway.ha.config.DataStoreConfiguration;
+import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -37,6 +39,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.Scanner;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.Preconditions.checkState;
@@ -88,15 +91,32 @@ public class HaGatewayTestUtils
                 .putAll(additionalVars)
                 .buildOrThrow();
         String configStr = replaceEnvironmentVariables(getResourceFileContent(configFile), vars);
-
         File target = Files.createTempFile("config-" + System.currentTimeMillis(), "config.yaml").toFile();
 
         try (BufferedWriter writer = Files.newBufferedWriter(target.toPath(), UTF_8)) {
             writer.append(configStr);
         }
 
-        log.info("Test Gateway Config \n[%s]", configStr);
+        log.info("Test Gateway config written to [%s]", target);
         return target;
+    }
+
+    /**
+     * Supplies pooled Gateway settings without connecting to a database, so configuration-only
+     * tests still reach the validation rule they intend to exercise.
+     */
+    public static void configurePooledValidation(HaGatewayConfiguration configuration)
+    {
+        DataStoreConfiguration database = new DataStoreConfiguration();
+        database.setJdbcUrl("jdbc:postgresql://localhost/unused_config_validation_database");
+        database.setUser("synthetic-config-test");
+        database.setDriver("org.postgresql.Driver");
+        configuration.setDataStore(database);
+        configuration.getTransactionAwareness().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
+        configuration.getTransactionAwareness().getPool().setEnabled(true);
+        configuration.getTransactionAwareness().setIdentityKey("synthetic-test-identity-" + UUID.randomUUID());
+        configuration.getTransactionAwareness().setAdminToken("synthetic-test-admin-" + UUID.randomUUID());
     }
 
     public static Map<String, String> buildPostgresVars(PostgreSQLContainer postgresql)

@@ -48,6 +48,19 @@ class LabRenderTests(unittest.TestCase):
         config = next(item for item in self.items if item["kind"] == "Secret" and item["metadata"]["name"] == "gateway-config")
         self.assertIn("jdbc:postgresql://postgres:5432/gateway", config["stringData"]["config.yaml"])
 
+    def test_gateway_configuration_requires_hostname_mapped_pools(self):
+        secret = next(item for item in self.items if item["kind"] == "Secret" and item["metadata"]["name"] == "gateway-config")
+        config = json.loads(secret["stringData"]["config.yaml"])
+        self.assertNotIn("routingRules", config)
+        self.assertNotIn("defaultRoutingGroup", config["routing"])
+        self.assertEqual(config["routing"]["hostnameToPool"]["localhost"], "transaction-test")
+        self.assertEqual(config["routing"]["hostnameToPool"]["gateway"], "transaction-test")
+        settings = config["transactionAwareness"]
+        self.assertTrue(settings["enabled"])
+        self.assertTrue(settings["pool"]["enabled"])
+        self.assertNotEqual(settings["identityKey"], settings["adminToken"])
+        self.assertEqual(config["serverConfig"]["http-server.process-forwarded"], "ignore")
+
     def test_gateway_image_override_does_not_change_other_resources(self):
         custom = render(self.namespace, "synthetic-test-password", "print('fixture')", gateway_image="example.invalid/gateway@sha256:" + "a" * 64)["items"]
         original = next(item for item in self.items if item["kind"] == "Deployment" and item["metadata"]["name"] == "gateway")

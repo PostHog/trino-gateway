@@ -1,5 +1,13 @@
 # Operation
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 The following aspects apply to managing Trino Gateway and the connected Trino
 clusters.
 
@@ -108,36 +116,42 @@ repopulated by health checks each time Trino Gateway starts.
 
 ## Graceful shutdown
 
+These stock steps are not sufficient for pooled members. In pooled mode, drain
+through the fenced lifecycle API and settle all authoritative request, query,
+transaction, and result obligations before sealing and retirement. Zero monitor
+query counts or a legacy active switch cannot authorize retirement.
+
+
 Trino Gateway supports graceful shutdown of Trino clusters. Even when a cluster
 is deactivated, any submitted query states can still be retrieved based on the
 Query ID.
 
 To graceful shutdown a trino cluster without query losses, the steps are:
 
-1. Deactivate the cluster by turning off the 'Active' switch. This ensures that no 
+1. Deactivate the cluster by turning off the 'Active' switch. This ensures that no
    new incoming queries are routed to the cluster.
 2. Poll the Trino cluster coordinator URL until the queued query count and the
    running query count are both zero.
 3. Terminate the Trino coordinator and worker Java processes.
 
-To gracefully shutdown a single worker process, refer to the [Trino 
+To gracefully shutdown a single worker process, refer to the [Trino
 documentation](https://trino.io/docs/current/admin/graceful-shutdown.html) for
 more details.
 
 ## Query routing options
 
-- The default router selects the cluster randomly to route the queries. 
+- The default router selects the cluster randomly to route the queries.
 - If you want to route the queries to the least loaded cluster for a user
   so the cluster with the fewest running or queued queries,
-use `QueryCountBasedRouter`. You can enable it by adding the module name 
+use `QueryCountBasedRouter`. You can enable it by adding the module name
 to the `modules` section of the config file:
 
 ```yaml
 modules:
   - io.trino.gateway.ha.module.QueryCountBasedRouterProvider
 ```
-- The router operates based on the stats it receives from the clusters, such as 
-the number of queued and running queries. These values are retrieved at regular 
+- The router operates based on the stats it receives from the clusters, such as
+the number of queued and running queries. These values are retrieved at regular
 intervals. This interval can be configured by setting `taskDelay` under
 `monitor` section in the config file. The default interval is 1 minute
 ```yaml
@@ -147,8 +161,8 @@ monitor:
 
 ## Monitoring <a name="monitoring"></a>
 
-Trino Gateway provides a metrics endpoint that uses the OpenMetrics format at 
-`/metrics`. Use it to monitor Trino Gateway instances with Prometheus and 
+Trino Gateway provides a metrics endpoint that uses the OpenMetrics format at
+`/metrics`. Use it to monitor Trino Gateway instances with Prometheus and
 other compatible systems with the following Prometheus configuration:
 
 ```yaml
@@ -159,26 +173,19 @@ scrape_configs:
         - gateway1.example.com:8080
 ```
 
-## Pooled members and legacy administration
+## Pooled administration boundary
 
-Pooled members use `/gateway/v1/pools/...` for lifecycle administration. The older
-`/gateway/transactions/backends/...` and route-management APIs administer non-pooled
-backends. These are administration interfaces, not the client SQL protocol.
+For hostname-only pooled deployments, use `/gateway/v1/pools/...` for fenced
+lifecycle administration. Stock backend registration and the cluster UI remain
+available, but neither an active switch nor a healthy probe certifies a member
+for admission. Stock routing selectors and route cookies do not override pool
+membership or durable ownership.
 
-Changing a pool's `apiMode` to `LEGACY` does not convert its former members into
-legacy backends. Their identities remain pooled permanently, including after
-retirement or loss. Legacy registration, routing, resume, and other lifecycle
-calls against those identities return `CONFLICT`. This prevents a retired member
-from becoming routable again through another administration interface.
-
-If you intentionally return a routing group to legacy mode, register a new
-non-pooled backend with a fresh name, endpoint, and process identity. Do not reuse
-a former pool member or delete its ledger rows to bypass the restriction. The
-mode change requires no live pooled members; it does not authorize destructive
-retirement or settle any unresolved obligations.
-
-See [pooled cordon coordination](design/pooled-cordon-coordination.md) for lock
-behavior, rolling-upgrade prerequisites, and recovery limits.
+The custom fixed-backend route override, cutover, resume, reincarnation, and
+rollout administration APIs remain removed; they are not upstream functionality.
+Do not reuse retired member identities or clear unresolved ledger rows.
+See [pooled operation](../testing/transaction-awareness/OPERATIONS.md) and
+[pooled cordon coordination](design/pooled-cordon-coordination.md).
 
 ## Transaction lifecycle diagnostics
 

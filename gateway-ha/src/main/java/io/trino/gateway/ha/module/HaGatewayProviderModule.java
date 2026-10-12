@@ -37,6 +37,7 @@ import io.trino.gateway.ha.config.AuthenticationConfiguration;
 import io.trino.gateway.ha.config.AuthorizationConfiguration;
 import io.trino.gateway.ha.config.ClusterStatsConfiguration;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
+import io.trino.gateway.ha.config.GatewayCookieConfiguration;
 import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.OAuth2GatewayCookieConfigurationPropertiesProvider;
@@ -51,6 +52,7 @@ import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.HaGatewayManager;
 import io.trino.gateway.ha.router.HaOAuth2RoutingStore;
 import io.trino.gateway.ha.router.HaQueryHistoryManager;
+import io.trino.gateway.ha.router.HostnameRoutingGroupSelector;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.PathFilter;
 import io.trino.gateway.ha.router.QueryHistoryManager;
@@ -116,7 +118,9 @@ public class HaGatewayProviderModule
         this.configuration = requireNonNull(configuration, "configuration is null");
 
         GatewayCookieConfigurationPropertiesProvider gatewayCookieConfigurationPropertiesProvider = GatewayCookieConfigurationPropertiesProvider.getInstance();
-        gatewayCookieConfigurationPropertiesProvider.initialize(configuration.getGatewayCookieConfiguration());
+        gatewayCookieConfigurationPropertiesProvider.initialize(configuration.getTransactionAwareness().isEnabled()
+                ? new GatewayCookieConfiguration()
+                : configuration.getGatewayCookieConfiguration());
 
         OAuth2GatewayCookieConfigurationPropertiesProvider oAuth2GatewayCookieConfigurationPropertiesProvider = OAuth2GatewayCookieConfigurationPropertiesProvider.getInstance();
         oAuth2GatewayCookieConfigurationPropertiesProvider.initialize(configuration.getOauth2GatewayCookieConfiguration());
@@ -177,6 +181,9 @@ public class HaGatewayProviderModule
     @Singleton
     public static RoutingGroupSelector getRoutingGroupSelector(@ForRouter HttpClient httpClient, HaGatewayConfiguration configuration)
     {
+        if (configuration.getTransactionAwareness().isEnabled()) {
+            return new HostnameRoutingGroupSelector(configuration.getRouting());
+        }
         RoutingRulesConfiguration routingRulesConfig = configuration.getRoutingRules();
         if (routingRulesConfig.isRulesEngineEnabled()) {
             try {
@@ -196,6 +203,14 @@ public class HaGatewayProviderModule
             }
         }
         return RoutingGroupSelector.byRoutingGroupHeader();
+    }
+
+    public static RoutingGroupSelector getRoutingGroupSelector(HaGatewayConfiguration configuration)
+    {
+        if (!configuration.getTransactionAwareness().isEnabled()) {
+            throw new IllegalArgumentException("The upstream selector requires a router HTTP client");
+        }
+        return getRoutingGroupSelector(null, configuration);
     }
 
     @Provides

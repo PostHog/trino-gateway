@@ -30,7 +30,6 @@ import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.PoolLifecycleConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.config.TransactionAwarenessConfiguration;
-import io.trino.gateway.ha.handler.RoutingTargetHandler;
 import io.trino.gateway.ha.handler.schema.RoutingDestination;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
@@ -40,7 +39,6 @@ import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
 import io.trino.gateway.ha.transaction.TransactionStore.Admission;
 import io.trino.gateway.ha.transaction.TransactionStore.BackendRef;
-import io.trino.gateway.ha.transaction.TransactionStore.DrainStatus;
 import io.trino.gateway.ha.transaction.TransactionStore.QueryBinding;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
 import io.trino.gateway.ha.transaction.TransactionStore.StoreException;
@@ -64,9 +62,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.Executor;
-import java.util.function.Function;
 import java.util.function.Supplier;
 
 import static io.airlift.http.client.Request.Builder.prepareGet;
@@ -91,13 +87,11 @@ public class TransactionAwarenessService
     private final TransactionAwarenessConfiguration config;
     private final TransactionStore store;
     private final TransactionLifecycleStats lifecycleStats;
-    private final RolloutStore rollouts;
     private final TransactionIdentity identity;
     private final GatewayBackendManager backendManager;
     private final HttpClient httpClient;
     private final List<String> statementPaths;
     private final RoutingGroupSelector routingGroupSelector;
-    private final String defaultRoutingGroup;
     private final TransactionRequestCapacity capacity;
     private final PoolStore pools;
     private final PoolLifecycleConfiguration poolConfig;
@@ -120,7 +114,6 @@ public class TransactionAwarenessService
         config = configuration.getTransactionAwareness();
         config.validate(configuration.getDataStore(), configuration.getRouting());
         store = new TransactionStore(jdbi);
-        rollouts = new RolloutStore(jdbi);
         pools = new PoolStore(jdbi);
         poolConfig = config.getPool();
         identity = config.isEnabled() ? new TransactionIdentity(config.getIdentityKey()) : null;
@@ -128,7 +121,6 @@ public class TransactionAwarenessService
         this.httpClient = httpClient;
         statementPaths = configuration.getStatementPaths();
         this.routingGroupSelector = routingGroupSelector;
-        defaultRoutingGroup = configuration.getRouting().getDefaultRoutingGroup();
         capacity = config.isEnabled() ? new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout()) : null;
     }
 
@@ -137,24 +129,35 @@ public class TransactionAwarenessService
         return config.isEnabled();
     }
 
-    public RoutingTargetResponse resolve(HttpServletRequest request, Supplier<RoutingTargetResponse> ordinaryRouting, Function<RoutingSelectorResponse, RoutingTargetResponse> selectBackend)
+    public RoutingTargetResponse resolve(HttpServletRequest request)
     {
-        if (isEnabled()) {
-            String path = request.getRequestURI();
-            if (!canonicalPath(path)) {
-                throw error(400, "Transaction-aware proxy requests require a canonical path");
-            }
+        return resolve(request, Optional.empty());
+    }
+
+    public RoutingTargetResponse resolve(HttpServletRequest request, Optional<String> pinnedBackend)
+    {
+        if (!isEnabled()) {
+            throw error(404, "Pooled routing is disabled");
         }
-        boolean submission = request.getMethod().equals("POST") && statementPaths.contains(request.getRequestURI());
-        boolean continuation = !request.getMethod().equals("POST") && (statementPaths.stream().anyMatch(path -> request.getRequestURI().startsWith(path + "/")) || request.getRequestURI().startsWith("/v1/query/"));
-        if (isEnabled() && request.getMethod().equals("POST") && !submission) {
-            throw error(400, "Transaction-aware query submission requires an exact configured statement path");
+        String path = request.getRequestURI();
+        if (!canonicalPath(path)) {
+            throw error(400, "Proxy requests require a canonical path");
         }
-        if (isEnabled() && (request.getMethod().equals("PUT") || (continuation && !List.of("GET", "HEAD", "DELETE").contains(request.getMethod())))) {
-            throw error(405, "This proxy method is not supported by transaction-aware routing");
+        boolean submission = request.getMethod().equals("POST") && statementPaths.contains(path);
+        boolean continuation = !request.getMethod().equals("POST") && (statementPaths.stream().anyMatch(statement -> path.startsWith(statement + "/")) || path.startsWith("/v1/query/"));
+        if (request.getMethod().equals("POST") && !submission) {
+            throw error(400, "Query submission requires an exact configured statement path");
         }
-        if (!isEnabled() || (!submission && !continuation)) {
-            return ordinaryRouting.get();
+        if (request.getMethod().equals("PUT") || (continuation && !List.of("GET", "HEAD", "DELETE").contains(request.getMethod()))) {
+            throw error(405, "This proxy method is not supported");
+        }
+        RoutingSelectorResponse selection = routingGroupSelector.findRoutingDestination(request);
+        String group = selection.routingGroup();
+        if (group == null || group.isBlank() || !selection.externalHeaders().isEmpty()) {
+            throw error(421, "The request hostname does not identify a pool");
+        }
+        if (!submission && !continuation) {
+            return resolveAuxiliary(request, group, pinnedBackend);
         }
         TransactionRequestCapacity.Lease lease = capacity.acquire();
         request.setAttribute(CAPACITY_ATTRIBUTE, lease);
@@ -163,67 +166,39 @@ public class TransactionAwarenessService
                 lease.remaining();
                 Optional<String> transaction = TransactionIdentity.transactionId(request);
                 Admission admission;
-                HttpServletRequest forwardedRequest = request;
                 if (submission) {
                     String owner = identity.owner(request);
                     if (transaction.isPresent()) {
                         admission = store.admitTransaction(transaction.orElseThrow(), owner);
                     }
                     else {
-                        RoutingSelectorResponse selection = routingGroupSelector.findRoutingDestination(request);
-                        if (!selection.externalHeaders().isEmpty()) {
-                            throw error(400, "Transaction-aware routing does not support external request-header rewrites");
+                        PoolStore.PoolRouting pooled = pools.routing(group);
+                        if (!pooled.pooled()) {
+                            throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "The hostname's pool is not active");
                         }
-                        String group = selection.routingGroup() == null || selection.routingGroup().isEmpty() ? defaultRoutingGroup : selection.routingGroup();
-                        PoolStore.PoolRouting pooled = poolConfig.isEnabled() ? pools.routing(group) : new PoolStore.PoolRouting(false, List.of());
-                        if (pooled.pooled()) {
-                            admission = admitPooled(group, owner, lease, request, pooled);
-                            // The coordinator may honour forwarded headers when qualifying the principal it
-                            // authenticates, so a client-supplied Forwarded/X-Forwarded-* value must not reach
-                            // it: otherwise a caller could present one host to the admission restriction and
-                            // another to the authenticator. The proxy's own forwarding headers are unaffected.
-                            forwardedRequest = withoutClientForwardedHeaders(RoutingTargetHandler.withRoutingHeaders(request, selection.externalHeaders()));
-                        }
-                        else {
-                            Optional<String> override = store.getRoute(group);
-                            if (override.isPresent()) {
-                                admission = store.admitNew(override.orElseThrow(), owner, group);
-                                forwardedRequest = RoutingTargetHandler.withRoutingHeaders(request, selection.externalHeaders());
-                            }
-                            else {
-                                RoutingTargetResponse selected = selectBackend.apply(selection);
-                                ProxyBackendConfiguration candidate = backendManager.getAllBackends().stream()
-                                        .filter(backend -> backend.getProxyTo().equals(selected.routingDestination().clusterHost()))
-                                        .filter(backend -> backend.getRoutingGroup().equals(group))
-                                        .findFirst().orElseThrow(() -> error(503, "No backend belongs to the selected routing group"));
-                                if (store.getBackend(candidate.getName()).isEmpty()) {
-                                    ensureBackend(candidate.getName(), lease.remaining());
-                                }
-                                admission = store.admitNew(candidate.getName(), owner, group);
-                                forwardedRequest = selected.modifiedRequest();
-                            }
-                        }
+                        admission = admitPooled(group, owner, lease, request, pooled);
                     }
                 }
                 else {
-                    if (request.getRequestURI().startsWith("/v1/query/") && TransactionIdentity.singleHeader(request, "Authorization").isEmpty()) {
+                    if (path.startsWith("/v1/query/") && TransactionIdentity.singleHeader(request, "Authorization").isEmpty()) {
                         throw error(401, "Query metadata and query-ID cancellation require owner credentials");
                     }
-                    String queryId = extractQueryIdIfPresent(request.getRequestURI(), null, statementPaths)
+                    String queryId = extractQueryIdIfPresent(path, null, statementPaths)
                             .orElseThrow(() -> error(400, "Invalid query continuation path"));
                     QueryBinding query = store.getQuery(queryId).orElseThrow(() -> error(404, "Unknown query identifier"));
+                    requirePool(query.backend(), group);
                     identity.validateContinuation(request, query.ownerHash());
-                    Optional<String> capability = request.getRequestURI().startsWith("/v1/query/") ? Optional.empty() : Optional.of(capabilityHash(request.getRequestURI()));
+                    Optional<String> capability = path.startsWith("/v1/query/") ? Optional.empty() : Optional.of(capabilityHash(path));
                     admission = store.admitQuery(queryId, Optional.of(query.ownerHash()), transaction, capability);
                 }
                 request.setAttribute(ADMISSION_ATTRIBUTE, admission);
+                requirePool(admission.backend(), group);
                 lease.remaining();
                 verifyProcess(admission.backend(), lease.remaining());
                 lease.remaining();
-                forwardedRequest = inlineResults(forwardedRequest);
+                HttpServletRequest forwardedRequest = inlineResults(withoutClientForwardedHeaders(request));
                 forwardedRequest.setAttribute(ADMISSION_ATTRIBUTE, admission);
-                BackendRef backend = admission.backend();
-                return new RoutingTargetResponse(new RoutingDestination(backend.routingGroup(), backend.url(), buildUriWithNewCluster(backend.url(), forwardedRequest), backend.externalUrl()), forwardedRequest);
+                return destination(admission.backend(), forwardedRequest);
             }));
         }
         catch (RuntimeException failure) {
@@ -235,6 +210,74 @@ public class TransactionAwarenessService
             }
             throw failure;
         }
+    }
+
+    private RoutingTargetResponse resolveAuxiliary(HttpServletRequest request, String group, Optional<String> pinnedBackend)
+    {
+        return guarded(() -> {
+            PoolStore.PoolRouting pooled = pools.routing(group);
+            if (!pooled.pooled()) {
+                throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "The hostname's pool is not active");
+            }
+            List<PoolStore.Candidate> candidates = candidates(group, pooled);
+            if (pinnedBackend.isPresent()) {
+                candidates.removeIf(candidate -> !sameAuthority(candidate.url(), pinnedBackend.orElseThrow()));
+            }
+            for (PoolStore.Candidate candidate : candidates) {
+                BackendRef backend = store.getBackend(candidate.backendName()).orElseThrow(() -> error(503, "Unknown pool member"));
+                requirePool(backend, group);
+                if (!backend.incarnation().equals(candidate.incarnation()) || !backend.url().equals(candidate.url()) ||
+                        (pinnedBackend.isPresent() && !sameAuthority(backend.url(), pinnedBackend.orElseThrow()))) {
+                    throw error(409, "The original coordinator process is no longer available");
+                }
+                verifyProcess(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
+                return destination(backend, withoutClientForwardedHeaders(request));
+            }
+            throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "No pool member is currently eligible");
+        });
+    }
+
+    public boolean isPooledBackendAvailable(HttpServletRequest request, String backendUrl)
+    {
+        return guarded(() -> {
+            String group = routingGroupSelector.findRoutingDestination(request).routingGroup();
+            PoolStore.PoolRouting pooled = pools.routing(group);
+            return pooled.pooled() && candidates(group, pooled).stream()
+                    .anyMatch(candidate -> sameAuthority(candidate.url(), backendUrl) && cachedHealth(candidate.backendName()));
+        });
+    }
+
+    private static boolean sameAuthority(String left, String right)
+    {
+        URI first = URI.create(left);
+        URI second = URI.create(right);
+        return first.getScheme().equalsIgnoreCase(second.getScheme()) && first.getAuthority().equalsIgnoreCase(second.getAuthority());
+    }
+
+    private static void requirePool(BackendRef backend, String group)
+    {
+        if (!group.equals(backend.poolId()) || !group.equals(backend.routingGroup())) {
+            throw error(403, "The request hostname does not own this query or transaction");
+        }
+    }
+
+    private static RoutingTargetResponse destination(BackendRef backend, HttpServletRequest request)
+    {
+        return new RoutingTargetResponse(new RoutingDestination(backend.routingGroup(), backend.url(), buildUriWithNewCluster(backend.url(), request), backend.externalUrl()), request);
+    }
+
+    private List<PoolStore.Candidate> candidates(String group, PoolStore.PoolRouting pooled)
+    {
+        Set<String> registrations = backendManager.getAllBackends().stream()
+                .filter(backend -> group.equals(backend.getRoutingGroup()))
+                .map(ProxyBackendConfiguration::getName)
+                .collect(java.util.stream.Collectors.toSet());
+        List<PoolStore.Candidate> eligible = new ArrayList<>(pooled.candidates().stream()
+                .filter(candidate -> registrations.contains(candidate.backendName()))
+                .toList());
+        Collections.shuffle(eligible);
+        eligible.sort(java.util.Comparator.comparing(candidate -> cachedHealth(candidate.backendName()) ? 0 : 1));
+        return eligible;
     }
 
     /**
@@ -256,23 +299,10 @@ public class TransactionAwarenessService
                 poolConfig.getHostQualificationDomains(),
                 Set.copyOf(poolConfig.getExcludedHostLabels())).orElse(null))
                 : null;
-        // Registration existence, not the legacy active flag, is the legacy fact that matters here.
-        // A pooled member's registration is created inactive on purpose: flipping it active through the
-        // legacy route would make it eligible for routing with no certified admission at all. The pool
-        // store is the authority for "may admit", so requiring the legacy flag would make every
-        // certified member unroutable.
-        Set<String> legacyCandidates = backendManager.getAllBackends().stream()
-                .filter(backend -> group.equals(backend.getRoutingGroup()))
-                .map(ProxyBackendConfiguration::getName)
-                .collect(java.util.stream.Collectors.toSet());
-        List<PoolStore.Candidate> eligible = new ArrayList<>(pooled.candidates().stream()
-                .filter(candidate -> legacyCandidates.contains(candidate.backendName()))
-                .toList());
+        List<PoolStore.Candidate> eligible = candidates(group, pooled);
         if (eligible.isEmpty()) {
             throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "No pool member is currently eligible to admit new work");
         }
-        Collections.shuffle(eligible);
-        eligible.sort(java.util.Comparator.comparing(candidate -> cachedHealth(candidate.backendName()) ? 0 : 1));
         StoreException lastRejection = null;
         int attempts = 0;
         for (PoolStore.Candidate candidate : eligible) {
@@ -628,162 +658,12 @@ public class TransactionAwarenessService
         });
     }
 
-    public Map<String, Object> drain(String name, boolean begin)
-    {
-        return drain(name, begin, null);
-    }
-
-    public Map<String, Object> drain(String name, boolean begin, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            if (begin && store.getBackend(name).isEmpty()) {
-                ensureBackend(name);
-            }
-            return status(begin ? administration(operation).beginDrain(name) : store.drainStatus(name));
-        });
-    }
-
-    public Map<String, Object> seal(String name, long generation)
-    {
-        return seal(name, generation, null);
-    }
-
-    public Map<String, Object> seal(String name, long generation, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            verifyProcess(store.getBackend(name).orElseThrow(() -> error(404, "Unknown backend")));
-            return status(administration(operation).seal(name, generation));
-        });
-    }
-
-    public Map<String, Object> drain(String name, UUID expectedIncarnation, long expectedGeneration, RolloutStore.Guard operation)
-    {
-        return guarded(() -> status(administration(operation).beginDrain(name, expectedIncarnation, expectedGeneration)));
-    }
-
-    public TransactionStore.RouteStatus routeStatus(String routingGroup)
-    {
-        return guarded(() -> store.routeStatus(routingGroup));
-    }
-
-    public TransactionStore.RouteStatus compareAndSetRoute(String routingGroup, long expectedGeneration, String expectedBackendName, String backendName, UUID backendIncarnation, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            ensureBackend(backendName);
-            return administration(operation).compareAndSetRoute(routingGroup, expectedGeneration, expectedBackendName, backendName, backendIncarnation);
-        });
-    }
-
-    public Map<String, Object> resume(String name, long generation)
-    {
-        return resume(name, generation, null);
-    }
-
-    public Map<String, Object> resume(String name, long generation, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            ensureBackend(name);
-            return status(administration(operation).resume(name, generation));
-        });
-    }
-
-    public Map<String, Object> cutover(String routingGroup, String backendName)
-    {
-        return cutover(routingGroup, backendName, null);
-    }
-
-    public Map<String, Object> cutover(String routingGroup, String backendName, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            BackendRef backend = ensureBackend(backendName);
-            if (!backend.routingGroup().equals(routingGroup)) {
-                throw error(409, "Destination does not belong to the routing group");
-            }
-            return Map.of("generation", administration(operation).setRoute(routingGroup, backendName), "backendName", backendName, "routingGroup", routingGroup);
-        });
-    }
-
-    public Map<String, Object> reincarnate(String name, UUID incarnation, long generation)
-    {
-        return reincarnate(name, incarnation, generation, null);
-    }
-
-    public Map<String, Object> reincarnate(String name, UUID incarnation, long generation, RolloutStore.Guard operation)
-    {
-        return guarded(() -> {
-            ProxyBackendConfiguration backend = backendManager.getBackendByName(name).orElseThrow(() -> error(404, "Unknown backend"));
-            JsonNode info = processInfo(backend.getProxyTo());
-            BackendRef proposed = new BackendRef(name, UUID.randomUUID(), backend.getProxyTo(), backend.getExternalUrl() == null ? backend.getProxyTo() : backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
-            return status(administration(operation).reincarnate(name, incarnation, generation, proposed));
-        });
-    }
-
-    public Map<String, Object> clearRoute(String routingGroup)
-    {
-        return clearRoute(routingGroup, null);
-    }
-
-    public Map<String, Object> clearRoute(String routingGroup, RolloutStore.Guard operation)
-    {
-        return guarded(() -> Map.of("generation", administration(operation).clearRoute(routingGroup)));
-    }
-
-    private TransactionStore administration(RolloutStore.Guard operation)
-    {
-        return operation == null ? store : store.withOperation(operation);
-    }
-
-    public RolloutStore.Operation acquireRollout(String group, String operationId, RolloutStore.Plan plan)
-    {
-        return guarded(() -> rollouts.acquire(group, operationId, plan));
-    }
-
-    public RolloutStore.Operation currentRollout(String group)
-    {
-        return guarded(() -> rollouts.current(group).orElseThrow(() -> error(404, "Unknown rollout")));
-    }
-
-    public RolloutStore.Operation checkpointRollout(String group, String operationId, long version, String phase, String evidence)
-    {
-        return guarded(() -> rollouts.checkpoint(group, operationId, version, phase, evidence));
-    }
-
-    public RolloutStore.Operation claimPublication(String group, String kind, String operationId, long version, String planHash)
-    {
-        return guarded(() -> rollouts.claimPublication(group, kind, new RolloutStore.Guard(operationId, version), planHash));
-    }
-
-    private BackendRef ensureBackend(String name)
-    {
-        return ensureBackend(name, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
-    }
-
-    private BackendRef ensureBackend(String name, Duration remaining)
-    {
-        ProxyBackendConfiguration backend = backendManager.getBackendByName(name).orElseThrow(() -> error(404, "Unknown backend"));
-        JsonNode info = processInfo(backend.getProxyTo(), remaining);
-        return store.ensureBackend(name, backend.getProxyTo(), backend.getExternalUrl() == null ? backend.getProxyTo() : backend.getExternalUrl(), backend.getRoutingGroup(), info.path("nodeId").asText(), info.path("coordinatorId").asText());
-    }
-
-    private void verifyProcess(BackendRef backend)
-    {
-        verifyProcess(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
-    }
-
     private void verifyProcess(BackendRef backend, Duration remaining)
     {
-        // A pooled member is reached over internal HTTP, so its verification probe describes the
-        // original protocol exactly as its registration probe does. A legacy backend is probed with
-        // the request it has always received.
-        JsonNode info = processInfo(backend.url(), remaining, backend.poolId() != null && poolConfig.isForwardedProtoHttps());
+        JsonNode info = processInfo(backend.url(), remaining, poolConfig.isForwardedProtoHttps());
         if (!backend.nodeId().equals(info.path("nodeId").asText()) || !backend.coordinatorId().equals(info.path("coordinatorId").asText())) {
             throw error(409, "The original coordinator process is no longer available");
         }
-    }
-
-    private JsonNode processInfo(String backend)
-    {
-        return processInfo(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS), false);
     }
 
     /**
@@ -795,17 +675,6 @@ public class TransactionAwarenessService
         return processInfo(backendUrl, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS), poolConfig.isForwardedProtoHttps());
     }
 
-    private JsonNode processInfo(String backend, Duration remaining)
-    {
-        return processInfo(backend, remaining, false);
-    }
-
-    /**
-     * @param forwardedProtoHttps asserts the original protocol of a request that terminated its TLS at
-     *         the Gateway. Only a pooled member's probe may pass true, and only when configured, so a
-     *         legacy backend is probed with exactly the request it received before this protocol
-     *         existed. Nothing here weakens what the coordinator requires of the request.
-     */
     private JsonNode processInfo(String backend, Duration remaining, boolean forwardedProtoHttps)
     {
         Duration timeout = new Duration(Math.max(1, Math.min(config.getProcessInfoTimeoutMillis(), remaining.toMillis())), MILLISECONDS);
@@ -828,23 +697,6 @@ public class TransactionAwarenessService
         catch (IOException e) {
             throw error(503, "Backend process identity is unavailable");
         }
-    }
-
-    private static Map<String, Object> status(DrainStatus status)
-    {
-        return Map.ofEntries(Map.entry("name", status.name()),
-                Map.entry("incarnation", status.incarnation()),
-                Map.entry("state", status.state()),
-                Map.entry("generation", status.generation()),
-                Map.entry("nodeId", status.nodeId() == null ? "" : status.nodeId()),
-                Map.entry("coordinatorId", status.coordinatorId() == null ? "" : status.coordinatorId()),
-                Map.entry("pendingRequests", status.pendingRequests()),
-                Map.entry("openTransactions", status.openTransactions()),
-                Map.entry("activeQueries", status.activeQueries()),
-                Map.entry("readyToSeal", status.readyToSeal()),
-                Map.entry("drained", status.drained()),
-                Map.entry("sealed", status.state().equals("SEALED")),
-                Map.entry("acceptingNewQueries", status.state().equals("ACTIVE")));
     }
 
     private static Optional<String> responseHeader(ProxyResponse response, String name)

@@ -1,9 +1,17 @@
 # Routing rules
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 Trino Gateway includes a routing rules engine.
 
 By default, Trino Gateway reads the `X-Trino-Routing-Group` request header to
-route requests. Use the `defaultRoutingGroup` setting to specify a fallback group, 
+route requests. Use the `defaultRoutingGroup` setting to specify a fallback group,
 defaults to the `adhoc` group.
 
 
@@ -54,7 +62,7 @@ routingRules:
   corresponding header values from being sent in the POST request.
 * Check headers to exclude when making API requests, specifics depend on the
   network configuration.
-* Set `propagateErrors` to `true` to forward routing service errors to  
+* Set `propagateErrors` to `true` to forward routing service errors to
   clients if present in the response.
 
 If there is error parsing the routing rules configuration file, an error is
@@ -131,8 +139,8 @@ or setting client tags before the request reaches the Trino cluster.
 
 Rules consist of a name, description, condition, and list
 of actions. If the condition of a particular rule evaluates to `true`, its
-actions are fired. Rules are stored as a 
-[multi-document](https://www.yaml.info/learn/document.html) YAML file. 
+actions are fired. Rules are stored as a
+[multi-document](https://www.yaml.info/learn/document.html) YAML file.
 
 ```yaml
 ---
@@ -165,12 +173,12 @@ routing group. Without this action, the configured default group is used and the
 whole routing rule is redundant.
 
 The condition and actions are written in [MVEL](http://mvel.documentnode.com/),
-an expression language with Java-like syntax. Classes from `java.util`, data-type 
+an expression language with Java-like syntax. Classes from `java.util`, data-type
 classes from `java.lang` such as `Integer` and `String`, as well as `java.lang.Math`
 and `java.lang.StrictMath` are available in rules. Rules may not use `java.lang.System`
 and other classes that allow access the Java runtime and operating system.
 In most cases, you can write
-conditions and actions in Java syntax and expect it to work. One exception is 
+conditions and actions in Java syntax and expect it to work. One exception is
 parametrized types. Exclude type parameters, for example to add a `HashSet` to the
 `state` variable, use an action such as:
 ```java
@@ -178,7 +186,7 @@ actions:
   - |
     state.put("triggeredRules",new HashSet())
 ```
-This is equivalent to `new HashSet<Object>()`. 
+This is equivalent to `new HashSet<Object>()`.
 
 There are some
 MVEL-specific operators. For example, instead of doing a null-check before
@@ -388,7 +396,7 @@ to set a `routingGroup`.
 
 The `state` object may be used to pass information from one rule evaluation to
 the next. This allows an author to avoid duplicating logic in multiple rules.
-Priority should be used to ensure that `state` is updated before being used 
+Priority should be used to ensure that `state` is updated before being used
 in downstream rules. For example, the atomic rules may be re-implemented as
 
 ```yaml

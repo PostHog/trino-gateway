@@ -1,10 +1,35 @@
 # Security
 
+> **Routing modes:** Official upstream routing functionality is retained. With
+> `transactionAwareness.enabled: false` and
+> `transactionAwareness.pool.enabled: false` (the defaults), the stock routing
+> behavior described below applies. When both flags are `true`, stock routing
+> selectors, routing rules, route cookies, and default-group fallback are
+> **bypassed**, not removed. Use [pooled hostname routing](pooled-routing.md)
+> instead; a pool failure never falls back to stock routing.
+
 Trino Gateway has its own security with its own authentication and authorization.
 These features are used only to authenticate and authorize its user interface and
 the APIs. All Trino-related requests are passed through to the Trino cluster
 without any authentication or authorization check in Trino Gateway, unless the
 optional client-certificate JWT bridge is configured.
+
+## Pooled authentication boundary
+
+In pooled mode, Host selects a configured pool, not an authenticated tenant.
+Headers, query properties, route cookies, and forwarded-host claims cannot
+change placement. The current deny-only tenant adapter reads one Basic
+credential principal qualified as the coordinator will qualify it; the
+coordinator still verifies credentials and authorization on each statement.
+Gateway UI/API OAuth login and certificate-to-JWT transport do not supply a
+supported pooled Basic principal. Do not advertise OAuth/Bearer pooled SQL
+from enabling transport affinity or the bridge alone.
+
+Preserve the public Host at trusted ingress. Reject or ignore untrusted
+forwarded headers before server-side request rewriting; strip client
+`Forwarded` and `X-Forwarded-*` and regenerate trusted coordinator-facing
+metadata. Restrict direct coordinator access. See
+[pooled routing](pooled-routing.md) for ownership and continuation boundaries.
 
 ## Client certificate JWT bridge
 
@@ -243,7 +268,7 @@ authentication:
     authorizationEndpoint:
     jwkEndpoint:
     redirectUrl:
-    redirectWebUrl: 
+    redirectWebUrl:
     userIdField:
     scopes:
       - s1
@@ -325,7 +350,7 @@ Trino Gateway supports the following roles in regex string format:
 - api : Allows access to rest apis to configure the clusters
 
 Users with attributes next to the role will be giving those privileges the
-users. You can use the preset users defined in the yaml file. 
+users. You can use the preset users defined in the yaml file.
 LDAP Authorization is also supported by adding user attribute configs in file.
 An OAuth claim can be used by setting the `privilegesField` in the OAuth
 configuration.
@@ -452,7 +477,7 @@ enabled.
 ## Web page permissions
 
 By default, all pages are accessible to all roles.
-To limit page access, you can set page permissions by pages 
+To limit page access, you can set page permissions by pages
 and `_` as separator field.
 
 The following pages are available:
@@ -466,9 +491,9 @@ The following pages are available:
 ```yaml
 # admin/api can access all pages, while user can only access dashboard/history
 pagePermissions:
-  admin: 
-  user: dashboard_history 
-  api: 
+  admin:
+  user: dashboard_history
+  api:
 ```
 
 ## Extra: Self-signed certificate in Trino Gateway
@@ -490,7 +515,7 @@ Trino Gateway should be added:
 -Djavax.net.ssl.trustStorePassword=<truststore password>
 ```
 
-If you want to skip the hostname validation for a self-signed certificate, 
+If you want to skip the hostname validation for a self-signed certificate,
 the `serverConfig` configuration should contain the following:
 
 ```yaml

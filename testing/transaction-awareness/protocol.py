@@ -35,7 +35,8 @@ def request(url, method="GET", body=None, headers=(), timeout=40):
         raise ValueError("Only HTTP and HTTPS endpoints are supported")
     payload = body.encode() if isinstance(body, str) else body
     try:
-        connection.putrequest(method, urlunsplit(("", "", parsed.path or "/", parsed.query, "")))
+        connection.putrequest(method, urlunsplit(("", "", parsed.path or "/", parsed.query, "")),
+                              skip_host=any(key.lower() == "host" for key, _ in headers))
         for key, value in headers:
             connection.putheader(key, value)
         if payload is not None:

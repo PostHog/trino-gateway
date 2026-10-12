@@ -149,6 +149,9 @@ public class TransactionAwarenessConfiguration
         if (!enabled) {
             return;
         }
+        if (!pool.isEnabled()) {
+            throw new IllegalArgumentException("Gateway requires pooled member lifecycle");
+        }
         if (dataStore == null || dataStore.getJdbcUrl() == null || !dataStore.getJdbcUrl().startsWith("jdbc:postgresql:")) {
             throw new IllegalArgumentException("Transaction awareness requires PostgreSQL");
         }

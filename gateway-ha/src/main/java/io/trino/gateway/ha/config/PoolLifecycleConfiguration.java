@@ -16,8 +16,7 @@ package io.trino.gateway.ha.config;
 import java.util.List;
 
 /**
- * Pooled member lifecycle configuration. Disabled by default: with {@code enabled = false} the
- * versioned pool API is absent and routing, admission and monitoring behave exactly as before.
+ * Configuration for the required pooled member lifecycle.
  */
 public class PoolLifecycleConfiguration
 {

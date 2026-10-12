@@ -108,6 +108,40 @@ abstract class BaseTestQueryHistoryManager
     }
 
     @Test
+    void testDisabledQueryHistoryDoesNotPersistSubmittedDetails()
+    {
+        DataStoreConfiguration disabled = new DataStoreConfiguration();
+        disabled.setJdbcUrl(container.getJdbcUrl());
+        disabled.setQueryHistoryEnabled(false);
+        QueryHistoryManager disabledManager = new HaQueryHistoryManager(jdbi, disabled);
+        QueryHistoryManager.QueryDetail detail = new QueryHistoryManager.QueryDetail();
+        detail.setQueryId("disabled-history-fixture");
+        detail.setQueryText("SELECT 1");
+        detail.setBackendUrl("http://backend.example.test");
+        detail.setExternalUrl("http://gateway.example.test");
+        detail.setRoutingGroup("fixture-pool");
+        detail.setUser("synthetic-user");
+        detail.setSource("synthetic-client");
+        detail.setCaptureTime(System.currentTimeMillis());
+
+        disabledManager.submitQueryDetail(detail);
+
+        long disabledRows = jdbi.withHandle(handle -> handle.createQuery("SELECT count(*) FROM query_history")
+                .mapTo(Long.class).one());
+        assertThat(disabledRows).isZero();
+        assertThat(disabledManager.fetchQueryHistory(Optional.empty())).isEmpty();
+
+        // Positive control: the same detail and database do persist when history is enabled.
+        queryHistoryManager.submitQueryDetail(detail);
+        long enabledRows = jdbi.withHandle(handle -> handle.createQuery("SELECT count(*) FROM query_history")
+                .mapTo(Long.class).one());
+        assertThat(enabledRows).isEqualTo(1);
+        assertThat(queryHistoryManager.fetchQueryHistory(Optional.empty()))
+                .extracting(QueryHistoryManager.QueryDetail::getQueryId)
+                .containsExactly(detail.getQueryId());
+    }
+
+    @Test
     void testSubmitQueryDetailTruncatesQueryText()
     {
         DataStoreConfiguration config = new DataStoreConfiguration();

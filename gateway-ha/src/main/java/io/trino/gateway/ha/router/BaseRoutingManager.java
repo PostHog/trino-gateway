@@ -52,6 +52,7 @@ public abstract class BaseRoutingManager
     private final ExecutorService executorService = Executors.newFixedThreadPool(5);
     private final GatewayBackendManager gatewayBackendManager;
     private final ConcurrentHashMap<String, TrinoStatus> backendToStatus;
+    private final Map<String, ClusterStats> observedClusterStats = new ConcurrentHashMap<>();
     private final String defaultRoutingGroup;
     private final QueryHistoryManager queryHistoryManager;
     private final LoadingCache<String, String> queryIdBackendCache;
@@ -194,25 +195,34 @@ public abstract class BaseRoutingManager
     }
 
     @Override
-    public void updateBackEndHealth(String backendId, TrinoStatus value)
+    public synchronized void updateBackEndHealth(String backendId, TrinoStatus value)
     {
         log.info("backend %s isHealthy %s", backendId, value);
         backendToStatus.put(backendId, value);
+        observedClusterStats.remove(backendId);
     }
 
     @Override
-    public void removeBackEndHealth(String backendId)
+    public synchronized void removeBackEndHealth(String backendId)
     {
         log.info("Removing backend %s from health tracking", backendId);
         backendToStatus.remove(backendId);
+        observedClusterStats.remove(backendId);
     }
 
     @Override
-    public void updateClusterStats(List<ClusterStats> stats)
+    public synchronized void updateClusterStats(List<ClusterStats> stats)
     {
         for (ClusterStats clusterStats : stats) {
             updateBackEndHealth(clusterStats.clusterId(), clusterStats.trinoStatus());
+            observedClusterStats.put(clusterStats.clusterId(), clusterStats);
         }
+    }
+
+    @Override
+    public synchronized Optional<ClusterStats> getClusterStats(String backendId)
+    {
+        return Optional.ofNullable(observedClusterStats.get(backendId));
     }
 
     @Override

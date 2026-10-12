@@ -31,6 +31,11 @@ public interface RoutingManager
     Optional<TrinoStatus> getBackEndHealth(String backendId);
 
     /**
+     * Returns the last monitoring observation for advisory ordering within an eligible pool.
+     */
+    Optional<ClusterStats> getClusterStats(String backendId);
+
+    /**
      * Updates the health status of a backend cluster.
      *
      * @param backendId the unique identifier of the backend cluster

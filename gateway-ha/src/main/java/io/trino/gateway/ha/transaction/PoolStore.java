@@ -376,7 +376,7 @@ public final class PoolStore
     public PoolState configurePool(String poolId, Guard guard, PoolSpec spec, boolean verifiedTenantIdentityAvailable)
     {
         validatePoolId(poolId);
-        check(List.of("LEGACY", "POOLED").contains(spec.apiMode()), POOL_VALIDATION, "apiMode must be LEGACY or POOLED");
+        check("POOLED".equals(spec.apiMode()), POOL_APIMODE, "apiMode must be POOLED");
         check(spec.minServing() >= 1 && spec.minServing() <= 1000, POOL_VALIDATION, "minServing must be between 1 and 1000");
         check(spec.desiredMembers() >= 1 && spec.desiredMembers() <= 1000, POOL_VALIDATION, "desiredMembers must be between 1 and 1000");
         check(spec.maxSurge() >= 0 && spec.maxSurge() <= 100, POOL_VALIDATION, "maxSurge must be between 0 and 100");
@@ -403,9 +403,6 @@ public final class PoolStore
             check(pool.ownerIdentity == null || Objects.equals(pool.ownerIdentity, guard.ownerIdentity()) || guard.controllerEpoch() > pool.epoch,
                     POOL_STALE_EPOCH,
                     "Taking authority from another controller requires a strictly greater epoch");
-            if (spec.apiMode().equals("LEGACY")) {
-                check(countMembers(handle, poolId, LIVE_PHASES) == 0, POOL_APIMODE, "A pool with live members cannot return to LEGACY mode");
-            }
             handle.createUpdate(
                             """
                             UPDATE pool SET epoch = :epoch, api_mode = :mode, min_serving = :minServing,

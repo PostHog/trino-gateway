@@ -1,11 +1,13 @@
 # Disposable Kubernetes lab
 
-This lab runs two independent Gateway processes sharing PostgreSQL, two stock
-Trino single-node coordinators, and two controllable Python backends. It is for
-synthetic development tests, not customer traffic. The initial Gateway image is
-upstream version 21. Trino is version 483.
+This lab runs two Gateway processes sharing PostgreSQL and controllable
+Python backends. Optional stock Trino coordinators are comparison controls,
+not admissible members: they lack the required process-identity contract.
+Use a compatible coordinator build for real pooled/client verification. The
+lab is for synthetic development tests, not customer traffic.
 
-Use `--gateway-image` with a verified digest for a reproducible fork baseline.
+Always provide `--gateway-image` with a verified compatible digest; the legacy
+upstream default is not compatible with mandatory pooled configuration.
 The bounded performance workflow and external database safety requirements are
 in [../LOAD.md](../LOAD.md).
 
@@ -42,7 +44,8 @@ Use an explicitly authorized **development** context and a unique namespace:
 
 ```sh
 python3 testing/transaction-awareness/deploy/lab.py \
-  --context <development-context> --namespace gateway-tx-lab-<unique-id> create
+  --context <development-context> --namespace gateway-tx-lab-<unique-id> \
+  create --gateway-image <compatible-gateway-image-digest>
 python3 testing/transaction-awareness/deploy/lab.py \
   --context <development-context> --namespace gateway-tx-lab-<unique-id> status
 python3 testing/transaction-awareness/deploy/lab.py \
@@ -60,11 +63,13 @@ directory, generated Secret manifests, or raw cluster diagnostics. `forward`
 opens loopback listeners for distinct Gateway pods, the fixtures, and real Trino
 coordinators. It prints the fixture suite's endpoint variables. Export those
 variables in another terminal and follow the parent test README.
-Set `TX_CA_FILE` to the generated `tls/ca.crt`. Do not disable TLS verification.
+The retained external protocol suites need their old placement setup adapted to
+pooled lifecycle calls before execution; the supported local multi-process
+contracts are listed in the parent test README. Set `TX_CA_FILE` to the generated `tls/ca.crt`. Do not disable TLS verification.
 
 The PostgreSQL fault proxy exposes a separate namespace-only HTTP control port.
 The forward command prints `TX_DATABASE_FAULT_URL` for this endpoint. Before
-testing a feature-enabled artifact, configure the owned Gateway Secret:
+testing a compatible pooled-mode artifact, configure the owned Gateway Secret:
 
 ```sh
 python3 testing/transaction-awareness/deploy/lab.py \
@@ -107,8 +112,16 @@ The existing `--jar` alternative remains available. Run this disruptive contract
 only after the other suites finish; reopen external forwards afterwards.
 
 The real Trino services are `https://trino-blue:8443` and
-`https://trino-green:8443`. Register them with separate backend names and routing
-groups from the Python fixtures. Trino processes forwarded headers so result
+`https://trino-green:8443`. Register them with separate backend names and pools from the Python fixtures.
+The renderer maps `localhost` and the Gateway Service hostname to
+`transaction-test`; local Gateway forwards use `https://localhost:<port>`.
+Configure the intended hostname-to-pool map before opening requests. Both
+transaction-awareness and pool flags are mandatory true. Registry entries alone
+never authorize query dispatch: configure the pool and certify/admit members
+through `/gateway/v1/pools` before testing clients. Routing-group and forwarded
+Host headers cannot select another pool. Use a separate fresh lab or an explicitly
+configured hostname for a different backend cohort; the old blue/green cutover
+and matrix-checkpoint scripts are removed. Trino processes forwarded headers so result
 continuation URLs can remain at the Gateway. Test this using an unmodified
 client; a fixture URL rewriter does not establish client compatibility.
 
