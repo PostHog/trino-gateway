@@ -65,31 +65,43 @@ final class TestDatabaseMigrationsPostgreSql
     public void testLegacyForkHistoryIsRenumbered()
     {
         // Schema + history shape of a deployment that applied this fork's original V5-V12
-        // numbering, before the 2026-10 upstream merge renumbered them to V7-V14. The base
-        // V1-V4 migrations are applied for real so the pending upstream V5/V6 (applied
-        // out-of-order after renumbering) find the tables they alter.
+        // numbering, before the 2026-10 upstream merge renumbered them to V7-V14. All legacy
+        // migrations are applied for real under their current file names so the renumbered
+        // rows match the actual schema and checksum repair can realign them.
         Path migrations = Path.of("src/main/resources/postgresql");
+        // Applied file (current name on disk) and the script/version pair an old gateway
+        // build recorded for it: the fork applied V5-V12 with these names and numbers.
+        String[][] legacyScripts = {
+                {"V1__create_schema.sql", "V1__create_schema.sql"},
+                {"V2__add_routingGroup_to_query_history.sql", "V2__add_routingGroup_to_query_history.sql"},
+                {"V3__add_externalUrl_to_query_history.sql", "V3__add_externalUrl_to_query_history.sql"},
+                {"V4__update_query_text_column_type.sql", "V4__update_query_text_column_type.sql"},
+                {"V7__transaction_awareness.sql", "V5__transaction_awareness.sql"},
+                {"V8__backend_incarnation_history.sql", "V6__backend_incarnation_history.sql"},
+                {"V9__query_capabilities.sql", "V7__query_capabilities.sql"},
+                {"V10__drain_obligation_indexes.sql", "V8__drain_obligation_indexes.sql"},
+                {"V11__cell_rollout_operations.sql", "V9__cell_rollout_operations.sql"},
+                {"V12__pool_member_lifecycle.sql", "V10__pool_member_lifecycle.sql"},
+                {"V13__pool_tenant_principals.sql", "V11__pool_tenant_principals.sql"},
+                {"V14__drain_reconciliation_index.sql", "V12__drain_reconciliation_index.sql"},
+        };
+        int[] legacyVersions = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
         jdbi.useHandle(handle -> {
-            for (int version = 1; version <= 4; version++) {
+            for (String[] script : legacyScripts) {
                 try {
-                    handle.execute(Files.readString(migrations.resolve("V" + version + "__" + switch (version) {
-                        case 1 -> "create_schema";
-                        case 2 -> "add_routingGroup_to_query_history";
-                        case 3 -> "add_externalUrl_to_query_history";
-                        default -> "update_query_text_column_type";
-                    } + ".sql")));
+                    handle.createScript(Files.readString(migrations.resolve(script[0]))).execute();
                 }
                 catch (IOException e) {
                     throw new RuntimeException(e);
                 }
             }
             handle.execute("CREATE TABLE flyway_schema_history (installed_rank INT, version VARCHAR(50), description VARCHAR(200), type VARCHAR(20), script VARCHAR(1000), checksum INT, installed_by VARCHAR(100), installed_on TIMESTAMP, execution_time INT, success BOOLEAN)");
-            for (int version = 1; version <= 12; version++) {
+            for (int i = 0; i < legacyScripts.length; i++) {
                 handle.execute(
                         "INSERT INTO flyway_schema_history (installed_rank, version, description, type, script, installed_by, installed_on, execution_time, success) VALUES (?, ?, 'legacy', 'SQL', ?, 'test', now(), 0, true)",
-                        version,
-                        String.valueOf(version),
-                        "V" + version + "__legacy.sql");
+                        legacyVersions[i],
+                        String.valueOf(legacyVersions[i]),
+                        legacyScripts[i][1]);
             }
         });
         DataStoreConfiguration config = new DataStoreConfiguration(
@@ -98,8 +110,8 @@ final class TestDatabaseMigrationsPostgreSql
         List<String> versions = jdbi.withHandle(handle -> handle.createQuery("SELECT version FROM flyway_schema_history WHERE type = 'SQL' AND version IS NOT NULL ORDER BY CAST(version AS INT)")
                 .mapTo(String.class).list());
         assertThat(versions).contains("7", "8", "9", "10", "11", "12", "13", "14");
-        List<String> legacyScripts = jdbi.withHandle(handle -> handle.createQuery("SELECT script FROM flyway_schema_history WHERE version IN ('5', '6') AND type = 'SQL'").mapTo(String.class).list());
-        assertThat(legacyScripts)
+        List<String> appliedUpstreamScripts = jdbi.withHandle(handle -> handle.createQuery("SELECT script FROM flyway_schema_history WHERE version IN ('5', '6') AND type = 'SQL'").mapTo(String.class).list());
+        assertThat(appliedUpstreamScripts)
                 .describedAs("upstream V5 and V6 must be applied after renumbering, not left as legacy rows")
                 .containsExactlyInAnyOrder("V5__add_oauth2_routing.sql", "V6__add_tags_to_gateway_backend.sql");
         dropAllTables();

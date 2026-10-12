@@ -51,23 +51,64 @@ public class FlywayMigration
             return;
         }
         log.info("Performing migrations...");
-        FluentConfiguration fluentConfiguration = Flyway.configure()
-                .dataSource(config.getJdbcUrl(), config.getUser(), config.getPassword())
-                .locations(getLocation(config.getJdbcUrl()))
-                .baselineOnMigrate(true)
-                .baselineVersion("0")
-                // Renumbered fork migrations leave lower-numbered upstream migrations (V5, V6)
-                // pending after higher ones; they are new to such databases, not out of order.
-                .outOfOrder(true);
-        if (config.getJdbcUrl().startsWith("jdbc:postgresql:")) {
-            // A transaction-level lock prevents concurrent indexes from finishing their snapshot wait.
-            fluentConfiguration.getConfigurationExtension(PostgreSQLConfigurationExtension.class).setTransactionalLock(false);
+        boolean postgres = config.getJdbcUrl().startsWith("jdbc:postgresql:");
+        // Flyway's non-transactional lock (required for CREATE INDEX CONCURRENTLY in V14) fails
+        // instead of waiting when another gateway pod holds it, crashing later pods on rolling
+        // deploys. Hold our own advisory lock across renumber+repair+migrate so pods serialize;
+        // the lock releases with the connection if the pod dies mid-migration.
+        MigrationLock migrationLock = postgres ? MigrationLock.acquire(config) : MigrationLock.NONE;
+        try {
+            FluentConfiguration fluentConfiguration = Flyway.configure()
+                    .dataSource(config.getJdbcUrl(), config.getUser(), config.getPassword())
+                    .locations(getLocation(config.getJdbcUrl()))
+                    .baselineOnMigrate(true)
+                    .baselineVersion("0")
+                    // Renumbered fork migrations leave lower-numbered upstream migrations (V5, V6)
+                    // pending after higher ones; they are new to such databases, not out of order.
+                    .outOfOrder(true);
+            if (postgres) {
+                // A transaction-level lock prevents concurrent indexes from finishing their snapshot wait.
+                fluentConfiguration.getConfigurationExtension(PostgreSQLConfigurationExtension.class).setTransactionalLock(false);
+            }
+            Flyway flyway = fluentConfiguration.load();
+            renumberLegacyForkMigrations(config);
+            flyway.repair();
+            MigrateResult migrations = flyway.migrate();
+            log.info("Performed %s migrations", migrations.migrationsExecuted);
         }
-        Flyway flyway = fluentConfiguration.load();
-        renumberLegacyForkMigrations(config);
-        flyway.repair();
-        MigrateResult migrations = flyway.migrate();
-        log.info("Performed %s migrations", migrations.migrationsExecuted);
+        finally {
+            migrationLock.release();
+        }
+    }
+
+    private record MigrationLock(Connection connection)
+    {
+        private static final MigrationLock NONE = new MigrationLock(null);
+
+        private static MigrationLock acquire(DataStoreConfiguration config)
+        {
+            try {
+                Connection connection = java.sql.DriverManager.getConnection(config.getJdbcUrl(), config.getUser(), config.getPassword());
+                connection.createStatement().execute("SELECT pg_advisory_lock(7272727, 7272727)");
+                return new MigrationLock(connection);
+            }
+            catch (SQLException e) {
+                throw new RuntimeException("Failed to acquire flyway migration lock", e);
+            }
+        }
+
+        private void release()
+        {
+            if (connection != null) {
+                try {
+                    connection.createStatement().execute("SELECT pg_advisory_unlock(7272727, 7272727)");
+                    connection.close();
+                }
+                catch (SQLException e) {
+                    log.warn(e, "Failed to release flyway migration lock");
+                }
+            }
+        }
     }
 
     // The 2026-10 upstream merge renumbered this fork's PostgreSQL migrations V5-V12 to V7-V14 to
@@ -78,35 +119,30 @@ public class FlywayMigration
 
     private static void renumberLegacyForkMigrations(DataStoreConfiguration config)
     {
-        // Runs before flyway.migrate(), whose advisory/increment locks do not cover this rewrite;
-        // a PostgreSQL advisory lock serializes concurrent gateway pods, and the single CASE
-        // statement keeps the rewrite atomic per row so overlapping non-PostgreSQL pods converge.
-        boolean postgres = config.getJdbcUrl().startsWith("jdbc:postgresql:");
-        String caseStatement = "UPDATE flyway_schema_history SET version = CASE version " +
-                "WHEN '5' THEN '7' WHEN '6' THEN '8' WHEN '7' THEN '9' WHEN '8' THEN '10' " +
-                "WHEN '9' THEN '11' WHEN '10' THEN '12' WHEN '11' THEN '13' WHEN '12' THEN '14' END " +
-                "WHERE version IN ('5', '6', '7', '8', '9', '10', '11', '12') AND script ~ '^V(5|6|7|8|9|10|11|12)__'";
+        // Keyed by script name, not by version: rows written by an older gateway build carry
+        // the old script names, and only those rows are the legacy numbering. Idempotent and
+        // safe against rows already renumbered or applied by a newer build.
+        String caseStatement = "UPDATE flyway_schema_history SET version = CASE script " +
+                "WHEN 'V5__transaction_awareness.sql' THEN '7' " +
+                "WHEN 'V6__backend_incarnation_history.sql' THEN '8' " +
+                "WHEN 'V7__query_capabilities.sql' THEN '9' " +
+                "WHEN 'V8__drain_obligation_indexes.sql' THEN '10' " +
+                "WHEN 'V9__cell_rollout_operations.sql' THEN '11' " +
+                "WHEN 'V10__pool_member_lifecycle.sql' THEN '12' " +
+                "WHEN 'V11__pool_tenant_principals.sql' THEN '13' " +
+                "WHEN 'V12__drain_reconciliation_index.sql' THEN '14' END " +
+                "WHERE script IN ('V5__transaction_awareness.sql', 'V6__backend_incarnation_history.sql', 'V7__query_capabilities.sql', 'V8__drain_obligation_indexes.sql', " +
+                "'V9__cell_rollout_operations.sql', 'V10__pool_member_lifecycle.sql', 'V11__pool_tenant_principals.sql', 'V12__drain_reconciliation_index.sql')";
         try (Connection connection = java.sql.DriverManager.getConnection(config.getJdbcUrl(), config.getUser(), config.getPassword());
                 Statement statement = connection.createStatement()) {
-            if (postgres) {
-                statement.execute("SELECT pg_advisory_lock(7272727)");
-            }
-            try {
-                int updated = statement.executeUpdate(postgres ? caseStatement : caseStatement.replace("~", "REGEXP"));
-                if (updated > 0) {
-                    log.info("Renumbered %s legacy fork flyway history rows (V5-V12 -> V7-V14)", updated);
-                }
-            }
-            catch (SQLException e) {
-                // Table does not exist yet (fresh database) — nothing to renumber.
-                log.debug("Skipping flyway history renumbering: %s", e.getMessage());
-            }
-            if (postgres) {
-                statement.execute("SELECT pg_advisory_unlock(7272727)");
+            int updated = statement.executeUpdate(caseStatement);
+            if (updated > 0) {
+                log.info("Renumbered %s legacy fork flyway history rows (V5-V12 -> V7-V14)", updated);
             }
         }
         catch (SQLException e) {
-            throw new RuntimeException("Failed to renumber legacy fork migrations in flyway_schema_history", e);
+            // Table does not exist yet (fresh database) — nothing to renumber.
+            log.debug("Skipping flyway history renumbering: %s", e.getMessage());
         }
     }
 }
