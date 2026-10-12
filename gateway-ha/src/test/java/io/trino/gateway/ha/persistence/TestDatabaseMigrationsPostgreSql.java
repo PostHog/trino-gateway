@@ -13,9 +13,17 @@
  */
 package io.trino.gateway.ha.persistence;
 
+import io.trino.gateway.ha.config.DataStoreConfiguration;
 import org.jdbi.v3.core.Handle;
+import org.junit.jupiter.api.Test;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
 
 import static io.trino.gateway.ha.util.TestcontainersUtils.createPostgreSqlContainer;
+import static org.assertj.core.api.Assertions.assertThat;
 
 final class TestDatabaseMigrationsPostgreSql
         extends BaseTestDatabaseMigrations
@@ -53,6 +61,62 @@ final class TestDatabaseMigrationsPostgreSql
         jdbiHandle.close();
     }
 
+    @Test
+    public void testLegacyForkHistoryIsRenumbered()
+    {
+        // Schema + history shape of a deployment that applied this fork's original V5-V12
+        // numbering, before the 2026-10 upstream merge renumbered them to V7-V14. All legacy
+        // migrations are applied for real under their current file names so the renumbered
+        // rows match the actual schema and checksum repair can realign them.
+        Path migrations = Path.of("src/main/resources/postgresql");
+        // Applied file (current name on disk) and the script/version pair an old gateway
+        // build recorded for it: the fork applied V5-V12 with these names and numbers.
+        String[][] legacyScripts = {
+                {"V1__create_schema.sql", "V1__create_schema.sql"},
+                {"V2__add_routingGroup_to_query_history.sql", "V2__add_routingGroup_to_query_history.sql"},
+                {"V3__add_externalUrl_to_query_history.sql", "V3__add_externalUrl_to_query_history.sql"},
+                {"V4__update_query_text_column_type.sql", "V4__update_query_text_column_type.sql"},
+                {"V7__transaction_awareness.sql", "V5__transaction_awareness.sql"},
+                {"V8__backend_incarnation_history.sql", "V6__backend_incarnation_history.sql"},
+                {"V9__query_capabilities.sql", "V7__query_capabilities.sql"},
+                {"V10__drain_obligation_indexes.sql", "V8__drain_obligation_indexes.sql"},
+                {"V11__cell_rollout_operations.sql", "V9__cell_rollout_operations.sql"},
+                {"V12__pool_member_lifecycle.sql", "V10__pool_member_lifecycle.sql"},
+                {"V13__pool_tenant_principals.sql", "V11__pool_tenant_principals.sql"},
+                {"V14__drain_reconciliation_index.sql", "V12__drain_reconciliation_index.sql"},
+        };
+        int[] legacyVersions = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+        jdbi.useHandle(handle -> {
+            for (String[] script : legacyScripts) {
+                try {
+                    handle.createScript(Files.readString(migrations.resolve(script[0]))).execute();
+                }
+                catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            }
+            handle.execute("CREATE TABLE flyway_schema_history (installed_rank INT, version VARCHAR(50), description VARCHAR(200), type VARCHAR(20), script VARCHAR(1000), checksum INT, installed_by VARCHAR(100), installed_on TIMESTAMP, execution_time INT, success BOOLEAN)");
+            for (int i = 0; i < legacyScripts.length; i++) {
+                handle.execute(
+                        "INSERT INTO flyway_schema_history (installed_rank, version, description, type, script, installed_by, installed_on, execution_time, success) VALUES (?, ?, 'legacy', 'SQL', ?, 'test', now(), 0, true)",
+                        legacyVersions[i],
+                        String.valueOf(legacyVersions[i]),
+                        legacyScripts[i][1]);
+            }
+        });
+        DataStoreConfiguration config = new DataStoreConfiguration(
+                container.getJdbcUrl(), container.getUsername(), container.getPassword(), null, true, 4, true, null);
+        FlywayMigration.migrate(config);
+        List<String> versions = jdbi.withHandle(handle -> handle.createQuery("SELECT version FROM flyway_schema_history WHERE type = 'SQL' AND version IS NOT NULL ORDER BY CAST(version AS INT)")
+                .mapTo(String.class).list());
+        assertThat(versions).contains("7", "8", "9", "10", "11", "12", "13", "14");
+        List<String> appliedUpstreamScripts = jdbi.withHandle(handle -> handle.createQuery("SELECT script FROM flyway_schema_history WHERE version IN ('5', '6') AND type = 'SQL'").mapTo(String.class).list());
+        assertThat(appliedUpstreamScripts)
+                .describedAs("upstream V5 and V6 must be applied after renumbering, not left as legacy rows")
+                .containsExactlyInAnyOrder("V5__add_oauth2_routing.sql", "V6__add_tags_to_gateway_backend.sql");
+        dropAllTables();
+    }
+
     @Override
     protected void verifyGatewaySchema()
     {
@@ -78,20 +142,20 @@ final class TestDatabaseMigrationsPostgreSql
     protected void dropAllTables()
     {
         jdbi.useHandle(handle -> {
-            handle.execute("DROP TABLE pool_tenant_principal");
-            handle.execute("DROP TABLE pool_publication_receipt");
-            handle.execute("DROP TABLE pool_publication");
-            handle.execute("DROP TABLE pool_tenant_admission");
-            handle.execute("DROP TABLE pool_failure_receipt");
-            handle.execute("DROP TABLE pool_member_certificate");
-            handle.execute("DROP TABLE pool_operation");
-            handle.execute("DROP TABLE transaction_rollout");
-            handle.execute("DROP TABLE transaction_admission");
-            handle.execute("DROP TABLE transaction_query_capability");
-            handle.execute("DROP TABLE transaction_query");
-            handle.execute("DROP TABLE transaction_binding");
+            handle.execute("DROP TABLE IF EXISTS pool_tenant_principal");
+            handle.execute("DROP TABLE IF EXISTS pool_publication_receipt");
+            handle.execute("DROP TABLE IF EXISTS pool_publication");
+            handle.execute("DROP TABLE IF EXISTS pool_tenant_admission");
+            handle.execute("DROP TABLE IF EXISTS pool_failure_receipt");
+            handle.execute("DROP TABLE IF EXISTS pool_member_certificate");
+            handle.execute("DROP TABLE IF EXISTS pool_operation");
+            handle.execute("DROP TABLE IF EXISTS transaction_rollout");
+            handle.execute("DROP TABLE IF EXISTS transaction_admission");
+            handle.execute("DROP TABLE IF EXISTS transaction_query_capability");
+            handle.execute("DROP TABLE IF EXISTS transaction_query");
+            handle.execute("DROP TABLE IF EXISTS transaction_binding");
             // These tables reference each other, so remove them in one statement.
-            handle.execute("DROP TABLE transaction_backend, pool, transaction_route");
+            handle.execute("DROP TABLE IF EXISTS transaction_backend, pool, transaction_route");
         });
         super.dropAllTables();
     }

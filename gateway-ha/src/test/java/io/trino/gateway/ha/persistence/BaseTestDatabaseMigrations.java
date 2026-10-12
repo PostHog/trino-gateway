@@ -37,7 +37,7 @@ public abstract class BaseTestDatabaseMigrations
 {
     protected abstract void createGatewaySchema();
 
-    private final JdbcDatabaseContainer<?> container;
+    protected final JdbcDatabaseContainer<?> container;
     protected final String schema;
     protected final Jdbi jdbi;
 
