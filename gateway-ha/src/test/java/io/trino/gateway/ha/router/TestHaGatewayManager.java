@@ -20,16 +20,23 @@ import io.trino.gateway.ha.config.DatabaseCacheConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.config.RoutingConfiguration;
 import io.trino.gateway.ha.persistence.JdbcConnectionManager;
+import org.jdbi.v3.core.Jdbi;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.testcontainers.postgresql.PostgreSQLContainer;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.Preconditions.checkArgument;
-import static io.trino.gateway.ha.TestingJdbcConnectionManager.createTestingJdbcConnectionManager;
+import static io.trino.gateway.ha.TestingJdbcConnectionManager.createTestingPostgresContainer;
 import static io.trino.gateway.ha.TestingJdbcConnectionManager.dataStoreConfig;
-import static io.trino.gateway.ha.TestingJdbcConnectionManager.destroyTestingDatabase;
+import static io.trino.gateway.ha.router.HaGatewayManager.tagsFromString;
+import static io.trino.gateway.ha.router.HaGatewayManager.tagsToString;
+import static java.util.Arrays.asList;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -37,21 +44,35 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @TestInstance(Lifecycle.PER_CLASS)
 final class TestHaGatewayManager
 {
+    private final PostgreSQLContainer postgres = createTestingPostgresContainer();
+    private final Jdbi jdbi = new JdbcConnectionManager(dataStoreConfig(postgres)).getJdbi();
+
+    @AfterAll
+    public final void close()
+    {
+        postgres.close();
+    }
+
+    @BeforeEach
+    void cleanUp()
+    {
+        // The container is shared by every test in this class, so start each one from an empty table
+        jdbi.useHandle(handle -> handle.execute("DELETE FROM gateway_backend"));
+    }
+
     @Test
     void testGatewayManagerWithCache()
     {
-        JdbcConnectionManager connectionManager = createTestingJdbcConnectionManager(dataStoreConfig());
         DatabaseCacheConfiguration cacheConfiguration = new DatabaseCacheConfiguration();
         cacheConfiguration.setEnabled(true);
         cacheConfiguration.setRefreshAfterWrite(new Duration(5, SECONDS));
-        testGatewayManager(new HaGatewayManager(connectionManager.getJdbi(), new RoutingConfiguration(), cacheConfiguration));
+        testGatewayManager(new HaGatewayManager(jdbi, new RoutingConfiguration(), cacheConfiguration));
     }
 
     @Test
     void testGatewayManagerWithoutCache()
     {
-        JdbcConnectionManager connectionManager = createTestingJdbcConnectionManager(dataStoreConfig());
-        testGatewayManager(new HaGatewayManager(connectionManager.getJdbi(), new RoutingConfiguration(), new DatabaseCacheConfiguration()));
+        testGatewayManager(new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration()));
     }
 
     static void testGatewayManager(HaGatewayManager haGatewayManager)
@@ -117,8 +138,10 @@ final class TestHaGatewayManager
     @Test
     void testGatewayManagerCacheExpire()
     {
-        DataStoreConfiguration dataStoreConfig = dataStoreConfig();
-        JdbcConnectionManager connectionManager = createTestingJdbcConnectionManager(dataStoreConfig);
+        // This test stops the database, so it needs a container of its own
+        PostgreSQLContainer postgres = createTestingPostgresContainer();
+        DataStoreConfiguration dataStoreConfig = dataStoreConfig(postgres);
+        JdbcConnectionManager connectionManager = new JdbcConnectionManager(dataStoreConfig);
         DatabaseCacheConfiguration cacheConfiguration = new DatabaseCacheConfiguration();
         cacheConfiguration.setEnabled(true);
         cacheConfiguration.setRefreshAfterWrite(new Duration(3, SECONDS));
@@ -138,7 +161,7 @@ final class TestHaGatewayManager
         assertThat(haGatewayManager.getBackendByName("new-etl1").map(ProxyBackendConfiguration::getProxyTo)).hasValue("https://etl1.trino.gateway.io:443");
 
         // Test read from cache when DB is not available
-        destroyTestingDatabase(dataStoreConfig);
+        postgres.stop();
         assertThat(haGatewayManager.getBackendByName("new-etl1").map(ProxyBackendConfiguration::getProxyTo)).hasValue("https://etl1.trino.gateway.io:443");
 
         // Failed to refresh from DB, but still read from cache
@@ -151,10 +174,164 @@ final class TestHaGatewayManager
     }
 
     @Test
+    void testAddBackendWithTags()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("tagged-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("tagged.trino.gateway.io");
+        backend.setExternalUrl("tagged.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("prod", "us-east-1"));
+
+        haGatewayManager.addBackend(backend);
+
+        ProxyBackendConfiguration retrieved = haGatewayManager.getBackendByName("tagged-backend").orElseThrow();
+        assertThat(retrieved.getTags()).containsExactly("prod", "us-east-1");
+    }
+
+    @Test
+    void testAddBackendWithoutTagsReturnsEmptyList()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("untagged-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("untagged.trino.gateway.io");
+        backend.setExternalUrl("untagged.trino.gateway.io");
+        backend.setActive(true);
+        // tags not set — defaults to empty list
+
+        haGatewayManager.addBackend(backend);
+
+        ProxyBackendConfiguration retrieved = haGatewayManager.getBackendByName("untagged-backend").orElseThrow();
+        assertThat(retrieved.getTags()).isEmpty();
+    }
+
+    @Test
+    void testUpdateBackendTags()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("update-tags-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("update-tags.trino.gateway.io");
+        backend.setExternalUrl("update-tags.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("dev"));
+        haGatewayManager.addBackend(backend);
+
+        backend.setTags(List.of("prod", "critical"));
+        haGatewayManager.updateBackend(backend);
+
+        ProxyBackendConfiguration retrieved = haGatewayManager.getBackendByName("update-tags-backend").orElseThrow();
+        assertThat(retrieved.getTags()).containsExactly("prod", "critical");
+    }
+
+    @Test
+    void testClearBackendTags()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("clear-tags-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("clear-tags.trino.gateway.io");
+        backend.setExternalUrl("clear-tags.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("to-be-removed"));
+        haGatewayManager.addBackend(backend);
+
+        backend.setTags(List.of());
+        haGatewayManager.updateBackend(backend);
+
+        ProxyBackendConfiguration retrieved = haGatewayManager.getBackendByName("clear-tags-backend").orElseThrow();
+        assertThat(retrieved.getTags()).isEmpty();
+    }
+
+    @Test
+    void testTagsAreIncludedInGetAllBackends()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("all-backends-tags-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("all-backends-tags.trino.gateway.io");
+        backend.setExternalUrl("all-backends-tags.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("env:prod", "region:us-west-2"));
+        haGatewayManager.addBackend(backend);
+
+        List<ProxyBackendConfiguration> allBackends = haGatewayManager.getAllBackends();
+        ProxyBackendConfiguration match = allBackends.stream()
+                .filter(b -> b.getName().equals("all-backends-tags-backend"))
+                .findFirst()
+                .orElseThrow();
+        assertThat(match.getTags()).containsExactly("env:prod", "region:us-west-2");
+    }
+
+    @Test
+    void testAddBackendRejectsTagWithComma()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("comma-tag-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("comma-tag.trino.gateway.io");
+        backend.setExternalUrl("comma-tag.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("version - 480,475"));
+
+        assertThatThrownBy(() -> haGatewayManager.addBackend(backend))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Backend tag cannot contain ',' character")
+                .hasMessageContaining("version - 480,475");
+    }
+
+    @Test
+    void testAddBackendNormalizesTags()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("normalized-tag-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("normalized-tag.trino.gateway.io");
+        backend.setExternalUrl("normalized-tag.trino.gateway.io");
+        backend.setActive(true);
+        // null and blank tags are dropped, surrounding whitespace is trimmed and duplicates are removed
+        backend.setTags(asList("env:prod", null, "   ", " env:prod ", "size:XL"));
+        assertThat(backend.getTags()).containsExactly("env:prod", "size:XL");
+
+        haGatewayManager.addBackend(backend);
+
+        ProxyBackendConfiguration retrieved = haGatewayManager.getBackendByName("normalized-tag-backend").orElseThrow();
+        assertThat(retrieved.getTags()).containsExactly("env:prod", "size:XL");
+    }
+
+    @Test
+    void testUpdateBackendRejectsTagWithComma()
+    {
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("update-comma-tag-backend");
+        backend.setRoutingGroup("adhoc");
+        backend.setProxyTo("update-comma-tag.trino.gateway.io");
+        backend.setExternalUrl("update-comma-tag.trino.gateway.io");
+        backend.setActive(true);
+        backend.setTags(List.of("env:prod"));
+        haGatewayManager.addBackend(backend);
+
+        backend.setTags(List.of("a,b"));
+        assertThatThrownBy(() -> haGatewayManager.updateBackend(backend))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Backend tag cannot contain ',' character");
+    }
+
+    @Test
     void testRemoveTrailingSlashInUrl()
     {
-        JdbcConnectionManager connectionManager = createTestingJdbcConnectionManager(dataStoreConfig());
-        HaGatewayManager haGatewayManager = new HaGatewayManager(connectionManager.getJdbi(), new RoutingConfiguration(), new DatabaseCacheConfiguration());
+        HaGatewayManager haGatewayManager = new HaGatewayManager(jdbi, new RoutingConfiguration(), new DatabaseCacheConfiguration());
 
         ProxyBackendConfiguration etl = new ProxyBackendConfiguration();
         etl.setActive(false);
@@ -177,6 +354,34 @@ final class TestHaGatewayManager
 
         assertThat(haGatewayManager.getBackendByName("new-etl1").map(ProxyBackendConfiguration::getProxyTo)).hasValue("https://etl2.trino.gateway.io:443");
         assertThat(haGatewayManager.getBackendByName("new-etl1").map(ProxyBackendConfiguration::getExternalUrl)).hasValue("https://etl2.trino.gateway.io:443");
+    }
+
+    @Test
+    void testTagsToString()
+    {
+        assertThat(tagsToString(null)).isNull();
+        assertThat(tagsToString(List.of())).isNull();
+        assertThat(tagsToString(List.of("prod"))).isEqualTo("prod");
+        assertThat(tagsToString(List.of("prod", "us-east-1", "critical")))
+                .isEqualTo("prod,us-east-1,critical");
+    }
+
+    @Test
+    void testTagsFromString()
+    {
+        assertThat(tagsFromString(null)).isEmpty();
+        assertThat(tagsFromString("")).isEmpty();
+        assertThat(tagsFromString("   ")).isEmpty();
+        assertThat(tagsFromString("prod")).containsExactly("prod");
+        assertThat(tagsFromString("prod,us-east-1,critical"))
+                .containsExactly("prod", "us-east-1", "critical");
+        assertThat(tagsFromString("prod , us-east-1 , critical"))
+                .containsExactly("prod", "us-east-1", "critical");
+        assertThat(tagsFromString(",prod,,us-east-1,"))
+                .containsExactly("prod", "us-east-1");
+
+        List<String> original = List.of("prod", "us-east-1", "critical");
+        assertThat(tagsFromString(tagsToString(original))).isEqualTo(original);
     }
 
     private static class TestingTicker

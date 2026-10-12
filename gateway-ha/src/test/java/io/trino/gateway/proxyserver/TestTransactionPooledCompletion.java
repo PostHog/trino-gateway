@@ -27,6 +27,7 @@ import io.trino.gateway.ha.persistence.DatabaseDeadline;
 import io.trino.gateway.ha.persistence.FlywayMigration;
 import io.trino.gateway.ha.persistence.GatewayDataSource;
 import io.trino.gateway.ha.router.GatewayBackendManager;
+import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingManager;
@@ -150,7 +151,7 @@ class TestTransactionPooledCompletion
                 HttpClient proxy = mock(HttpClient.class);
                 SettableFuture<ProxyResponse> raw = SettableFuture.create();
                 doReturn(new TestingResponseFuture(raw)).when(proxy).executeAsync(any(), any());
-                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), mock(QueryHistoryManager.class), configuration);
+                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), configuration);
                 handler.setTransactionAwareness(service);
                 try {
                     HttpServletRequest original = request();

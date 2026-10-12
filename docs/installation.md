@@ -55,6 +55,28 @@ You can also disable query history recording to the database by setting
 `queryHistoryEnabled` to `false`. This can be useful in scenarios where you
 want to reduce database load or don't need query history tracking.
 
+To limit the size of each query history record, set
+`queryHistoryMaxQueryTextLength` to the maximum number of characters of query
+text to store. Longer query text is truncated and a
+`-- [truncated by trino-gateway: N of M chars]` comment is appended, so the
+stored value can be slightly longer than the configured limit. By default, the
+full query text is stored.
+
+If `maxPoolSize` is configured and greater than 0, Trino Gateway uses a
+connection pool for data store connections, including Trino Gateway metadata,
+query history, and the pins for
+[OAuth2 token-exchange routing](#configure-oauth2-token-exchange-routing).
+If `maxPoolSize` is not configured, Trino Gateway creates a new JDBC connection
+per request.
+A value of `10` is a reasonable starting point for many deployments, but the
+optimal value depends on the database capacity and expected concurrency.
+The optional `keepaliveTime` and `maxLifetime` settings control how frequently
+idle pooled connections are checked and how long a pooled connection can be
+reused. Both accept Airlift-style durations such as `2m` or `30m`. If they are
+not configured, the connection pool defaults are used. A non-zero value below
+`30s`, or a `keepaliveTime` that is not less than `maxLifetime`, is not applied:
+the setting is reset to its default or disabled and a warning is logged.
+
 For example:
 
 ```yaml
@@ -66,7 +88,32 @@ dataStore:
   queryHistoryHoursRetention: 24
   runMigrationsEnabled: false
   queryHistoryEnabled: true  # Set to false to disable query history recording
+  queryHistoryMaxQueryTextLength: 10000  # Optional: truncate stored query text
+  maxPoolSize: 10            # Optional: enables JDBC connection pooling for the data store
+  keepaliveTime: 2m          # Optional: interval for checking idle pooled connections
+  maxLifetime: 30m           # Optional: maximum lifetime of a pooled connection
 ```
+
+Keep the pool small. Trino Gateway uses the data store for backend metadata,
+query history, and periodic cleanup. Each query submitted through Trino Gateway
+inserts a query history record while the request is proxied, so the pool must
+keep up with the query submission rate. Each insert is short, so a large pool is
+rarely beneficial. HikariCP recommends a fixed-size pool sized roughly as
+`(cpu_cores * 2) + effective_spindles` for the Trino Gateway host, and the
+default of `10` suits most deployments. Never set `maxPoolSize` higher
+than what the database allows across all Trino Gateway instances, such as
+PostgreSQL or MySQL `max_connections`, or the Oracle `sessions` and `processes`
+limits. At high scale, an external pooler such as PgBouncer is often a better
+fit than a large pool.
+
+Set `maxLifetime` a few seconds shorter than the shortest connection lifetime
+enforced by the database or infrastructure, such as a load balancer idle timeout
+or the MySQL `wait_timeout`. Keep `keepaliveTime` shorter than `maxLifetime`.
+
+For the rationale and the full set of pool tuning options, see the HikariCP
+documentation on [pool
+sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing) and
+[configuration](https://github.com/brettwooldridge/HikariCP#gear-configuration-knobs-baby).
 
 `Flyway` uses a transactional lock in databases that support it such as 
 [PostgreSQL](https://documentation.red-gate.com/fd/postgresql-database-235241807.html#).
@@ -158,6 +205,58 @@ dataStore:
 ### Configure routing rules
 
 Find more information in the [routing rules documentation](routing-rules.md).
+
+### Configure OAuth2 token-exchange routing
+
+Trino's OAuth2 token-exchange handshake spans two HTTP clients that share only
+an `authId`: the driver/CLI poll loop (`GET /oauth2/token/{authId}`) and the
+browser (`GET /oauth2/token/initiate/{authIdHash}`, returning from the identity
+provider to `GET /oauth2/callback`). Only the coordinator that issued the
+original `401` challenge holds the in-memory exchange state for that `authId`,
+so in a multi-coordinator deployment normal routing can send these requests to
+a different backend and stall the login. This is separate from the existing
+cookie-based browser routing (see
+[Routing logic](routing-logic.md#routing-based-on-cookies)), which cannot help
+on its own since the driver and browser are different HTTP clients.
+
+Enable pinning of OAuth2 token-exchange requests to the coordinator that
+minted the `authId` with:
+
+```yaml
+routing:
+  oauth2RoutingEnabled: true   # default false
+```
+
+Pins are recorded in the `oauth2_routing` table so they are shared across
+gateway instances. This table is created automatically by the database
+migrations run on startup (see [Backend database](#backend-database)), so no
+separate database or manual setup is required as long as migrations are enabled.
+If you have set `runMigrationsEnabled` to `false`, the table is not created for
+you: you must provision it manually using the DDL below, otherwise pins cannot
+be persisted and OAuth2 routing silently falls back to normal routing. For
+reference, the DDL (identical for MySQL and PostgreSQL; Oracle uses `NUMBER` for
+the `created` column) is:
+
+```sql
+CREATE TABLE IF NOT EXISTS oauth2_routing (
+oauth_id VARCHAR(256) PRIMARY KEY,
+backend_url VARCHAR (256),
+created bigint
+);
+CREATE INDEX oauth2_routing_created_idx ON oauth2_routing(created);
+```
+
+If the pinned coordinator becomes unhealthy or inactive, the pin is dropped
+and the client is forced to re-authenticate, since the handshake cannot be
+recovered on another backend.
+
+Stored pins are retained for 1 hour by default, and are pruned automatically.
+The retention period can be adjusted (as a duration with a time unit) with:
+
+```yaml
+dataStore:
+  oauth2RoutingRetention: "1h"    # e.g. "90s", "10m", "2h"
+```
 
 ### Configure logging <a name="logging">
 

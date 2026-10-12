@@ -16,9 +16,9 @@ package io.trino.gateway.ha.persistence;
 import io.airlift.log.Logger;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import org.flywaydb.core.Flyway;
+import org.flywaydb.core.api.configuration.FluentConfiguration;
 import org.flywaydb.core.api.output.MigrateResult;
-
-import java.util.Map;
+import org.flywaydb.database.postgresql.PostgreSQLConfigurationExtension;
 
 public class FlywayMigration
 {
@@ -47,16 +47,16 @@ public class FlywayMigration
             return;
         }
         log.info("Performing migrations...");
-        Flyway flyway = Flyway.configure()
+        FluentConfiguration fluentConfiguration = Flyway.configure()
                 .dataSource(config.getJdbcUrl(), config.getUser(), config.getPassword())
                 .locations(getLocation(config.getJdbcUrl()))
                 .baselineOnMigrate(true)
-                .baselineVersion("0")
-                // A transaction-level lock prevents concurrent indexes from finishing their snapshot wait.
-                .configuration(config.getJdbcUrl().startsWith("jdbc:postgresql:")
-                        ? Map.of("flyway.postgresql.transactional.lock", "false")
-                        : Map.of())
-                .load();
+                .baselineVersion("0");
+        if (config.getJdbcUrl().startsWith("jdbc:postgresql:")) {
+            // A transaction-level lock prevents concurrent indexes from finishing their snapshot wait.
+            fluentConfiguration.getConfigurationExtension(PostgreSQLConfigurationExtension.class).setTransactionalLock(false);
+        }
+        Flyway flyway = fluentConfiguration.load();
         flyway.repair();
         MigrateResult migrations = flyway.migrate();
         log.info("Performed %s migrations", migrations.migrationsExecuted);
