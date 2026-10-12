@@ -339,13 +339,13 @@ class TestTransactionDatabasePool
                     }
                 }
                 if (check.equals("lock")) {
-                    TransactionStore store = new TransactionStore(pooled);
-                    var backend = store.ensureBackend("blue", "http://blue.example.test", null, "group", "node", "abcde");
+                    PooledTransactionStoreFixture store = new PooledTransactionStoreFixture(pooled);
+                    store.ensureBackend("blue", "http://blue.example.test", null, "group", "node", "abcde");
                     var admission = store.admitNew("blue", "owner", "group");
                     try (var blocker = admin.open(); var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
                         blocker.begin();
-                        blocker.createQuery("SELECT incarnation FROM " + schema + ".transaction_backend WHERE incarnation = :id FOR UPDATE")
-                                .bind("id", backend.incarnation()).mapTo(UUID.class).one();
+                        blocker.createQuery("SELECT admission_id FROM " + schema + ".transaction_admission WHERE admission_id = :id FOR UPDATE")
+                                .bind("id", admission.id()).mapTo(UUID.class).one();
                         var update = executor.submit(() -> store.markUncertain(admission.id()));
                         try {
                             assertThatThrownBy(() -> update.get(2, java.util.concurrent.TimeUnit.SECONDS))

@@ -34,6 +34,12 @@ import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.module.HaGatewayProviderModule;
 import io.trino.gateway.ha.persistence.FlywayMigration;
 import io.trino.gateway.ha.router.GatewayBackendManager;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Protocol;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -42,6 +48,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.Isolated;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.testcontainers.containers.JdbcDatabaseContainer;
 import org.weakref.jmx.guice.MBeanModule;
 
@@ -197,6 +205,7 @@ class TestPooledTransportHttp
         // TLS terminates in front of the Gateway: the proxy asserts the external protocol and port.
         configuration.getRouting().setForwardedProto("https");
         configuration.getRouting().setForwardedPort(443);
+        configuration.getRouting().setHostnameSuffixToPool(Map.of(DOMAIN, POOL));
         configuration.validate();
         FlywayMigration.migrate(dataStore);
 
@@ -300,6 +309,66 @@ class TestPooledTransportHttp
         database.useHandle(handle -> handle.execute(
                 "TRUNCATE transaction_admission, transaction_query_capability, transaction_query, transaction_binding, query_history CASCADE"));
         database.useHandle(handle -> handle.createUpdate("UPDATE transaction_backend SET state = 'ACTIVE' WHERE instance_id = 'i-1'").execute());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Protocol.class, names = {"HTTP_1_1", "H2_PRIOR_KNOWLEDGE"})
+    void standardStatementDeliveryPreservesThePublicHostAcrossHttpProtocols(Protocol protocol)
+            throws Exception
+    {
+        OkHttpClient client = new OkHttpClient.Builder().protocols(List.of(protocol)).build();
+        try {
+            Request request = new Request.Builder()
+                    .url(gateway.resolve("/v1/statement").toString())
+                    .header("Host", WAREHOUSE_HOST)
+                    .header("Authorization", basic("alice", "correct-password"))
+                    .header("X-Trino-User", "alice")
+                    .post(RequestBody.create("SELECT 1", MediaType.parse("text/plain; charset=utf-8")))
+                    .build();
+            try (Response response = client.newCall(request).execute()) {
+                assertThat(response.code()).isEqualTo(200);
+                assertThat(response.protocol()).isEqualTo(protocol);
+                assertThat(response.header("X-Trino-Started-Transaction-Id")).isEqualTo(TRANSACTION);
+                assertThat(response.body()).isNotNull();
+                assertThat(response.body().string()).contains("\"nextUri\"");
+            }
+            Exchange statement = lastStatementExchange();
+            assertThat(statement.method()).isEqualTo("POST");
+            assertThat(statement.path()).isEqualTo("/v1/statement");
+            assertThat(statement.headers().get("X-forwarded-host")).containsExactly(WAREHOUSE_HOST);
+            assertThat(statement.headers().get("X-forwarded-proto")).containsExactly("https");
+            assertThat(statement.headers().get("X-forwarded-port")).containsExactly("443");
+            assertThat(statement.headers().get("Authorization")).containsExactly(basic("alice", "correct-password"));
+            assertThat(count("transaction_query")).isEqualTo(1);
+            assertThat(count("transaction_binding")).isEqualTo(1);
+        }
+        finally {
+            client.connectionPool().evictAll();
+            client.dispatcher().executorService().shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = Protocol.class, names = {"HTTP_1_1", "H2_PRIOR_KNOWLEDGE"})
+    void healthEndpointsNeedNoQueryCredentialsOrPoolSelection(Protocol protocol)
+            throws Exception
+    {
+        OkHttpClient client = new OkHttpClient.Builder().protocols(List.of(protocol)).build();
+        try {
+            for (String path : List.of("/trino-gateway/livez", "/trino-gateway/readyz")) {
+                Request request = new Request.Builder().url(gateway.resolve(path).toString()).build();
+                try (Response response = client.newCall(request).execute()) {
+                    assertThat(response.code()).isEqualTo(200);
+                    assertThat(response.protocol()).isEqualTo(protocol);
+                }
+            }
+            assertThat(exchanges.stream().anyMatch(exchange -> exchange.path().startsWith("/v1/statement"))).isFalse();
+            assertThat(openAdmissions()).isZero();
+        }
+        finally {
+            client.connectionPool().evictAll();
+            client.dispatcher().executorService().shutdown();
+        }
     }
 
     @Test
@@ -534,9 +603,8 @@ class TestPooledTransportHttp
                 .append(method).append(' ').append(path).append(" HTTP/1.1\r\n")
                 .append("Host: ").append(host).append("\r\n");
         if (path.startsWith("/v1/")) {
-            // Selects the pool, never an individual member: the member is chosen by the authoritative
-            // store. Header-free routing is a separate piece of work.
-            request.append("X-Trino-Routing-Group: ").append(POOL).append("\r\n");
+            // This obsolete input must not change the hostname's pool.
+            request.append("X-Trino-Routing-Group: ignored-pool\r\n");
         }
         if (authorization != null) {
             request.append("Authorization: ").append(authorization).append("\r\n");

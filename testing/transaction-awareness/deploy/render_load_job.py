@@ -37,7 +37,7 @@ def render_job(namespace, name, gateway_urls, groups, script, ca_certificate, *,
               "data": {"load_open_loop.py": script, "ca.pem": ca_certificate}}
     if processes == 8:
         config["data"].update(process_sources)
-    environment = {"TX_GATEWAY_URLS": ",".join(gateway_urls), "TX_LOAD_ROUTING_GROUPS": ",".join(groups),
+    environment = {"TX_GATEWAY_URLS": ",".join(gateway_urls), "TX_LOAD_HOSTNAMES": ",".join(groups),
                    "TX_ALLOW_FIXTURE_MUTATION": "yes", "TX_CA_FILE": "/source/ca.pem", "TX_TLS_SERVER_NAME": "gateway",
                    "TX_LOAD_EXPECTED_BACKENDS": json.dumps(expected_backends or {})}
     launch = ("import base64,os,runpy,secrets; "

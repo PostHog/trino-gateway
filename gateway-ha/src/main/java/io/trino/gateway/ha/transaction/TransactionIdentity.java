@@ -67,7 +67,7 @@ public final class TransactionIdentity
         if (user.isBlank() || originalUser.isBlank() || user.length() > 1024 || originalUser.length() > 1024) {
             throw error(400, "Invalid Trino user context");
         }
-        return digest("credential\0" + Base64.getEncoder().encodeToString(credential)) + ":" + digest("context\0" + user + "\0" + originalUser);
+        return digest("credential\0" + TenantPrincipals.requestHost(request).orElse("") + "\0" + Base64.getEncoder().encodeToString(credential)) + ":" + digest("context\0" + user + "\0" + originalUser);
     }
 
     public void validateContinuation(HttpServletRequest request, String recordedOwner)

@@ -17,7 +17,6 @@ import io.airlift.json.JsonCodec;
 import io.trino.gateway.ha.HaGatewayLauncher;
 import io.trino.gateway.ha.HaGatewayTestUtils;
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
-import io.trino.gateway.ha.clustermonitor.TrinoStatus;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -57,33 +56,35 @@ final class TestGatewayResource
     }
 
     @Test
-    void testActivateBackendSetsPendingInHealthCache()
+    void testLegacyActivationPreservesHealthCache()
             throws IOException
     {
+        ClusterStats before = getBackendState("activate-test");
         Request request = new Request.Builder()
                 .url("http://localhost:%s/gateway/backend/activate/activate-test".formatted(routerPort))
                 .post(RequestBody.create("", JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.isSuccessful()).isTrue();
+            assertThat(response.code()).isEqualTo(409);
         }
 
-        assertThat(getBackendState("activate-test").trinoStatus()).isEqualTo(TrinoStatus.PENDING);
+        assertThat(getBackendState("activate-test")).isEqualTo(before);
     }
 
     @Test
-    void testDeactivateBackendSetsUnhealthyInHealthCache()
+    void testLegacyDeactivationPreservesHealthCache()
             throws IOException
     {
+        ClusterStats before = getBackendState("deactivate-test");
         Request request = new Request.Builder()
                 .url("http://localhost:%s/gateway/backend/deactivate/deactivate-test".formatted(routerPort))
                 .post(RequestBody.create("", JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.isSuccessful()).isTrue();
+            assertThat(response.code()).isEqualTo(409);
         }
 
-        assertThat(getBackendState("deactivate-test").trinoStatus()).isEqualTo(TrinoStatus.UNKNOWN);
+        assertThat(getBackendState("deactivate-test")).isEqualTo(before);
     }
 
     @Test
@@ -95,7 +96,7 @@ final class TestGatewayResource
                 .post(RequestBody.create("", JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.code()).isEqualTo(404);
+            assertThat(response.code()).isEqualTo(409);
         }
 
         Request stateRequest = new Request.Builder()
@@ -116,7 +117,7 @@ final class TestGatewayResource
                 .post(RequestBody.create("", JSON))
                 .build();
         try (Response response = httpClient.newCall(request).execute()) {
-            assertThat(response.code()).isEqualTo(404);
+            assertThat(response.code()).isEqualTo(409);
         }
 
         Request stateRequest = new Request.Builder()

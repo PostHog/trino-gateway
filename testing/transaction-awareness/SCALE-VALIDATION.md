@@ -60,8 +60,8 @@ Run the correctness procedures in [VALIDATION.md](VALIDATION.md), including
 database faults, native clients, and Gateway process replacement. Keep any failed
 case and its uncertainty intact before attempting a corrected comparison.
 
-Use [LOAD.md](LOAD.md) for bounded open-loop workloads and
-[MATRIX.md](MATRIX.md) for per-case workload and preservation guards. Compare
+Use [LOAD.md](LOAD.md) for bounded hostname-based open-loop workloads and
+preservation guards. Compare
 identical database, client, payload, monitor cadence, resources, and topology
 between baseline and candidate images. An inherited database is not a fresh
 baseline merely because the measured backend name changed.

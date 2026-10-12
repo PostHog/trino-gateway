@@ -294,6 +294,11 @@ class TestAddClientCertificateJwtHeader
         HaGatewayConfiguration configuration = new HaGatewayConfiguration();
         configuration.setRequestAnalyzerConfig(new RequestAnalyzerConfig());
         configuration.setClientCertificateJwtAuthentication(authConfig);
+        io.trino.gateway.ha.config.DataStoreConfiguration database = new io.trino.gateway.ha.config.DataStoreConfiguration();
+        database.setJdbcUrl("jdbc:postgresql://localhost/unused_certificate_unit_test");
+        configuration.setDataStore(database);
+        configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-certificate-unit-tests");
+        configuration.getTransactionAwareness().setAdminToken("synthetic-admin-token-for-certificate-unit-tests");
 
         assertThatThrownBy(configuration::validate)
                 .isInstanceOf(HaGatewayConfiguration.HaGatewayConfigurationException.class)

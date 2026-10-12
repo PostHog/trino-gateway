@@ -33,7 +33,6 @@ public class HaGatewayConfiguration
     private DataStoreConfiguration dataStore;
     private MonitorConfiguration monitor = new MonitorConfiguration();
     private RoutingConfiguration routing = new RoutingConfiguration();
-    private RoutingRulesConfiguration routingRules = new RoutingRulesConfiguration();
     private AuthenticationConfiguration authentication;
     private AuthorizationConfiguration authorization;
     private Map<String, UserConfiguration> presetUsers = new HashMap<>();
@@ -41,8 +40,6 @@ public class HaGatewayConfiguration
     private BackendStateConfiguration backendState;
     private ClusterStatsConfiguration clusterStatsConfiguration;
     private List<String> extraWhitelistPaths = new ArrayList<>();
-    private OAuth2GatewayCookieConfiguration oauth2GatewayCookieConfiguration = new OAuth2GatewayCookieConfiguration();
-    private GatewayCookieConfiguration gatewayCookieConfiguration = new GatewayCookieConfiguration();
     private List<String> statementPaths = ImmutableList.of(V1_STATEMENT_PATH);
     private boolean includeClusterHostInResponse;
     private ProxyResponseConfiguration proxyResponseConfiguration = new ProxyResponseConfiguration();
@@ -98,16 +95,6 @@ public class HaGatewayConfiguration
     public void setRouting(RoutingConfiguration routing)
     {
         this.routing = routing;
-    }
-
-    public RoutingRulesConfiguration getRoutingRules()
-    {
-        return this.routingRules;
-    }
-
-    public void setRoutingRules(RoutingRulesConfiguration routingRules)
-    {
-        this.routingRules = routingRules;
     }
 
     public AuthenticationConfiguration getAuthentication()
@@ -178,26 +165,6 @@ public class HaGatewayConfiguration
     public void setExtraWhitelistPaths(List<String> extraWhitelistPaths)
     {
         this.extraWhitelistPaths = extraWhitelistPaths;
-    }
-
-    public OAuth2GatewayCookieConfiguration getOauth2GatewayCookieConfiguration()
-    {
-        return oauth2GatewayCookieConfiguration;
-    }
-
-    public void setOauth2GatewayCookieConfiguration(OAuth2GatewayCookieConfiguration oauth2GatewayCookieConfiguration)
-    {
-        this.oauth2GatewayCookieConfiguration = oauth2GatewayCookieConfiguration;
-    }
-
-    public GatewayCookieConfiguration getGatewayCookieConfiguration()
-    {
-        return gatewayCookieConfiguration;
-    }
-
-    public void setGatewayCookieConfiguration(GatewayCookieConfiguration gatewayCookieConfiguration)
-    {
-        this.gatewayCookieConfiguration = gatewayCookieConfiguration;
     }
 
     public RequestAnalyzerConfig getRequestAnalyzerConfig()

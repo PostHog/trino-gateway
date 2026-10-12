@@ -53,6 +53,16 @@ class TestTransactionIdentity
     }
 
     @Test
+    void testTheSameCredentialCannotOwnWorkOnAnotherHostname()
+    {
+        HttpServletRequest first = request(Map.of("Authorization", List.of(basic("alice", "password")), "Host", List.of("first.example.test")));
+        HttpServletRequest second = request(Map.of("Authorization", List.of(basic("alice", "password")), "Host", List.of("second.example.test")));
+        String owner = identity.owner(first);
+        assertThat(identity.owner(second)).isNotEqualTo(owner);
+        assertThatThrownBy(() -> identity.validateContinuation(second, owner)).isInstanceOf(WebApplicationException.class);
+    }
+
+    @Test
     void testHeaderlessAndCredentialOnlyContinuations()
     {
         String owner = identity.owner(request(Map.of("Authorization", List.of(basic("service", "password")), "X-Trino-User", List.of("tenant"))));

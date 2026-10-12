@@ -27,7 +27,7 @@ final class TestRoutingConfiguration
         RoutingConfiguration routingConfiguration = new RoutingConfiguration();
         assertThat(routingConfiguration.getAsyncTimeout()).isEqualTo(new Duration(2, MINUTES));
         assertThat(routingConfiguration.isForwardedHeadersEnabled()).isTrue();
-        assertThat(routingConfiguration.getDefaultRoutingGroup()).isEqualTo("adhoc");
+        assertThat(new ProxyBackendConfiguration().getRoutingGroup()).isNull();
     }
 
     @Test
@@ -41,8 +41,5 @@ final class TestRoutingConfiguration
 
         routingConfiguration.setForwardedHeadersEnabled(false);
         assertThat(routingConfiguration.isForwardedHeadersEnabled()).isFalse();
-
-        routingConfiguration.setDefaultRoutingGroup("batch");
-        assertThat(routingConfiguration.getDefaultRoutingGroup()).isEqualTo("batch");
     }
 }

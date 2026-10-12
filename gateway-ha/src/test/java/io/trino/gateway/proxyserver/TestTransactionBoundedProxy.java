@@ -20,14 +20,12 @@ import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.HttpClient.HttpResponseFuture;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
-import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
-import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.TrinoRequestUser;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService;
 import io.trino.gateway.ha.transaction.TransactionStore;
@@ -76,7 +74,7 @@ class TestTransactionBoundedProxy
 {
     private static final String QUERY = "20260910_120000_00001_abcde";
     private static final String PATH = "/v1/statement/executing/" + QUERY + "/capability/1";
-    private static final BackendRef BACKEND = new BackendRef("blue", UUID.randomUUID(), "http://blue.example.test", "http://blue.example.test", "group", "node", "abcde");
+    private static final BackendRef BACKEND = new BackendRef("blue", UUID.randomUUID(), "http://blue.example.test", "http://blue.example.test", "group", "node", "abcde", "group");
     private MockedConstruction<TransactionStore> construction;
     private TransactionStore store;
     private TransactionAwarenessService service;
@@ -99,13 +97,14 @@ class TestTransactionBoundedProxy
         config.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-adapter-tests");
         config.getTransactionAwareness().setMaxInFlightRequests(1);
         config.getTransactionAwareness().setCompletionThreads(1);
-        GatewayCookieConfigurationPropertiesProvider.getInstance().initialize(config.getGatewayCookieConfiguration());
         HttpClient monitor = mock(HttpClient.class);
         StringResponse info = mock(StringResponse.class);
         when(info.getStatusCode()).thenReturn(200);
         when(info.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
         when(monitor.execute(any(), any())).thenReturn(info);
-        service = new TransactionAwarenessService(config, mock(Jdbi.class), mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class), new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
+        RoutingGroupSelector selector = mock(RoutingGroupSelector.class);
+        when(selector.findRoutingDestination(any())).thenReturn(new io.trino.gateway.ha.router.schema.RoutingSelectorResponse("group"));
+        service = new TransactionAwarenessService(config, mock(Jdbi.class), mock(GatewayBackendManager.class), monitor, selector, new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
         store = construction.constructed().getFirst();
         when(store.getQuery(QUERY)).thenReturn(Optional.of(new QueryBinding(QUERY, "owner", BACKEND, null, false)));
         when(store.admitQuery(anyString(), any(), any(), any())).thenAnswer(_ -> new Admission(UUID.randomUUID(), BACKEND, "owner", null, QUERY));
@@ -114,7 +113,7 @@ class TestTransactionBoundedProxy
         HttpResponseFuture<?> future = new TestingResponseFuture(raw);
         doReturn(future).when(proxy).executeAsync(any(), any());
         history = mock(QueryHistoryManager.class);
-        handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), history, mock(OAuth2RoutingStore.class), config);
+        handler = new ProxyRequestHandler(proxy, history, mock(OAuth2RoutingStore.class), config);
         handler.setTransactionAwareness(service);
     }
 
@@ -343,7 +342,7 @@ class TestTransactionBoundedProxy
         when(request.getHeaderNames()).thenAnswer(_ -> Collections.emptyEnumeration());
         when(request.getAttribute(anyString())).thenAnswer(call -> attributes.get(call.getArgument(0)));
         doAnswer(call -> attributes.put(call.getArgument(0), call.getArgument(1))).when(request).setAttribute(anyString(), any());
-        return service.resolve(request, () -> { throw new AssertionError("Unexpected ordinary routing"); }, _ -> { throw new AssertionError("Unexpected backend selection"); });
+        return service.resolve(request);
     }
 
     private void assertOverloaded()

@@ -1651,31 +1651,26 @@ class TestPoolStore
     // --------------------------------------------------------------------------------------------
 
     @Test
-    void legacyRoutingMutationsFailClosedOncePooled()
+    void legacyConfigurationIsRefusedWithoutChangingPoolAuthority()
     {
-        serving("i-1");
-        assertThatThrownBy(() -> transactions.setRoute(POOL, "backend-i-1"))
-                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-        assertThatThrownBy(() -> transactions.clearRoute(POOL))
-                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-        assertThatThrownBy(() -> transactions.beginDrain("backend-i-1"))
-                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-        assertThatThrownBy(() -> transactions.ensureBackend("backend-i-9", "http://i-9.example.test", null, POOL, "node-i-9", "coord-i-9"))
-                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-        assertThatThrownBy(() -> transactions.admitNew("backend-i-1", "owner", POOL))
-                .isInstanceOfSatisfying(TransactionStore.StoreException.class, failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-    }
+        var empty = first.poolState(POOL).orElseThrow();
+        assertThatThrownBy(() -> first.configurePool(
+                POOL,
+                new Guard("op-legacy-empty", "configure", epoch + 1, PLAN_HASH, "another-controller"),
+                new PoolSpec("LEGACY", 3, 3, 1, 1, "r-1", false),
+                false))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_APIMODE));
+        assertThat(first.poolState(POOL).orElseThrow()).isEqualTo(empty);
 
-    @Test
-    void aPooledModeChangeIsRefusedWhileLiveMembersExist()
-    {
         serving("i-1");
+        var serving = first.poolState(POOL).orElseThrow();
         assertThatThrownBy(() -> first.configurePool(
                 POOL,
                 guard("op-legacy", "configure"),
                 new PoolSpec("LEGACY", 3, 3, 1, 1, "r-1", false),
                 false))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_APIMODE));
+        assertThat(first.poolState(POOL).orElseThrow()).isEqualTo(serving);
     }
 
     @Test
@@ -2274,92 +2269,6 @@ class TestPoolStore
             completion.get(5, TimeUnit.SECONDS);
         }
         assertThat(first.obligations(POOL, "i-1").orElseThrow().activeQueries()).isEqualTo(1);
-    }
-
-    @ParameterizedTest
-    @ValueSource(strings = {"RETIRED", "LOST"})
-    void legacyModeCannotReviveOrRouteAPreviouslyPooledIncarnation(String state)
-    {
-        register("i-1");
-        if (state.equals("RETIRED")) {
-            retire("i-1");
-            retired("i-1");
-        }
-        else {
-            suspect("i-1");
-            lost("i-1");
-        }
-        Member member = first.member(POOL, "i-1").orElseThrow();
-        first.configurePool(POOL, guard("op-switch-legacy", "configure"), new PoolSpec("LEGACY", 1, 1, 1, 1, "r-1", false), false);
-        var route = transactions.routeStatus(POOL);
-        List<Runnable> mutations = List.of(
-                () -> transactions.ensureBackend(member.backendName(), member.url(), member.externalUrl(), POOL, member.nodeId(), member.coordinatorId()),
-                () -> transactions.resume(member.backendName(), member.generation()),
-                () -> transactions.beginDrain(member.backendName()),
-                () -> transactions.seal(member.backendName(), member.generation()),
-                () -> transactions.reincarnate(
-                        member.backendName(),
-                        member.incarnation(),
-                        member.generation(),
-                        new TransactionStore.BackendRef(member.backendName(), UUID.randomUUID(), "http://replacement.example.test", "http://replacement.example.test", POOL, "replacement-node", "replacement-coordinator")),
-                () -> transactions.setRoute(POOL, member.backendName()),
-                () -> transactions.compareAndSetRoute(POOL, route.generation(), route.backendName(), member.backendName(), member.incarnation()),
-                () -> transactions.admitNew(member.backendName(), "owner", POOL));
-        for (Runnable mutation : mutations) {
-            assertThatThrownBy(mutation::run).hasMessageContaining("member lifecycle protocol").isInstanceOfSatisfying(
-                    TransactionStore.StoreException.class,
-                    failure -> assertThat(failure.code()).isEqualTo(TransactionStore.ErrorCode.CONFLICT));
-        }
-        assertThat(first.member(POOL, "i-1").orElseThrow().phase()).isEqualTo(state);
-    }
-
-    @Test
-    void configuringLegacyModeSeesAMemberCommittedWhileWaitingForAuthority()
-            throws Exception
-    {
-        CountDownLatch recordedMember = new CountDownLatch(1);
-        CountDownLatch commitMember = new CountDownLatch(1);
-        AtomicInteger registrarPid = new AtomicInteger();
-        Jdbi pausedDatabase = Jdbi.create(fixtureUrl, fixtureUsername, fixturePassword);
-        pausedDatabase.setSqlLogger(new SqlLogger()
-        {
-            @Override
-            public void logAfterExecution(StatementContext context)
-            {
-                if (context.getRawSql().contains("INSERT INTO pool_operation")) {
-                    try (var statement = context.getConnection().createStatement(); var result = statement.executeQuery("SELECT pg_backend_pid()")) {
-                        result.next();
-                        registrarPid.set(result.getInt(1));
-                        recordedMember.countDown();
-                        if (!commitMember.await(10, TimeUnit.SECONDS)) {
-                            throw new AssertionError("Member registration was not released");
-                        }
-                    }
-                    catch (SQLException | InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }
-            }
-        });
-        try (var executor = Executors.newFixedThreadPool(2)) {
-            try {
-                var registration = executor.submit(() -> new PoolStore(pausedDatabase).registerMember(POOL, guard("op-register-before-mode", "register"), registration("i-1")));
-                assertThat(recordedMember.await(5, TimeUnit.SECONDS)).isTrue();
-                var configuration = executor.submit(() -> new PoolStore(repeatableReadDatabase()).configurePool(
-                        POOL,
-                        guard("op-configure-after-wait", "configure"),
-                        new PoolSpec("LEGACY", 1, 1, 1, 1, "r-1", false),
-                        false));
-                awaitDatabaseWaiter(registrarPid.get());
-                commitMember.countDown();
-                assertThat(registration.get(5, TimeUnit.SECONDS).phase()).isEqualTo("PREPARING");
-                assertThatThrownBy(() -> configuration.get(5, TimeUnit.SECONDS)).satisfies(failure ->
-                        assertThat(failure.getCause()).isInstanceOfSatisfying(PoolException.class, error -> assertThat(error.code()).isEqualTo(POOL_APIMODE)));
-            }
-            finally {
-                commitMember.countDown();
-            }
-        }
     }
 
     private Jdbi repeatableReadDatabase()

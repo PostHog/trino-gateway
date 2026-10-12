@@ -457,34 +457,9 @@ configuration file names.
 
 #### Additional options
 
-To implement routing rules, create a ConfigMap from your routing rules yaml
-definition:
-
-```shell
-kubectl create cm routing-rules --from-file your-routing-rules.yaml
-```
-
-Then mount it to your container:
-
-```yaml
-volumes:
-    - name: routing-rules
-      configMap:
-          name: routing-rules
-          items:
-              name: your-routing-rules.yaml
-              path: your-routing-rules.yaml
-
-volumeMounts:
-    - name: routing-rules
-      mountPath: "/etc/routing-rules/your-routing-rules.yaml"
-      subPath: your-routing-rules.yaml
-```
-
-Ensure that the `mountPath` matches the `rulesConfigPath` specified in your
-configuration. Note that the `subPath` is not strictly necessary, and if it 
-is not specified the file is mounted at `mountPath/<configMap key>`. 
-Kubernetes updates the mounted file when the ConfigMap is updated.
+Configure the `routing.hostnameToPool` and `routing.hostnameSuffixToPool` maps
+in the Gateway configuration. See [Hostname routing](routing-rules.md).
+Separate routing-rule files and external selectors are not supported.
 
 Standard Helm options such as `replicaCount`, `image`, `imagePullSecrets`, 
 `service`, `ingress` and `resources` are supported. These are defined in 

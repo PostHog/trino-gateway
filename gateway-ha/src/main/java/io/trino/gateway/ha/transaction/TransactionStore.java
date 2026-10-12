@@ -21,7 +21,6 @@ import org.jdbi.v3.core.Jdbi;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
@@ -47,22 +46,10 @@ public final class TransactionStore
             """;
 
     private final GatewayDatabase jdbi;
-    private final RolloutStore.Guard operation;
 
     public TransactionStore(Jdbi jdbi)
     {
-        this(jdbi, null);
-    }
-
-    private TransactionStore(Jdbi jdbi, @Nullable RolloutStore.Guard operation)
-    {
         this.jdbi = new GatewayDatabase(requireNonNull(jdbi, "jdbi is null"), GatewayDatabase.Operation.TRANSACTION_STORE);
-        this.operation = operation;
-    }
-
-    public TransactionStore withOperation(RolloutStore.Guard operation)
-    {
-        return new TransactionStore(jdbi.raw(), requireNonNull(operation, "operation is null"));
     }
 
     /**
@@ -99,9 +86,6 @@ public final class TransactionStore
 
     public record DrainStatus(String name, UUID incarnation, String state, long generation, long pendingRequests, long openTransactions, long activeQueries, boolean readyToSeal, boolean drained, @Nullable String nodeId, @Nullable String coordinatorId) {}
 
-    @com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.ALWAYS)
-    public record RouteStatus(String routingGroup, long generation, @Nullable String backendName, @Nullable UUID backendIncarnation) {}
-
     public enum ErrorCode
     {
         NOT_FOUND, OWNER_MISMATCH, CONFLICT, SEALED, NOT_DRAINED, NOT_ACTIVE, STALE_GENERATION, TENANT_NOT_ADMITTED
@@ -123,45 +107,6 @@ public final class TransactionStore
         {
             return code;
         }
-    }
-
-    public BackendRef ensureBackend(String name, String url, @Nullable String externalUrl, String routingGroup, @Nullable String nodeId, @Nullable String coordinatorId)
-    {
-        return ensureBackend(new BackendRef(name, UUID.randomUUID(), url, externalUrl == null ? url : externalUrl, routingGroup, nodeId, coordinatorId));
-    }
-
-    public BackendRef ensureBackend(BackendRef proposed)
-    {
-        BackendRef canonical = new BackendRef(
-                proposed.name(),
-                proposed.incarnation(),
-                proposed.url().replaceAll("/+$", ""),
-                proposed.externalUrl().replaceAll("/+$", ""),
-                proposed.routingGroup(),
-                proposed.nodeId(),
-                proposed.coordinatorId());
-        return jdbi.inReadCommittedTransaction(handle -> {
-            lockRoute(handle, canonical.routingGroup(), false);
-            checkLegacyMode(handle, canonical.routingGroup());
-            handle.createUpdate(
-                            """
-                            INSERT INTO transaction_backend (incarnation, name, current_name, backend_url, external_url, routing_group, node_id, coordinator_id, state)
-                            VALUES (:id, :name, :name, :url, :external, :group, :node, :coordinator, 'ACTIVE')
-                            ON CONFLICT DO NOTHING
-                            """)
-                    .bind("id", canonical.incarnation()).bind("name", canonical.name()).bind("url", canonical.url())
-                    .bind("external", canonical.externalUrl()).bind("group", canonical.routingGroup())
-                    .bind("node", canonical.nodeId()).bind("coordinator", canonical.coordinatorId()).execute();
-            check(findBackend(handle, canonical.name()).isPresent(), ErrorCode.CONFLICT, "Backend endpoint or process already has another identity");
-            BackendRef actual = lockBackend(handle, canonical.name());
-            checkLegacyBackend(actual);
-            check(actual.url().equals(canonical.url()) && actual.externalUrl().equals(canonical.externalUrl()) &&
-                            actual.routingGroup().equals(canonical.routingGroup()) && Objects.equals(actual.nodeId(), canonical.nodeId()) &&
-                            Objects.equals(actual.coordinatorId(), canonical.coordinatorId()),
-                    ErrorCode.CONFLICT,
-                    "Backend incarnation configuration changed");
-            return actual;
-        });
     }
 
     public Optional<BackendRef> getBackend(String name)
@@ -206,20 +151,6 @@ public final class TransactionStore
             check(poolId.equals(memberPool(handle, backend)), ErrorCode.CONFLICT, "Backend is not a member of this pool");
             check(backend.routingGroup().equals(poolId), ErrorCode.CONFLICT, "Backend belongs to another routing group");
             check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Member does not accept new statements");
-            return insertAdmission(handle, backend, ownerHash, null, null);
-        });
-    }
-
-    public Admission admitNew(String candidateName, String ownerHash, String routingGroup)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            lockRoute(handle, routingGroup, false);
-            check(!isPooledMode(handle, routingGroup), ErrorCode.CONFLICT, "Pooled routing groups admit through the member lifecycle protocol");
-            String selected = findRoute(handle, routingGroup).orElse(candidateName);
-            BackendRef backend = shareBackend(handle, selected);
-            checkLegacyBackend(backend);
-            check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
-            check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Backend does not accept new statements");
             return insertAdmission(handle, backend, ownerHash, null, null);
         });
     }
@@ -355,178 +286,12 @@ public final class TransactionStore
         });
     }
 
-    public DrainStatus beginDrain(String name)
-    {
-        return beginDrain(name, null, null);
-    }
-
-    public DrainStatus beginDrain(String name, @Nullable UUID expectedIncarnation, @Nullable Long expectedGeneration)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            BackendRef backend = lockAdministrativeBackend(handle, name, "drain");
-            if (expectedIncarnation != null || expectedGeneration != null) {
-                DrainStatus before = status(handle, backend);
-                check(backend.incarnation().equals(expectedIncarnation) && Objects.equals(before.generation(), expectedGeneration),
-                        ErrorCode.STALE_GENERATION,
-                        "Backend incarnation or generation changed");
-            }
-            handle.createUpdate("UPDATE transaction_backend SET state = 'DRAINING', generation = generation + 1 WHERE incarnation = :id AND state = 'ACTIVE'")
-                    .bind("id", backend.incarnation()).execute();
-            return status(handle, backend);
-        });
-    }
-
     public DrainStatus drainStatus(String name)
     {
         return jdbi.inReadCommittedReadTransaction(handle -> {
             BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
             return status(handle, observed.poolId() == null ? lockBackend(handle, name) : observed);
         });
-    }
-
-    public DrainStatus seal(String name, long generation)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            BackendRef backend = lockAdministrativeBackend(handle, name, "seal");
-            DrainStatus before = status(handle, backend);
-            check(before.generation() == generation, ErrorCode.STALE_GENERATION, "Backend generation changed");
-            if (before.drained()) {
-                return before;
-            }
-            check(before.readyToSeal(), ErrorCode.NOT_DRAINED, "Backend still has work or is not draining");
-            handle.createUpdate("UPDATE transaction_backend SET state = 'SEALED', generation = generation + 1 WHERE incarnation = :id").bind("id", backend.incarnation()).execute();
-            return status(handle, backend);
-        });
-    }
-
-    public DrainStatus resume(String name, long generation)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            BackendRef backend = lockAdministrativeBackend(handle, name, "resume");
-            DrainStatus before = status(handle, backend);
-            check(before.generation() == generation, ErrorCode.STALE_GENERATION, "Backend generation changed");
-            handle.createUpdate("UPDATE transaction_backend SET state = 'ACTIVE', generation = generation + 1 WHERE incarnation = :id")
-                    .bind("id", backend.incarnation()).execute();
-            return status(handle, backend);
-        });
-    }
-
-    public long setRoute(String routingGroup, String backendName)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            lockRoute(handle, routingGroup);
-            checkLegacyMode(handle, routingGroup);
-            RolloutStore.requireGuard(handle, routingGroup, operation);
-            check(operation == null, ErrorCode.CONFLICT, "Rollouts must use compare-and-set routing");
-            BackendRef backend = lockBackend(handle, backendName);
-            checkLegacyBackend(backend);
-            check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
-            check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Route target does not accept new statements");
-            return handle.createQuery(
-                    """
-                    UPDATE transaction_route SET backend_name = :backend, generation = generation + 1
-                    WHERE routing_group = :group RETURNING generation
-                    """).bind("backend", backendName).bind("group", routingGroup).mapTo(Long.class).one();
-        });
-    }
-
-    public RouteStatus routeStatus(String routingGroup)
-    {
-        return jdbi.withHandle(handle -> routeStatus(handle, routingGroup));
-    }
-
-    public RouteStatus compareAndSetRoute(String routingGroup, long expectedGeneration, @Nullable String expectedBackendName, String backendName, UUID backendIncarnation)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            lockRoute(handle, routingGroup);
-            checkLegacyMode(handle, routingGroup);
-            var owner = RolloutStore.requireGuard(handle, routingGroup, operation);
-            if (owner != null) {
-                check(owner.plan().targetBackend().equals(backendName) && List.of("VERIFIED", "CUTOVER").contains(owner.phase()), ErrorCode.CONFLICT, "Rollout route mutation is out of phase");
-                check(expectedGeneration == owner.plan().expectedRouteGeneration() && Objects.equals(expectedBackendName, owner.plan().sourceBackend()), ErrorCode.STALE_GENERATION, "Rollout source route precondition changed");
-            }
-            RouteStatus before = routeStatus(handle, routingGroup);
-            check(before.generation() == expectedGeneration && Objects.equals(before.backendName(), expectedBackendName),
-                    ErrorCode.STALE_GENERATION,
-                    "Routing group generation or backend changed");
-            BackendRef backend = lockBackend(handle, backendName);
-            checkLegacyBackend(backend);
-            check(backend.incarnation().equals(backendIncarnation), ErrorCode.STALE_GENERATION, "Destination incarnation changed");
-            check(backend.routingGroup().equals(routingGroup), ErrorCode.CONFLICT, "Backend belongs to another routing group");
-            check(backendState(handle, backend).equals("ACTIVE"), ErrorCode.NOT_ACTIVE, "Route target does not accept new statements");
-            handle.createUpdate("UPDATE transaction_route SET backend_name = :backend, generation = generation + 1 WHERE routing_group = :group")
-                    .bind("backend", backendName).bind("group", routingGroup).execute();
-            return routeStatus(handle, routingGroup);
-        });
-    }
-
-    static RouteStatus routeStatus(Handle handle, String routingGroup)
-    {
-        return handle.createQuery(
-                        """
-                        SELECT r.generation, r.backend_name, b.incarnation
-                        FROM transaction_route r
-                        LEFT JOIN transaction_backend b ON b.current_name = r.backend_name
-                        WHERE r.routing_group = :group
-                        """).bind("group", routingGroup)
-                .map((rs, _) -> new RouteStatus(routingGroup, rs.getLong("generation"), rs.getString("backend_name"), rs.getObject("incarnation", UUID.class)))
-                .findOne().orElseGet(() -> new RouteStatus(routingGroup, 0, null, null));
-    }
-
-    public DrainStatus reincarnate(String name, UUID expectedIncarnation, long expectedGeneration, BackendRef proposed)
-    {
-        check(name.equals(proposed.name()), ErrorCode.CONFLICT, "Replacement logical name changed");
-        check(proposed.nodeId() != null && !proposed.nodeId().isBlank() && proposed.coordinatorId() != null && !proposed.coordinatorId().isBlank(),
-                ErrorCode.CONFLICT,
-                "Replacement requires a verified coordinator identity");
-        return jdbi.inReadCommittedTransaction(handle -> {
-            BackendRef previous = lockAdministrativeBackend(handle, name, "reincarnate");
-            DrainStatus before = status(handle, previous);
-            check(previous.incarnation().equals(expectedIncarnation) && before.generation() == expectedGeneration,
-                    ErrorCode.STALE_GENERATION,
-                    "Backend incarnation or generation changed");
-            check(before.drained() && before.pendingRequests() == 0 && before.openTransactions() == 0 && before.activeQueries() == 0,
-                    ErrorCode.NOT_DRAINED,
-                    "Replacement requires a sealed backend without outstanding work");
-            check(!previous.incarnation().equals(proposed.incarnation()) &&
-                            !(Objects.equals(previous.nodeId(), proposed.nodeId()) && Objects.equals(previous.coordinatorId(), proposed.coordinatorId())),
-                    ErrorCode.CONFLICT,
-                    "Replacement must identify a different coordinator process");
-            check(previous.routingGroup().equals(proposed.routingGroup()), ErrorCode.CONFLICT, "Replacement routing group changed");
-            check(!handle.createQuery("SELECT EXISTS (SELECT 1 FROM transaction_route WHERE backend_name = :name)")
-                    .bind("name", name).mapTo(Boolean.class).one(), ErrorCode.CONFLICT, "Remove the route to this backend before replacement");
-            handle.createUpdate("UPDATE transaction_backend SET current_name = NULL WHERE incarnation = :id").bind("id", previous.incarnation()).execute();
-            int inserted = handle.createUpdate(
-                            """
-                            INSERT INTO transaction_backend (incarnation, name, current_name, backend_url, external_url, routing_group, node_id, coordinator_id, state, generation)
-                            VALUES (:id, :name, :name, :url, :external, :group, :node, :coordinator, 'DRAINING', :generation)
-                            ON CONFLICT DO NOTHING
-                            """).bind("id", proposed.incarnation()).bind("name", name).bind("url", proposed.url().replaceAll("/+$", ""))
-                    .bind("external", proposed.externalUrl().replaceAll("/+$", "")).bind("group", proposed.routingGroup())
-                    .bind("node", proposed.nodeId()).bind("coordinator", proposed.coordinatorId()).bind("generation", Math.incrementExact(before.generation())).execute();
-            check(inserted == 1, ErrorCode.CONFLICT, "Replacement endpoint or process already has another identity");
-            return status(handle, lockBackend(handle, name));
-        });
-    }
-
-    public long clearRoute(String routingGroup)
-    {
-        return jdbi.inReadCommittedTransaction(handle -> {
-            lockRoute(handle, routingGroup);
-            checkLegacyMode(handle, routingGroup);
-            RolloutStore.requireGuard(handle, routingGroup, operation);
-            check(operation == null, ErrorCode.CONFLICT, "Rollouts cannot remove the durable route");
-            return handle.createQuery(
-                    """
-                    UPDATE transaction_route SET backend_name = NULL, generation = generation + 1
-                    WHERE routing_group = :group RETURNING generation
-                    """).bind("group", routingGroup).mapTo(Long.class).one();
-        });
-    }
-
-    public Optional<String> getRoute(String routingGroup)
-    {
-        return jdbi.withHandle(handle -> findRoute(handle, routingGroup));
     }
 
     static void lockRoute(Handle handle, String routingGroup)
@@ -539,12 +304,6 @@ public final class TransactionStore
         handle.createUpdate("INSERT INTO transaction_route (routing_group) VALUES (:group) ON CONFLICT DO NOTHING").bind("group", routingGroup).execute();
         handle.createQuery("SELECT routing_group FROM transaction_route WHERE routing_group = :group FOR " + (exclusive ? "UPDATE" : "SHARE"))
                 .bind("group", routingGroup).mapTo(String.class).one();
-    }
-
-    private static Optional<String> findRoute(Handle handle, String routingGroup)
-    {
-        return handle.createQuery("SELECT backend_name FROM transaction_route WHERE routing_group = :group AND backend_name IS NOT NULL")
-                .bind("group", routingGroup).mapTo(String.class).findOne();
     }
 
     private static Admission insertAdmission(Handle handle, BackendRef backend, String ownerHash, @Nullable String transactionId, @Nullable String queryId)
@@ -653,39 +412,6 @@ public final class TransactionStore
     {
         return handle.createQuery("SELECT * FROM transaction_backend WHERE current_name = :name FOR UPDATE").bind("name", name)
                 .map((rs, _) -> backend(rs)).findOne().orElseThrow(() -> missing("backend"));
-    }
-
-    private BackendRef lockAdministrativeBackend(Handle handle, String name, String action)
-    {
-        BackendRef observed = findBackend(handle, name).orElseThrow(() -> missing("backend"));
-        checkLegacyBackend(observed);
-        lockRoute(handle, observed.routingGroup());
-        checkLegacyMode(handle, observed.routingGroup());
-        var owner = RolloutStore.requireGuard(handle, observed.routingGroup(), operation);
-        if (owner != null) {
-            boolean source = name.equals(owner.plan().sourceBackend());
-            boolean target = name.equals(owner.plan().targetBackend());
-            boolean preparing = List.of("CLAIMED", "WARMED", "VERIFIED").contains(owner.phase());
-            boolean allowed = switch (action) {
-                case "drain" -> (source && List.of("CUTOVER", "DRAINING").contains(owner.phase())) || (target && preparing);
-                case "seal" -> (source && List.of("DRAINING", "SEALED").contains(owner.phase())) || (target && preparing);
-                case "resume", "reincarnate" -> target && preparing;
-                default -> false;
-            };
-            check(allowed, ErrorCode.CONFLICT, "Rollout backend mutation is out of phase");
-        }
-        BackendRef locked = lockBackend(handle, name);
-        checkLegacyBackend(locked);
-        check(locked.routingGroup().equals(observed.routingGroup()), ErrorCode.CONFLICT, "Backend routing group changed");
-        if (owner != null && name.equals(owner.plan().sourceBackend())) {
-            check(locked.incarnation().equals(owner.plan().sourceIncarnation()), ErrorCode.STALE_GENERATION, "Rollout source incarnation changed");
-        }
-        return locked;
-    }
-
-    private static void checkLegacyBackend(BackendRef backend)
-    {
-        check(backend.poolId() == null, ErrorCode.CONFLICT, "Pooled backend incarnations require the member lifecycle protocol");
     }
 
     private static BackendRef shareBackend(Handle handle, String name)
@@ -811,14 +537,6 @@ public final class TransactionStore
     {
         return handle.createQuery("SELECT api_mode = 'POOLED' FROM pool WHERE pool_id = :group")
                 .bind("group", routingGroup).mapTo(Boolean.class).findOne().orElse(false);
-    }
-
-    /**
-     * Legacy administrative mutations fail closed once a routing group switches to pooled mode.
-     */
-    private static void checkLegacyMode(Handle handle, String routingGroup)
-    {
-        check(!isPooledMode(handle, routingGroup), ErrorCode.CONFLICT, "Pooled routing groups use the member lifecycle protocol");
     }
 
     @Nullable

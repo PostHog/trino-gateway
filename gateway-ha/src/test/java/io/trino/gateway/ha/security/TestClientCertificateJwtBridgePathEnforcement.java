@@ -252,6 +252,7 @@ final class TestClientCertificateJwtBridgePathEnforcement
         requestAnalyzerConfig.setClientCertificateIdentityField("CN");
 
         HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        io.trino.gateway.ha.HaGatewayTestUtils.configurePooledValidation(configuration);
         configuration.setRequestAnalyzerConfig(requestAnalyzerConfig);
         configuration.setClientCertificateJwtAuthentication(authConfig);
         return configuration;

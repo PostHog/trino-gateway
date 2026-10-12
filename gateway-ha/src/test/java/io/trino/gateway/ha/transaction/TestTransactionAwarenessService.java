@@ -20,7 +20,6 @@ import io.airlift.http.client.Request;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
-import io.trino.gateway.ha.handler.schema.RoutingDestination;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
@@ -43,7 +42,6 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.MockedConstruction;
 
-import java.net.URI;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
@@ -79,9 +77,11 @@ class TestTransactionAwarenessService
     private static final String TRANSACTION = "00000000-0000-0000-0000-000000000001";
     private static final String CONTINUATION = "/v1/statement/executing/" + QUERY + "/capability/1";
     private static final String RESULTS = "{\"id\":\"" + QUERY + "\",\"stats\":{\"state\":\"FINISHED\"}}";
-    private static final BackendRef BACKEND = new BackendRef("blue", UUID.randomUUID(), "http://blue.example.test", "http://blue.example.test", "group", "node", "abcde");
+    private static final BackendRef BACKEND = new BackendRef("blue", UUID.randomUUID(), "http://blue.example.test", "http://blue.example.test", "group", "node", "abcde", "group");
     private MockedConstruction<TransactionStore> construction;
     private TransactionStore store;
+    private MockedConstruction<PoolStore> poolConstruction;
+    private PoolStore pools;
     private TransactionAwarenessService service;
     private HaGatewayConfiguration configuration;
     private GatewayBackendManager backendManager;
@@ -93,6 +93,7 @@ class TestTransactionAwarenessService
     void setup()
     {
         construction = mockConstruction(TransactionStore.class);
+        poolConstruction = mockConstruction(PoolStore.class);
         configuration = new HaGatewayConfiguration();
         DataStoreConfiguration database = new DataStoreConfiguration();
         database.setJdbcUrl("jdbc:postgresql://localhost/unused_unit_test_database");
@@ -106,6 +107,15 @@ class TestTransactionAwarenessService
         lifecycleStats = new TransactionLifecycleStats();
         service = new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats);
         store = construction.constructed().getFirst();
+        pools = poolConstruction.constructed().getFirst();
+        when(selector.findRoutingDestination(any())).thenReturn(new RoutingSelectorResponse("group"));
+        when(pools.routing("group")).thenReturn(new PoolStore.PoolRouting(true, List.of(new PoolStore.Candidate("blue", BACKEND.incarnation(), "blue", BACKEND.url()))));
+        io.trino.gateway.ha.config.ProxyBackendConfiguration backend = new io.trino.gateway.ha.config.ProxyBackendConfiguration();
+        backend.setName("blue");
+        backend.setRoutingGroup("group");
+        backend.setProxyTo(BACKEND.url());
+        when(backendManager.getAllBackends()).thenReturn(List.of(backend));
+        when(store.getBackend("blue")).thenReturn(Optional.of(BACKEND));
     }
 
     @AfterEach
@@ -113,6 +123,7 @@ class TestTransactionAwarenessService
     {
         service.shutdown();
         construction.close();
+        poolConstruction.close();
     }
 
     @ParameterizedTest
@@ -471,7 +482,7 @@ class TestTransactionAwarenessService
     void noncanonicalSubmissionCannotBypassAdmission(String path)
     {
         HttpServletRequest request = request("POST", path, Map.of());
-        expectStatus(400, () -> service.resolve(request, () -> { throw new AssertionError("Ordinary routing must not execute"); }, _ -> { throw new AssertionError("Backend selection must not execute"); }));
+        expectStatus(400, () -> service.resolve(request));
         verifyNoInteractions(store, selector, backendManager, httpClient);
     }
 
@@ -492,9 +503,7 @@ class TestTransactionAwarenessService
                 "/v1//query/" + QUERY)) {
             HttpServletRequest request = request(method, path, Map.of());
             expectStatus(400, () -> service.resolve(
-                    request,
-                    () -> { throw new AssertionError("Noncanonical continuation reached ordinary routing: " + path); },
-                    _ -> { throw new AssertionError("Noncanonical continuation reached backend selection: " + path); }));
+                    request));
         }
         verifyNoInteractions(store, selector, backendManager, httpClient);
     }
@@ -507,13 +516,12 @@ class TestTransactionAwarenessService
         HttpServletRequest request = request("POST", "/v1/statement", Map.of("Authorization", List.of(basic), header, List.of("json+zstd,json+lz4,json")));
         Admission admission = new Admission(UUID.randomUUID(), BACKEND, "owner", null, null);
         when(selector.findRoutingDestination(request)).thenReturn(new RoutingSelectorResponse("group"));
-        when(store.getRoute("group")).thenReturn(Optional.of("blue"));
-        when(store.admitNew(eq("blue"), anyString(), eq("group"))).thenReturn(admission);
+        when(store.admitPooledMember(eq("group"), eq("blue"), anyString(), any())).thenReturn(admission);
         StringResponse process = mock(StringResponse.class);
         when(process.getStatusCode()).thenReturn(200);
         when(process.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
         when(httpClient.execute(any(), any())).thenReturn(process);
-        RoutingTargetResponse resolved = service.resolve(request, () -> { throw new AssertionError("Ordinary routing must not execute"); }, _ -> { throw new AssertionError("Override must bypass candidate selection"); });
+        RoutingTargetResponse resolved = service.resolve(request);
         HttpServletRequest forwarded = resolved.modifiedRequest();
         assertThat(forwarded.getHeader(header)).isNull();
         assertThat(Collections.list(forwarded.getHeaders(header))).isEmpty();
@@ -526,23 +534,23 @@ class TestTransactionAwarenessService
     }
 
     @Test
-    void disabledFeaturePreservesOrdinaryRouting()
+    void disabledFeatureCannotConstructAService()
     {
         configuration.getTransactionAwareness().setEnabled(false);
-        HttpServletRequest request = request("POST", "/v1/statement/", Map.of());
-        RoutingTargetResponse ordinary = new RoutingTargetResponse(new RoutingDestination("group", BACKEND.url(), URI.create(BACKEND.url()), BACKEND.externalUrl()), request);
-        assertThat(service.resolve(request, () -> ordinary, _ -> { throw new AssertionError("Unused backend selector"); })).isSameAs(ordinary);
-        verifyNoInteractions(store, selector, backendManager, httpClient);
+        assertThatThrownBy(() -> new TransactionAwarenessService(configuration, mock(Jdbi.class), backendManager, httpClient, selector, lifecycleStats))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("requires transaction awareness");
     }
 
     @Test
     void canonicalPathDoesNotRejectEncodedQueryParameters()
     {
+        configureKnownQuery();
         HttpServletRequest request = request("GET", "/v1/info", Map.of());
         when(request.getQueryString()).thenReturn("example=%2Fpath%3Bvalue&dot=../segment");
-        RoutingTargetResponse ordinary = new RoutingTargetResponse(new RoutingDestination("group", BACKEND.url(), URI.create(BACKEND.url()), BACKEND.externalUrl()), request);
-        assertThat(service.resolve(request, () -> ordinary, _ -> { throw new AssertionError("Unused backend selector"); })).isSameAs(ordinary);
-        verifyNoInteractions(store, selector, backendManager, httpClient);
+        RoutingTargetResponse result = service.resolve(request);
+        assertThat(result.routingDestination().clusterHost()).isEqualTo(BACKEND.url());
+        assertThat(result.routingDestination().clusterUri().getRawQuery()).isEqualTo(request.getQueryString());
+        verify(store, never()).admitPooledMember(anyString(), anyString(), anyString(), any());
     }
 
     @ParameterizedTest
@@ -552,9 +560,7 @@ class TestTransactionAwarenessService
         configureKnownQuery();
         HttpServletRequest request = request(method, "/v1/query/" + QUERY, Map.of());
         expectStatus(401, () -> service.resolve(
-                request,
-                () -> { throw new AssertionError("Known query must not use ordinary routing"); },
-                _ -> { throw new AssertionError("Known query must not select a new backend"); }));
+                request));
         verify(store, never()).admitQuery(anyString(), any(), any(), any());
         verifyNoInteractions(httpClient);
     }
@@ -566,9 +572,7 @@ class TestTransactionAwarenessService
         Admission admission = configureKnownQuery();
         HttpServletRequest request = request(method, CONTINUATION, Map.of());
         RoutingTargetResponse response = service.resolve(
-                request,
-                () -> { throw new AssertionError("Known query must not use ordinary routing"); },
-                _ -> { throw new AssertionError("Known query must not select a new backend"); });
+                request);
         assertThat(admission(response.modifiedRequest())).isEqualTo(admission);
         assertThat(response.routingDestination().clusterHost()).isEqualTo(BACKEND.url());
         verify(store).admitQuery(QUERY, Optional.of("owner"), Optional.empty(), Optional.of(TransactionAwarenessService.capabilityHash(CONTINUATION)));
@@ -584,13 +588,11 @@ class TestTransactionAwarenessService
                 .thenThrow(new StoreException(ErrorCode.NOT_FOUND, "Unknown capability"));
         HttpServletRequest request = request(method, forged, Map.of());
         expectStatus(404, () -> service.resolve(
-                request,
-                () -> { throw new AssertionError("Capability rejection must not reroute"); },
-                _ -> { throw new AssertionError("Capability rejection must not select a backend"); }));
+                request));
         assertThat(admission(request)).isNull();
         verify(store, never()).admitQuery(anyString(), any(), any());
         verify(store, never()).admitQuery(anyString(), any(), any(), eq(Optional.empty()));
-        verifyNoInteractions(httpClient, selector, backendManager);
+        verifyNoInteractions(httpClient, backendManager);
     }
 
     @ParameterizedTest
@@ -601,9 +603,7 @@ class TestTransactionAwarenessService
         HttpServletRequest request = request(method, CONTINUATION, Map.of());
         when(request.getQueryString()).thenReturn("maxWait=1s&example=%2Fencoded");
         RoutingTargetResponse resolved = service.resolve(
-                request,
-                () -> { throw new AssertionError("Known query must not reroute"); },
-                _ -> { throw new AssertionError("Known query must not select a backend"); });
+                request);
         assertThat(resolved.modifiedRequest().getRequestURI()).isEqualTo(CONTINUATION);
         assertThat(resolved.modifiedRequest().getQueryString()).isEqualTo(request.getQueryString());
         assertThat(resolved.routingDestination().clusterUri().getRawPath()).isEqualTo(CONTINUATION);
@@ -620,7 +620,7 @@ class TestTransactionAwarenessService
         HttpServletRequest request = request(method, "/v1/query/" + QUERY, Map.of("Authorization", List.of(basic)));
         String owner = new TransactionIdentity(configuration.getTransactionAwareness().getIdentityKey()).owner(request);
         when(store.getQuery(QUERY)).thenReturn(Optional.of(new QueryBinding(QUERY, owner, BACKEND, null, false)));
-        service.resolve(request, () -> { throw new AssertionError("Metadata must not reroute"); }, _ -> { throw new AssertionError("Metadata must not select a backend"); });
+        service.resolve(request);
         verify(store).admitQuery(QUERY, Optional.of(owner), Optional.empty(), Optional.empty());
     }
 
@@ -695,14 +695,10 @@ class TestTransactionAwarenessService
     {
         configureKnownQuery();
         for (int index = 0; index < 16; index++) {
-            service.resolve(request("GET", CONTINUATION, Map.of()),
-                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                    _ -> { throw new AssertionError("Unexpected backend selection"); });
+            service.resolve(request("GET", CONTINUATION, Map.of()));
         }
         expectStatus(503, () -> service.resolve(
-                request("HEAD", CONTINUATION, Map.of()),
-                () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                _ -> { throw new AssertionError("Unexpected backend selection"); }));
+                request("HEAD", CONTINUATION, Map.of())));
         verify(store, times(16)).admitQuery(anyString(), any(), any(), any());
         verify(httpClient, times(16)).execute(any(), any());
     }
@@ -711,9 +707,7 @@ class TestTransactionAwarenessService
     void processProbeHasAnExplicitBoundedRequestTimeout()
     {
         configureKnownQuery();
-        service.resolve(request("GET", CONTINUATION, Map.of()),
-                () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                _ -> { throw new AssertionError("Unexpected backend selection"); });
+        service.resolve(request("GET", CONTINUATION, Map.of()));
         org.mockito.ArgumentCaptor<Request> probe = org.mockito.ArgumentCaptor.forClass(Request.class);
         verify(httpClient).execute(probe.capture(), any());
         assertThat(probe.getValue().getRequestTimeout()).isPresent();
@@ -727,9 +721,7 @@ class TestTransactionAwarenessService
         configureKnownQuery();
         for (int index = 0; index < 32; index++) {
             RoutingTargetResponse result = service.resolve(
-                    request(method, CONTINUATION, Map.of()),
-                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                    _ -> { throw new AssertionError("Unexpected backend selection"); });
+                    request(method, CONTINUATION, Map.of()));
             service.requestRejectedBeforeDispatch(result.modifiedRequest());
         }
         verify(store, times(32)).rejectAdmission(any());
@@ -742,9 +734,7 @@ class TestTransactionAwarenessService
         when(httpClient.execute(any(), any())).thenThrow(new IllegalStateException("synthetic probe failure"));
         for (int index = 0; index < 32; index++) {
             expectStatus(503, () -> service.resolve(
-                    request("GET", CONTINUATION, Map.of()),
-                    () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                    _ -> { throw new AssertionError("Unexpected backend selection"); }));
+                    request("GET", CONTINUATION, Map.of())));
         }
         verify(store, times(32)).admitQuery(anyString(), any(), any(), any());
         verify(store, times(32)).rejectAdmission(any());
@@ -753,8 +743,8 @@ class TestTransactionAwarenessService
     @Test
     void unexpectedRoutingFailureHasSafeClassificationWithoutExceptionDetails()
     {
-        when(store.routeStatus("group")).thenThrow(new IllegalStateException("private connection string and credentials"));
-        assertThatThrownBy(() -> service.routeStatus("group")).isInstanceOfSatisfying(
+        when(store.getTransaction(TRANSACTION)).thenThrow(new IllegalStateException("private connection string and credentials"));
+        assertThatThrownBy(() -> service.transaction(TRANSACTION)).isInstanceOfSatisfying(
                 WebApplicationException.class,
                 failure -> {
                     assertThat(failure.getResponse().getStatus()).isEqualTo(503);
@@ -766,8 +756,8 @@ class TestTransactionAwarenessService
     @Test
     void rejectedRoutingStateHasItsOwnSafeClassification()
     {
-        when(store.routeStatus("group")).thenThrow(new StoreException(ErrorCode.NOT_ACTIVE, "private backend name"));
-        assertThatThrownBy(() -> service.routeStatus("group")).isInstanceOfSatisfying(
+        when(store.getTransaction(TRANSACTION)).thenThrow(new StoreException(ErrorCode.NOT_ACTIVE, "private backend name"));
+        assertThatThrownBy(() -> service.transaction(TRANSACTION)).isInstanceOfSatisfying(
                 WebApplicationException.class,
                 failure -> {
                     assertThat(failure.getResponse().getStatus()).isEqualTo(503);
@@ -792,9 +782,7 @@ class TestTransactionAwarenessService
             return process;
         });
         expectStatus(504, () -> service.resolve(
-                request("GET", CONTINUATION, Map.of()),
-                () -> { throw new AssertionError("Unexpected ordinary routing"); },
-                _ -> { throw new AssertionError("Unexpected backend selection"); }));
+                request("GET", CONTINUATION, Map.of())));
         verify(store).rejectAdmission(admission.id());
         verify(store, never()).markUncertain(any());
     }

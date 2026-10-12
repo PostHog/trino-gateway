@@ -36,10 +36,7 @@ import io.trino.gateway.ha.resource.HaGatewayResource;
 import io.trino.gateway.ha.resource.LoginResource;
 import io.trino.gateway.ha.resource.PublicResource;
 import io.trino.gateway.ha.router.BackendLifecycleManager;
-import io.trino.gateway.ha.router.ForRouter;
 import io.trino.gateway.ha.router.RoutingManager;
-import io.trino.gateway.ha.router.RoutingRulesManager;
-import io.trino.gateway.ha.router.StochasticRoutingManager;
 import io.trino.gateway.ha.security.AuthorizedExceptionMapper;
 import io.trino.gateway.ha.security.QueryMetadataParser;
 import io.trino.gateway.ha.security.QueryUserInfoParser;
@@ -50,7 +47,6 @@ import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.List;
 
-import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static io.airlift.http.client.HttpClientBinder.httpClientBinder;
 import static io.airlift.jaxrs.JaxrsBinder.jaxrsBinder;
 import static java.util.Objects.requireNonNull;
@@ -140,12 +136,8 @@ public class BaseApp
         binder.bind(io.trino.gateway.ha.transaction.PoolLifecycleService.class).in(Scopes.SINGLETON);
         binder.bind(io.trino.gateway.ha.clustermonitor.PoolMonitoringScope.class).in(Scopes.SINGLETON);
         newExporter(binder).export(ProxyHandlerStats.class).withGeneratedName();
-        binder.bind(RoutingRulesManager.class);
         binder.bind(ClusterMetricsStatsExporter.class).in(Scopes.SINGLETON);
-        newOptionalBinder(binder, RoutingManager.class)
-                .setDefault()
-                .to(StochasticRoutingManager.class)
-                .in(Scopes.SINGLETON);
+        binder.bind(RoutingManager.class).in(Scopes.SINGLETON);
         binder.bind(BackendLifecycleManager.class).in(Scopes.SINGLETON);
     }
 
@@ -198,6 +190,5 @@ public class BaseApp
         jaxrsBinder(binder).bind(QueryUserInfoParser.class);
         jaxrsBinder(binder).bind(QueryMetadataParser.class);
         httpClientBinder(binder).bindHttpClient("monitor", ForMonitor.class);
-        httpClientBinder(binder).bindHttpClient("router", ForRouter.class);
     }
 }

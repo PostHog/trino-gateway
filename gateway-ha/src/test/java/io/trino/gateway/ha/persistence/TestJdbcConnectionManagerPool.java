@@ -15,7 +15,6 @@ package io.trino.gateway.ha.persistence;
 
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.DatabaseCacheConfiguration;
-import io.trino.gateway.ha.config.RoutingConfiguration;
 import io.trino.gateway.ha.router.HaGatewayManager;
 import io.trino.gateway.ha.router.HaQueryHistoryManager;
 import io.trino.gateway.ha.router.QueryHistoryManager;
@@ -153,7 +152,6 @@ final class TestJdbcConnectionManagerPool
                 Handle heldHandle = jdbi.open()) {
             Future<HaGatewayManager> gatewayManager = executorService.submit(() -> new HaGatewayManager(
                     connectionManager.getJdbi(),
-                    new RoutingConfiguration(),
                     new DatabaseCacheConfiguration()));
 
             assertThatThrownBy(() -> gatewayManager.get(200, MILLISECONDS))

@@ -98,7 +98,7 @@ class TestTransactionBootstrap
     }
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
+    @ValueSource(booleans = true)
     void productionModulesStartWithoutJustInTimeBindings(boolean enabled)
             throws Exception
     {
@@ -120,6 +120,7 @@ class TestTransactionBootstrap
                 configuration.getTransactionAwareness().setIdentityKey("synthetic-identity-key-for-bootstrap-only");
                 configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-bootstrap-only");
             }
+            configuration.getRouting().setHostnameToPool(Map.of("localhost", "pool"));
             configuration.validate();
             FlywayMigration.migrate(database);
 

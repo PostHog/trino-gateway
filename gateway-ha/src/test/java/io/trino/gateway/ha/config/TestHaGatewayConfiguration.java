@@ -16,6 +16,7 @@ package io.trino.gateway.ha.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import com.google.common.collect.ImmutableList;
+import io.trino.gateway.ha.HaGatewayTestUtils;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -30,14 +31,14 @@ class TestHaGatewayConfiguration
     @Test
     void testDefaultStatementPaths()
     {
-        HaGatewayConfiguration haGatewayConfiguration = new HaGatewayConfiguration();
+        HaGatewayConfiguration haGatewayConfiguration = pooledValidationConfiguration();
         assertThat(haGatewayConfiguration.getStatementPaths()).containsOnly(V1_STATEMENT_PATH);
     }
 
     @Test
     void testAdditionalPath()
     {
-        HaGatewayConfiguration haGatewayConfiguration = new HaGatewayConfiguration();
+        HaGatewayConfiguration haGatewayConfiguration = pooledValidationConfiguration();
         List<String> additionalPaths = ImmutableList.of("/ui/api/insights/ide/statement/", "/v2/statement");
         haGatewayConfiguration.setAdditionalStatementPaths(additionalPaths);
         assertThat(haGatewayConfiguration.getStatementPaths())
@@ -47,7 +48,7 @@ class TestHaGatewayConfiguration
     @Test
     void testValidation()
     {
-        HaGatewayConfiguration haGatewayConfiguration = new HaGatewayConfiguration();
+        HaGatewayConfiguration haGatewayConfiguration = pooledValidationConfiguration();
         assertThatThrownBy(() -> haGatewayConfiguration.setAdditionalStatementPaths(ImmutableList.of("relative/path/")))
                 .isInstanceOf(HaGatewayConfiguration.HaGatewayConfigurationException.class)
                 .hasMessage("Statement paths must be absolute");
@@ -104,7 +105,7 @@ class TestHaGatewayConfiguration
         requestAnalyzerConfig.setClientCertificateUserMappingPattern("(.*)");
         requestAnalyzerConfig.setClientCertificateUserMappingFile("src/test/resources/auth/test-user-mapping.json");
 
-        HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        HaGatewayConfiguration configuration = pooledValidationConfiguration();
         assertThatThrownBy(() -> configuration.setRequestAnalyzerConfig(requestAnalyzerConfig))
                 .isInstanceOf(HaGatewayConfiguration.HaGatewayConfigurationException.class)
                 .hasMessageContaining("Invalid client certificate user mapping configuration");
@@ -116,7 +117,7 @@ class TestHaGatewayConfiguration
         RequestAnalyzerConfig requestAnalyzerConfig = new RequestAnalyzerConfig();
         requestAnalyzerConfig.setClientCertificateUserMappingPattern("(.*)@example\\.com");
 
-        HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        HaGatewayConfiguration configuration = pooledValidationConfiguration();
         configuration.setRequestAnalyzerConfig(requestAnalyzerConfig);
         configuration.setClientCertificateJwtAuthentication(new ClientCertificateJwtAuthenticationConfiguration());
         assertThatThrownBy(configuration::validate)
@@ -131,7 +132,7 @@ class TestHaGatewayConfiguration
         requestAnalyzerConfig.setClientCertificateIdentityField("CN");
         requestAnalyzerConfig.setClientCertificateUserMappingPattern("(.*)@example\\.com");
 
-        HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        HaGatewayConfiguration configuration = pooledValidationConfiguration();
         configuration.setRequestAnalyzerConfig(requestAnalyzerConfig);
 
         assertThatThrownBy(configuration::validate)
@@ -147,7 +148,7 @@ class TestHaGatewayConfiguration
                 "src/test/resources/auth/test_private_key.pem",
                 "src/test/resources/auth/test_public_key.pem"));
 
-        HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        HaGatewayConfiguration configuration = pooledValidationConfiguration();
         configuration.setClientCertificateJwtAuthentication(authConfig);
         assertThatThrownBy(configuration::validate)
                 .isInstanceOf(HaGatewayConfiguration.HaGatewayConfigurationException.class)
@@ -171,6 +172,14 @@ class TestHaGatewayConfiguration
         HaGatewayConfiguration configuration = new ObjectMapper(new YAMLFactory())
                 .readValue(yamlBridgeFirst, HaGatewayConfiguration.class);
 
+        HaGatewayTestUtils.configurePooledValidation(configuration);
         assertThatCode(configuration::validate).doesNotThrowAnyException();
+    }
+
+    private static HaGatewayConfiguration pooledValidationConfiguration()
+    {
+        HaGatewayConfiguration configuration = new HaGatewayConfiguration();
+        HaGatewayTestUtils.configurePooledValidation(configuration);
+        return configuration;
     }
 }

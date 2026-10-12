@@ -5,11 +5,16 @@ does not claim that the feature, its tests, or a production rollout are complete
 
 ## Scope and guarantees
 
-The opt-in feature preserves explicit Trino transaction affinity and prevents a
-planned backend retirement while that backend has unresolved work. The first
-implementation uses PostgreSQL. Enabling it with an unsupported datastore or
-incomplete security configuration must fail startup. The disabled configuration
-must preserve existing routing behavior.
+Gateway requires pooled routing and PostgreSQL. It preserves transaction
+ownership and blocks member retirement while work remains unresolved. Unsupported
+datastores, disabled lifecycle settings, and incomplete security configuration
+fail startup. There is no non-pooled routing path.
+
+This design records the original ledger reasoning. Fixed-backend routing,
+cutover, resume, reincarnation, and rollout sections below are historical. Their
+APIs have been removed. The current hostname and pool contract is in
+[Routing logic](../routing-logic.md) and
+[pooled operation](../../testing/transaction-awareness/OPERATIONS.md).
 
 This is routing, not transaction replication. A transaction cannot move between
 coordinators. A coordinator failure can still fail its transactions. The gateway
@@ -22,7 +27,8 @@ Unknown outcomes block automatic retirement until authoritative reconciliation;
 a timeout is not, by itself, evidence that work finished.
 
 Tenant placement and tenant data migration remain external responsibilities.
-This feature can preserve old transactions while new work uses a new placement.
+Transactions stay on their original pool member during member replacement.
+A tenant hostname mapping must remain stable while its work is in flight.
 It cannot establish that the target has the required catalogs, authorization,
 data freshness, or write consistency. Those are cutover prerequisites.
 

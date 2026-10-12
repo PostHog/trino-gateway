@@ -1,6 +1,9 @@
 services:
   trino-gateway:
-    image: ${TRINO_GATEWAY_IMAGE:-trinodb/trino-gateway:latest}
+    image: ${TRINO_GATEWAY_IMAGE:?Set a compatible pooled Gateway image}
+    environment:
+      - GATEWAY_TRANSACTION_IDENTITY_KEY=${GATEWAY_TRANSACTION_IDENTITY_KEY:?Set a shared runtime identity key}
+      - GATEWAY_TRANSACTION_ADMIN_TOKEN=${GATEWAY_TRANSACTION_ADMIN_TOKEN:?Set a separate runtime admin token}
     depends_on:
       postgres:
         condition: service_healthy

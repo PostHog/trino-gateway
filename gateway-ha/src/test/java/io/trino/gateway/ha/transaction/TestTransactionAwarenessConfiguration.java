@@ -23,12 +23,24 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class TestTransactionAwarenessConfiguration
 {
     @Test
-    void testDisabledConfigurationDoesNotRequireNewSecrets()
+    void testDisabledConfigurationIsRejected()
     {
         TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
-        assertThat(config.isEnabled()).isFalse();
-        assertThat(config.getTerminalRetentionSeconds()).isEqualTo(120);
-        config.validate(null);
+        config.setEnabled(false);
+        assertThatThrownBy(() -> config.validate(null)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("requires transaction awareness");
+    }
+
+    @Test
+    void testNonPooledConfigurationIsRejected()
+    {
+        TransactionAwarenessConfiguration config = new TransactionAwarenessConfiguration();
+        config.setEnabled(true);
+        config.setIdentityKey("synthetic-identity-key-for-tests-only");
+        config.setAdminToken("synthetic-admin-token-for-tests-only");
+        config.getPool().setEnabled(false);
+        assertThatThrownBy(() -> config.validate(database("jdbc:postgresql://localhost/test")))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("requires pooled");
     }
 
     @Test

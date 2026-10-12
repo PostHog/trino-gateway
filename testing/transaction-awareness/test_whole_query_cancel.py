@@ -2,25 +2,25 @@
 
 import base64
 from concurrent.futures import ThreadPoolExecutor
-import json
 import secrets
 import time
 import unittest
 from urllib.parse import urlsplit
 
-from protocol import finish, request, statement, through_gateway
-from test_rollout_api import local_gateways
+from protocol import finish, request, through_gateway
+from gateway_fixture import bootstrap_pool, local_gateways, pool_request
 
 
 class WholeQueryCancellationContract(unittest.TestCase):
     def setup_fixture(self, gateways, backends, token):
         self.gateways, self.backends, self.token = gateways, backends, token
+        bootstrap_pool(gateways, backends, token)
         self.authorization = "Basic " + base64.b64encode(
             ("fixture-user:" + secrets.token_hex(16)).encode()).decode()
 
     def submit(self, sql, transaction="NONE", replica=0):
-        result = statement(self.gateways[replica], sql, transaction,
-                           routing_group="cell", extra=[("Authorization", self.authorization)])
+        result = request(self.gateways[replica] + "/v1/statement", "POST", sql,
+                         [("X-Trino-Transaction-Id", transaction), ("Authorization", self.authorization)])
         self.assertEqual(result.status, 200, result.body)
         return result
 
@@ -29,15 +29,20 @@ class WholeQueryCancellationContract(unittest.TestCase):
         return next(backend for backend in self.backends if backend.state.coordinator_id == suffix)
 
     def admin(self, name, suffix="", method="GET", body=None, replica=0):
-        response = request(self.gateways[replica] + "/gateway/transactions/backends/" + name + suffix,
-                           method, None if body is None else json.dumps(body),
-                           [("Authorization", "Bearer " + self.token), ("Content-Type", "application/json")])
-        return response
+        if method == "POST":
+            generation = body["generation"] if body is not None else self.status(name)["generation"]
+            body = {"operationId": "cancel-" + name + suffix.replace("/", "-"), "stepId": suffix[1:],
+                    "controllerEpoch": 1, "ownerIdentity": "fixture-controller",
+                    "expectedGeneration": generation}
+        return pool_request(self.gateways, self.token, "/members/" + name + suffix,
+                            method, body, replica)
 
     def status(self, name):
-        response = self.admin(name, "/drain")
+        response = self.admin(name, "/obligations")
         self.assertEqual(response.status, 200, response.body)
-        return response.json()
+        member = self.admin(name)
+        self.assertEqual(member.status, 200, member.body)
+        return {**response.json(), "generation": member.json()["generation"]}
 
     def eventually(self, predicate):
         deadline = time.monotonic() + 10

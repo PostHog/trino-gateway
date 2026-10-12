@@ -20,7 +20,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 
 public class TransactionAwarenessConfiguration
 {
-    private boolean enabled;
+    private boolean enabled = true;
     private String identityKey;
     private String adminToken;
     private int terminalRetentionSeconds = 120;
@@ -145,10 +145,13 @@ public class TransactionAwarenessConfiguration
 
     public void validate(DataStoreConfiguration dataStore, RoutingConfiguration routing)
     {
-        pool.validate(enabled, routing == null || routing.isForwardedHeadersEnabled());
         if (!enabled) {
-            return;
+            throw new IllegalArgumentException("Gateway requires transaction awareness");
         }
+        if (!pool.isEnabled()) {
+            throw new IllegalArgumentException("Gateway requires pooled member lifecycle");
+        }
+        pool.validate(true, routing == null || routing.isForwardedHeadersEnabled());
         if (dataStore == null || dataStore.getJdbcUrl() == null || !dataStore.getJdbcUrl().startsWith("jdbc:postgresql:")) {
             throw new IllegalArgumentException("Transaction awareness requires PostgreSQL");
         }

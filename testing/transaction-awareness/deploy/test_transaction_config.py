@@ -16,10 +16,11 @@ class TransactionConfigTests(unittest.TestCase):
         self.assertGreaterEqual(len(settings["identityKey"].encode()), 32)
         self.assertNotEqual(settings["identityKey"], settings["adminToken"])
         self.assertEqual(settings["terminalRetentionSeconds"], 2)
-        disabled = configure_transactions(enabled, enabled=False, terminal_retention=120)
-        self.assertFalse(disabled["transactionAwareness"]["enabled"])
-        again = configure_transactions(disabled, enabled=True, terminal_retention=2)
+        self.assertTrue(settings["pool"]["enabled"])
+        again = configure_transactions(enabled, enabled=True, terminal_retention=2)
         self.assertEqual(again["transactionAwareness"], settings)
+        with self.assertRaisesRegex(ValueError, "must remain enabled"):
+            configure_transactions(enabled, enabled=False, terminal_retention=120)
 
     def test_refuses_invalid_persistent_keys_instead_of_rotating(self):
         for value in ["", "short", None, 32]:
@@ -38,6 +39,13 @@ class TransactionConfigTests(unittest.TestCase):
             with self.subTest(retention=retention), self.assertRaises(ValueError):
                 configure_transactions({"dataStore": {"jdbcUrl": "jdbc:postgresql://postgres/gateway"}},
                                        enabled=True, terminal_retention=retention)
+
+    def test_pool_settings_are_preserved_but_cannot_disable_pooling(self):
+        baseline = {"dataStore": {"jdbcUrl": "jdbc:postgresql://postgres/gateway"},
+                    "transactionAwareness": {"pool": {"enabled": False, "maxPreDispatchCandidates": 3}}}
+        configured = configure_transactions(baseline, enabled=True, terminal_retention=2)
+        self.assertEqual(configured["transactionAwareness"]["pool"], {"enabled": True, "maxPreDispatchCandidates": 3})
+        self.assertFalse(baseline["transactionAwareness"]["pool"]["enabled"])
 
 
 if __name__ == "__main__":

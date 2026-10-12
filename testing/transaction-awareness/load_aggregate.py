@@ -134,7 +134,7 @@ def _aggregate(children, *, rate, duration, concurrency, window_start_utc, windo
             if bucket_totals[event] != count[key]:
                 raise ValueError("Window bucket totals differ from request counts")
         gateway_count = number(result["gateway_endpoints"], integer=True, minimum=1)
-        group_count = number(result["routing_groups"], integer=True, minimum=1)
+        group_count = number(result["hostnames"], integer=True, minimum=1)
         if not isinstance(result["per_gateway_counts"], list) or len(result["per_gateway_counts"]) != gateway_count:
             raise ValueError("Child routing inventory does not match its counters")
         if gateways is None:
@@ -214,7 +214,7 @@ def _aggregate(children, *, rate, duration, concurrency, window_start_utc, windo
                 client_concurrency=concurrency, client_processes=8, peak_client_inflight=None,
                 peak_client_inflight_bounds=dict(min=max(peaks), max=sum(peaks)),
                 peak_client_inflight_interpretation="Bounds from child peaks, not an observed global peak",
-                gateway_endpoints=len(gateways), routing_groups=groups, per_gateway_counts=[dict(row) for row in gateways],
+                gateway_endpoints=len(gateways), hostnames=groups, per_gateway_counts=[dict(row) for row in gateways],
                 client_cpu_seconds=worker_cpu, client_average_cpu_cores=worker_cpu / completion_elapsed_seconds,
                 client_cpu_interpretation="Sum of worker process CPU through their late completions, excluding cleanup and parent CPU; denominator is the common parent completion span",
                 backend_result_rows=dict(backend_rows), unconsumed_continuations=unconsumed,

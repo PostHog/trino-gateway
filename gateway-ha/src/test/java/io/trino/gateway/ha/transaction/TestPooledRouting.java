@@ -244,7 +244,6 @@ class TestPooledRouting
         probeSucceeds();
         // i-1 has no Gateway backend registration, so the Gateway has no endpoint record for it.
         when(backendManager.getAllBackends()).thenReturn(List.of(backend("i-2")));
-        when(backendManager.getActiveBackends(POOL)).thenReturn(List.of(backend("i-2")));
         for (int attempt = 0; attempt < 10; attempt++) {
             assertThat(resolve().routingDestination().clusterHost()).isEqualTo("http://i-2.example.test");
         }
@@ -307,33 +306,20 @@ class TestPooledRouting
     }
 
     @Test
-    void legacyRoutingIsUnchangedForANonPooledRoutingGroup()
+    void aNonPooledGroupCannotFallBackToAnActiveLegacyBackend()
     {
-        // No pool row in POOLED mode for this group, so the ordinary single-route path is used.
         database.useHandle(handle -> handle.createUpdate("UPDATE pool SET api_mode = 'LEGACY' WHERE pool_id = :pool").bind("pool", POOL).execute());
         ProxyBackendConfiguration backend = backend("legacy");
         when(backendManager.getBackendByName("backend-legacy")).thenReturn(Optional.of(backend));
         when(backendManager.getAllBackends()).thenReturn(List.of(backend));
-        when(backendManager.getActiveBackends(POOL)).thenReturn(List.of(backend));
         probeReturns("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node-legacy\",\"coordinatorId\":\"abcde\"}");
 
-        RoutingTargetResponse response = service.resolve(
-                request(),
-                () -> {
-                    throw new AssertionError("Unexpected ordinary routing");
-                },
-                _ -> new RoutingTargetResponse(
-                        new io.trino.gateway.ha.handler.schema.RoutingDestination(
-                                POOL,
-                                backend.getProxyTo(),
-                                java.net.URI.create(backend.getProxyTo() + "/v1/statement"),
-                                backend.getExternalUrl()),
-                        request()));
-        assertThat(response.routingDestination().clusterHost()).isEqualTo("http://legacy.example.test");
-        String legacyState = database.withHandle(handle -> handle.createQuery(
-                        "SELECT state FROM transaction_backend WHERE current_name = 'backend-legacy'")
-                .mapTo(String.class).one());
-        assertThat(legacyState).isEqualTo("ACTIVE");
+        assertThatThrownBy(this::resolve).isInstanceOfSatisfying(WebApplicationException.class, failure -> {
+            assertThat(failure.getResponse().getStatus()).isEqualTo(503);
+            assertThat(failure.getResponse().getHeaderString("X-Trino-Gateway-Error")).isEqualTo("ROUTING_STATE_NOT_ACTIVE");
+        });
+        long admissions = database.withHandle(handle -> handle.createQuery("SELECT count(*) FROM transaction_admission").mapTo(Long.class).one());
+        assertThat(admissions).isZero();
     }
 
     // --------------------------------------------------------------------------------------------
@@ -556,13 +542,7 @@ class TestPooledRouting
         headers.put("Authorization", List.of("Basic " + Base64.getEncoder().encodeToString((user + ":secret").getBytes(UTF_8))));
         headers.put("Host", List.of(host));
         RoutingTargetResponse response = service.resolve(
-                request(headers),
-                () -> {
-                    throw new AssertionError("Unexpected ordinary routing");
-                },
-                _ -> {
-                    throw new AssertionError("Unexpected legacy backend selection");
-                });
+                request(headers));
         service.completeRequest(response.modifiedRequest());
         return response;
     }
@@ -578,13 +558,7 @@ class TestPooledRouting
     private RoutingTargetResponse resolveWithoutRelease()
     {
         return service.resolve(
-                request(),
-                () -> {
-                    throw new AssertionError("Unexpected ordinary routing");
-                },
-                _ -> {
-                    throw new AssertionError("Unexpected legacy backend selection");
-                });
+                request());
     }
 
     private PoolStore.Guard guard(String operationId, String stepId)
@@ -662,14 +636,12 @@ class TestPooledRouting
                 })
                 .toList();
         when(backendManager.getAllBackends()).thenReturn(backends);
-        when(backendManager.getActiveBackends(POOL)).thenReturn(List.of());
         backends.forEach(backend -> when(backendManager.getBackendByName(backend.getName())).thenReturn(Optional.of(backend)));
     }
 
     private void registerBackends()
     {
         List<ProxyBackendConfiguration> backends = pools.members(POOL).stream().map(member -> backend(member.instanceId())).toList();
-        when(backendManager.getActiveBackends(POOL)).thenReturn(backends);
         when(backendManager.getAllBackends()).thenReturn(backends);
         backends.forEach(backend -> when(backendManager.getBackendByName(backend.getName())).thenReturn(Optional.of(backend)));
     }

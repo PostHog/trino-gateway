@@ -1,243 +1,122 @@
-# Bounded load and deadline regressions
+# Bounded hostname-based load tooling
 
-Use only an explicitly authorized disposable lab. Keep endpoints, credentials,
-generated manifests, and all results outside this public repository. Do not
-publish sanitized benchmark summaries or internal analytics in public comments.
+Use only explicitly authorized disposable environments. Keep endpoint values,
+credentials, generated manifests, measurements, receipts, and all execution
+outcomes outside this public repository. A passing test is not a throughput or
+capacity claim. See [README.md](README.md) for supported pooled contracts,
+[SCALE-VALIDATION.md](SCALE-VALIDATION.md) for acceptance boundaries, and
+[DATABASE_COST.md](DATABASE_COST.md) for aligned database measurements.
 
-See [database measurements and cost estimates](DATABASE_COST.md) for aligned
-request rates, connection samples, ACUs, idle baselines, and cost attribution.
-See [single-case orchestration](MATRIX.md) for bounded checkpoint Jobs and
-independent before/after preservation guards.
+## Placement and prerequisites
 
-`test_overload.OverloadContract` holds sixteen accepted continuations on one
-Gateway. The seventeenth must receive `503` with `Retry-After` before backend
-dispatch. It releases and consumes all held pages. `TX_EXPECT_MAX_IN_FLIGHT`
-can select an intentionally different configured limit.
+A compatible Gateway artifact must require both transaction-awareness and pool
+flags true. Configure exact hostname-to-pool mappings, register backend metadata,
+and certify/admit the members through the pooled lifecycle API before load.
+Active registry entries are not a fallback. Placement is not tenant authorization.
 
-`test_overload.DeadlineContract` requires the existing
-`routing.asyncTimeout: 500ms` and `TX_EXPECT_ROUTING_TIMEOUT_MS=500`. It holds
-the process-identity response before statement forwarding, checks a bounded
-failure, rejects late dispatch, and checks lease recovery. Use separate backend
-identities: an old implementation can accept a query after the client stops
-waiting. Preserve that unresolved ledger as evidence.
-
-## Open-loop measurement
-
-`load_open_loop.py` schedules aggregate **HTTP requests**, not SQL queries.
-Each arrival submits `SELECT 1` or consumes an advertised continuation. A
-two-response fake query normally needs two HTTP requests. SQL counts and
-post-window cleanup are separate. The schedule does not wait for earlier work.
-
-The client reuses verified connections, never retries uncertain requests, caps
-in-flight work, and drops arrivals that exceed capacity or scheduling lag.
-Receipts include offered/achieved/successful HTTP rates, response and scheduled
-p50/p95/p99, errors, scheduling lag, dropped arrivals, CPU time, and outstanding
-continuations. `503` responses are not successful target throughput. Client or
-fixture saturation invalidates a server-capacity conclusion.
-
-Before each warmup or measurement window, the client starts every configured
-executor worker using bounded, no-traffic barrier tasks. Worker preparation
-has a 30-second deadline and releases waiting workers on failure. It does not
-open connections or prewarm the Gateway, database, or backend. Receipts record
-`client_setup_seconds` and `client_setup_method` separately; request timing and
-the existing process-CPU interval exclude this setup. Scheduled-start checks
-still reject a boundary missed during preparation. All warmup error and client
-lag gates remain unchanged.
-
-`client_cgroup_cpu` records cgroup-v2 CPU quota and counters before setup, before
-timed traffic, and after executor completion. Its `setup_and_scheduled_wait`
-span includes any wait for the requested UTC start. Its
-`workload_and_late_completion` span includes late requests and excludes
-continuation cleanup. These are read-bounded intervals, not exact timed-window
-CPU measurements. Counter deltas include CPU usage, quota periods, throttled
-periods, and throttled microseconds. The receipt retains timestamps and CPU
-quota alongside the deltas; it does not infer a cause for scheduling delays.
-
-Missing or unreadable cgroup-v2 files produce `available: false`. Malformed
-data, counter resets, changed quotas, or invalid time order produce
-`valid: false` and no derived deltas for that span. Unlimited CPU quota is
-explicitly represented by a null quota value, not a guessed capacity. These
-diagnostics do not alter workload validity gates. An external capacity audit
-must separately require valid cgroup evidence when its conclusions need it.
-
-### Optional multi-process client
-
-The default client uses one process. Explicit eight-process mode divides the
-aggregate arrival schedule and concurrency limit among eight spawned workers.
-Select it with `--processes 8`, or `client_processes: 8` in a matrix case.
-It does not multiply the requested rate or number of client slots. Each process
-owns its connections and continuations. All workers must finish no-traffic
-preparation before the parent selects their common monotonic and UTC window.
-Staggered global arrival ordinals preserve the aggregate schedule, including
-fractional per-process rates. A late worker cannot move its own window.
-
-The parent computes global latency and scheduling-lag percentiles from pooled
-numeric samples, never from averages of worker percentiles. Final receipts omit
-those raw arrays to keep log output bounded; the percentiles cannot be independently
-reconstructed from the compact receipt alone. Worker count, profile, counters,
-window alignment and sample lengths are checked before aggregation. A missing or
-failed worker invalidates the phase; remaining workers do not replace its share.
-
-`peak_client_inflight` is null in this mode. Its separately named bounds use the
-largest worker peak as the lower bound and the sum of worker peaks as the upper
-bound. The upper bound is not an observed simultaneous peak. Process CPU sums
-worker CPU only; it excludes parent overhead. The parent samples the whole
-container's shared cgroup series per phase and never sums duplicated worker measurements.
-All workers finish measured requests and late completions before that final CPU
-sample. Only then can any worker begin continuation cleanup. Existing request,
-lag, drop, warmup and cleanup gates remain unchanged.
-
-The matrix renderer requires both `load_multiprocess.py` and `load_aggregate.py`
-alongside its four ordinary source modules for this mode. Standalone
-`render_job(..., processes=8, process_sources=...)` requires the same two added
-modules. Selecting more processes does not increase container resources. Review
-CPU, memory and orchestration deadlines for the chosen private client profile.
-
-### Window and response accounting
-
-`window_start_utc` and `window_end_utc` identify the scheduled measurement
-window as ISO 8601 UTC timestamps. One wall-clock sample anchors the monotonic
-schedule; subsequent wall-clock adjustments do not change its end timestamp.
-
-`response_error_categories` separates measured-request and cleanup counts for
-six exact plain-text Gateway `503` messages. It emits fixed category names,
-never response bodies. Unrecognized, wrapped, or modified messages remain
-`unknown_503`; matching a message does not authenticate its origin. In particular,
-`routing_state_unavailable` does not distinguish pool exhaustion, database
-connectivity, lock timeouts, or other internal failures. Existing HTTP status,
-error, retry, and validity behavior is unchanged. These request-phase counters
-can include responses completed after the measurement window; use the existing
-per-second telemetry for in-window rates.
-
-Warmup has a separate nested receipt. Cleanup traffic and requests completed
-after the window do not enter its `second_buckets` or `request_rates`.
-Existing overall error counts still include cleanup failures and invalidate
-the run when appropriate.
-
-Each second bucket records its offset, duration, and HTTP starts, completions,
-successful completions, and failed completions. Empty buckets contain zeros.
-The final bucket can be shorter than one second. Rate minima and maxima use
-each bucket's actual duration; average rates divide total counts by the full
-window duration. These rates count POSTs and continuation GETs together, not
-SQL queries. Existing per-Gateway method counters retain their separate POST
-and GET totals, including separately named cleanup counters.
-
-For aligned cost measurements, `--measurement-start-utc '<ISO-8601-Z-time>'`
-waits after warmup before starting the measurement. The start must be at most
-600 seconds away when warmup finishes. The client rejects starts missed by more
-than one second, including an excessive delay while waiting. Receipts preserve
-the actual window and add `planned_window_start_utc` and
-`measurement_start_drift_seconds`; both are null when no start was requested.
-These timestamps do not establish clock synchronization with the database.
+`TX_LOAD_HOSTNAMES` specifies mapped Host authorities. Each SQL submission rotates
+these inputs independently of continuation arrivals. Every continuation retains
+its initiating Host even when issued through a different Gateway process.
+`X-Trino-Routing-Group` and `X-Forwarded-Host` do not select placement. Expected
+synthetic result identities are keyed by the same hostname values.
 
 ```sh
 export TX_ALLOW_FIXTURE_MUTATION=yes
 export TX_GATEWAY_URLS='<independent-gateway-https-endpoints>'
 export TX_CA_FILE='<private-lab-ca-file>'
 export TX_QUERY_AUTHORIZATION='<runtime-only-query-authorization>'
-export TX_LOAD_ROUTING_GROUPS='<comma-separated-groups>'
-export TX_LOAD_EXPECTED_BACKENDS='<JSON-group-to-fixture-identity-map>'
+export TX_LOAD_HOSTNAMES='<comma-separated-mapped-host-authorities>'
+export TX_LOAD_EXPECTED_BACKENDS='<JSON-hostname-to-fixture-identity-map>'
 python3 testing/transaction-awareness/load_open_loop.py \
-  --rate 1000 --warmup 10 --duration 60 --concurrency 128 \
+  --rate 100 --warmup 10 --duration 60 --concurrency 128 \
   --output '<new-private-receipt-file>'
 ```
 
-For capacity results, use the in-cluster Job from `deploy/render_load_job.py`,
-not a local port-forward bottleneck. Address every Gateway pod separately.
-`TX_TLS_SERVER_NAME=gateway` verifies the lab service certificate while
-connecting to pod addresses; verification remains enabled. Jobs have 2 CPU/
-2 GiB, no API credentials, no retries, no preemption, and finite deadlines.
-They generate synthetic query credentials inside the process and print metrics
-for private capture. Fake backends do not authenticate these credentials; the
-separate real-Trino suites establish authentication and client compatibility.
+Verified TLS remains mandatory. `TX_TLS_SERVER_NAME` may name the expected lab
+certificate identity while connecting to individual pod addresses; it does not
+change Host placement or bypass certificate trust. Without it, the URL hostname
+is verified. Local localhost port-forwards are functional fixtures, not evidence
+of in-cluster capacity.
 
-The checkpoint protocol client also supports `TX_TLS_SERVER_NAME` through the
-same verified connection class. This lets each pod IP retain the expected
-certificate identity without routing through a Service. Certificate-chain and
-hostname verification remain enabled; an incorrect name or untrusted CA fails
-before HTTP dispatch. Without this setting, the URL hostname is verified.
-Bundle `load_open_loop.py` alongside `protocol.py` and `load_checkpoints.py`
-when running checkpoints inside the disposable client Job.
+## Open-loop accounting
 
-`load_checkpoints.Checkpoints` holds a transaction during measurement. Afterwards
-it proves that transaction blocks sealing, switches the group, checks existing
-transaction and new-query placement through every Gateway, rolls back, and
-seals only after observed obligations and retention end. A failure preserves
-evidence. These post-load checks complement, but do not replace, concurrent
-cutover/race tests. The timed throughput window measures steady-state routing.
+`load_open_loop.py` schedules aggregate HTTP requests, not SQL queries. Arrivals
+submit a statement or consume an advertised continuation without waiting for
+earlier work. SQL counts, measured HTTP traffic, and post-window cleanup are
+separate. The bounded client reuses connections, never retries uncertain work,
+caps concurrency, and drops arrivals exceeding its resource or lag limits.
 
-## Matrix and safety
+Before each window, bounded no-traffic barrier tasks prepare every executor
+worker. Setup has its own deadline and accounting; it does not prewarm Gateway,
+PostgreSQL, or backends. Scheduled-start checks reject a missed boundary.
+Optional `--measurement-start-utc '<ISO-8601-Z-time>'` requests a start at most
+600 seconds after warmup; an excessive delay does not silently shift the window.
 
-An explicit concurrent-cutover case can switch the routing group while timed
-traffic continues. See [the concurrent case contract](MATRIX.md#cutover-during-timed-load).
-This is separate from the default checkpoint sequence, which changes routing
-after measurement. Neither fixture workload establishes distributed query or
-large-result performance against a real Trino cluster.
+Private receipts distinguish offered, completed, and successful HTTP rates,
+latency and scheduling-lag distributions, status/error categories, dropped
+arrivals, CPU, and unconsumed continuations. Per-second buckets use their actual
+durations and count POST/GET together. Warmup and cleanup remain separate;
+cleanup failures can invalidate the run. HTTP 503 is not successful throughput,
+and a classified 503 message does not identify its underlying cause.
 
-Compare identical database/client/payload/resources between baseline and fixed
-images. Record image digest, engine/version, actual database capacity, replicas,
-fixture/client resources, and errors. Run ten-second warmups and sixty-second
-measurements at 100 and 1000 HTTP requests/second for 2, 20, and 100 Gateways.
-Compare a hot backend with two independent backends in distinct groups; two
-groups do not establish one-hundred-cell capacity. Repeat successful highest-
-replica 1000-request/second cases for five minutes. Report unmet targets honestly.
-Measure Gateway, client, fixture, and database CPU/memory. Local PostgreSQL is
-not Aurora evidence; configured maximum ACUs are not measured headroom.
+Cgroup-v2 diagnostics separately sample setup/scheduled-wait and
+workload/late-completion intervals. Missing files are unavailable; changed quotas,
+reset counters, malformed values, and invalid ordering invalidate derived deltas.
+These are bounded sampled intervals, not exact timed-window CPU attribution.
+Unlimited quota is not guessed capacity. Client, backend, or database saturation
+precludes a Gateway-capacity conclusion.
 
-The monitor runs once per second in both versions. One hundred Gateways with
-two backends add about two hundred monitor probes per second, beyond measured
-client requests and request-time process checks. Include this background traffic
-when interpreting fixture CPU; keep cadence identical between versions.
+## Eight-process mode
 
-Create with `--without-real-trino --benchmark --gateway-image <verified-digest> --priority-class <approved-test-class>`.
-The existing PriorityClass must have the task ownership label, a negative priority,
-`preemptionPolicy: Never`, and `globalDefault: false`. Obtain explicit approval before
-creating this cluster-scoped test resource. The helper never adopts another application's class.
-Pass the verified class object as `priority_class` to `render_job` and database setup.
-Setting the pod's preemption policy alone does not override priority admission.
-Benchmark fixtures default to 1 CPU/512 MiB. For the full matrix, explicitly
-select `--benchmark-fixture-memory 8Gi` for both baseline and fixed images.
-Allowed memory values are `512Mi`, `2Gi`, `4Gi`, and `8Gi`; CPU stays at 1.
-Review eligible node CPU, memory, pod-IP capacity, and quota before external
-database setup or replica increases. The memory override derives initial
-namespace memory quota from rendered requests and replicas, adds 1 GiB
-headroom, and retains a 16 GiB minimum and 140 GiB maximum. It does not widen
-CPU or pod-count quotas, or prove that eligible nodes can fit these requests.
+`--processes 8` divides the aggregate schedule and concurrency among eight
+spawned workers; it does not multiply either. Workers own their connections and
+continuations, finish no-traffic preparation before a common monotonic/UTC
+window, and complete measured work before any continuation cleanup.
 
-The fixture intentionally retains query results and request history. Account
-for the complete matrix, warmups, reruns, live connections, and history export
-when selecting its memory limit. Python allocator and platform differences make
-local memory estimates insufficient to establish container headroom. The number
-of Gateway replicas does not multiply the aggregate scheduled request count,
-but additional connections and background monitors add overhead.
+Aggregation checks worker count, profiles, counters, sample sizes, and aligned
+windows. Global percentiles use pooled samples, never worker-percentile averages;
+compact final receipts omit raw arrays. Missing/failed workers invalidate the
+phase instead of reallocating their share. Simultaneous inflight peak is unknown;
+reported lower/upper bounds are not an observed peak. Worker CPU sums exclude
+parent overhead, and shared-container cgroup observations are not summed.
 
-Use identical resources for both images. A configured memory allowance is not
-evidence that the full workload fits or that the fixture cannot be a bottleneck.
-Monitor actual memory and account for accumulated queries before adding reruns;
-do not silently discard history, evict query results, or reset an uncertain
-fixture to make a failed run pass. Query IDs use a locked per-incarnation
-sequence instead of a bounded random identifier space.
+`deploy/render_load_job.py` creates bounded, non-preempting Jobs with no API
+credentials or retries. Explicit eight-process mode requires both
+`load_multiprocess.py` and `load_aggregate.py` in `process_sources`. Provide an
+approved, task-owned, negative-priority, non-default PriorityClass with
+`preemptionPolicy: Never`; do not create or adopt cluster-scoped resources without
+authorization. Review client, fixture, database, and replica resources first.
 
-```sh
-python3 testing/transaction-awareness/deploy/lab.py \
-  --context '<authorized-development-context>' \
-  --namespace 'gateway-tx-lab-<unique-id>' configure-load \
-  --database-config '<private-database-json>' --database-ca '<public-ca-file>' \
-  --database-address '<private-database-ip>' --replicas 2 --capacity-reviewed \
-  --priority-class '<approved-test-class>'
-```
+Synthetic credentials generated in these Jobs are not authenticated by the fake
+coordinators. They do not establish real Trino authentication, unmodified-client
+compatibility, or large-result performance. Test those separately.
 
-Database JSON contains only `jdbcUrl`, `user`, `password`, and `driver`.
-Require explicit authorization for credential transfer. JDBC requires
-`sslmode=verify-full&sslrootcert=/etc/database-ca/ca.pem`. Only Gateway pods get
-egress to the supplied private addresses and JDBC port. The quota is bounded
-at 60 CPU/140 GiB/120 pods; only the selected replicas start. Scale one phase
-at a time, wait for every pod, and scale down after high-replica measurements.
-Keep failed-case evidence; use new schemas/identities when prior cases leave
-uncertainty, never purge unresolved state to pass.
+## Lifecycle and preservation boundaries
+
+The obsolete rollout clients, fixed blue/green load checkpoints, concurrent
+cutover driver, and matrix wrapper have been removed. They must not be exported
+as supported pool operations. Use the multi-process pool contracts in README for
+transaction affinity, draining, controller fencing, and query reconciliation;
+steady-state load does not replace those safety checks.
+
+For controlled comparisons, bind each run privately to a source revision and
+immutable artifact plus identical workload, PostgreSQL, client, and backend
+resources. Account for monitor probes and request-time identity checks. Local
+PostgreSQL is not managed-database failover or capacity evidence. Configured
+maximum resources are not measured headroom.
+
+Preserve failed and uncertain work. Do not reset coordinators, evict retained
+results, delete ledger rows, or retry ambiguous requests to manufacture a clean
+run. The fixture retains query/results and request history, so accumulated
+warmups and reruns consume memory. Finite quotas and configured allowances do
+not establish that a complete workload fits.
 
 ```sh
-cd testing/transaction-awareness
-python3 -m unittest test_load_open_loop test_fake_trino test_network_fault_proxy -v
-python3 -m unittest discover -s deploy -p 'test_*.py' -v
+python3 -m unittest -v test_load_open_loop test_load_executor_setup \
+  test_load_client_cpu test_load_error_categories test_load_multiprocess \
+  test_load_aggregate test_protocol_tls
 ```
+
+The retained externally configured overload/deadline and fault oracles also need
+pooled placement setup before execution against a pool-only artifact. A removed
+legacy API or readiness failure is not a transaction-routing regression.

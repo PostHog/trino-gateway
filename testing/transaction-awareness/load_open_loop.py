@@ -205,9 +205,9 @@ class VerifiedNameConnection(http.client.HTTPSConnection):
 class OpenLoop:
     def __init__(self, gateways, groups, authorization, *, rate, duration, concurrency=128,
                  timeout=10, maximum_lag=.05, transport=None, expected_backends=None,
-                 measurement_start_utc=None, processes=1, query_owners=None, cutover_control=None):
+                 measurement_start_utc=None, processes=1):
         if not gateways or not groups or not authorization:
-            raise ValueError("Explicit gateways, routing groups, and runtime authorization are required")
+            raise ValueError("Explicit gateways, mapped hostnames, and runtime authorization are required")
         if not 1 <= rate <= 10000 or not 0 < duration <= 600 or rate * duration > 1_000_000:
             raise ValueError("Keep each run bounded to at most one million requests and ten minutes")
         if not 1 <= concurrency <= 512 or not 0 < timeout <= 120 or maximum_lag <= 0:
@@ -221,15 +221,6 @@ class OpenLoop:
             raise ValueError("Eight processes require a supported aggregate rate, divisible capacity, and independent transports")
         self.processes = processes
         self.rotation_offset = 0
-        self.query_owners = query_owners
-        self.owner_policy = None
-        if query_owners is not None:
-            from load_cutover import QueryOwners
-            self.owner_policy = QueryOwners(query_owners)
-        if cutover_control is not None and (processes != 8 or query_owners is None):
-            raise ValueError("Concurrent cutover requires eight processes and verified query owners")
-        self.cutover_control = cutover_control
-        self.cutover_samples = []
         self.gateways, self.groups, self.authorization = gateways, groups, authorization
         self.rate, self.duration, self.concurrency = rate, duration, concurrency
         self.timeout = timeout
@@ -274,21 +265,20 @@ class OpenLoop:
                     self.counts["started_in_window"] += 1
                 self.record_window_event(started, "started")
         headers = {}
-        expected_query, expected_owner, owner = None, -1, -1
         if continuation:
-            path, expected_backend = continuation[:2]
-            if self.owner_policy is not None:
-                expected_query, expected_owner = continuation[2:]
+            path, expected_backend, hostname = continuation
+            headers = {"Host": hostname}
             method, body = "GET", None
         else:
             method, path, body = "POST", "/v1/statement", "SELECT 1"
             with self.lock:
                 sql_sequence = self.counts["sql_submissions"]
                 self.counts["sql_submissions"] += 1
+            hostname = self.groups[(sql_sequence + self.rotation_offset) % len(self.groups)]
             headers = {"Authorization": self.authorization, "X-Trino-User": "user",
                        "X-Trino-Transaction-Id": "NONE", "Content-Type": "text/plain",
-                       "X-Trino-Routing-Group": self.groups[(sql_sequence + self.rotation_offset) % len(self.groups)]}
-            expected_backend = self.expected_backends.get(headers["X-Trino-Routing-Group"])
+                       "Host": hostname}
+            expected_backend = self.expected_backends.get(headers["Host"])
         with self.lock:
             index = (self.method_counts[method] + self.rotation_offset + (1 if method == "GET" else 0)) % len(self.gateways)
             self.method_counts[method] += 1
@@ -298,11 +288,6 @@ class OpenLoop:
             status, raw = self.transport.request(index, method, path, body, headers)
             if status == 200:
                 payload = json.loads(raw)
-                if self.owner_policy is not None:
-                    owner, query_id = self.owner_policy.observe(payload)
-                    if expected_query is not None and (query_id != expected_query or owner != expected_owner):
-                        raise ValueError("Continuation changed its initial query identity or owner")
-                    expected_backend = self.owner_policy.identities[owner]
                 if "error" in payload:
                     error = "sql_error"
                 if expected_backend is not None and payload.get("data") != [[expected_backend]] and not payload.get("nextUri"):
@@ -326,11 +311,6 @@ class OpenLoop:
             if response_category:
                 self.response_error_categories["cleanup" if cleanup else "measured"][response_category] += 1
             if not cleanup:
-                if self.owner_policy is not None:
-                    self.cutover_samples.append([0 if method == "POST" else 1,
-                        started - self.window_beginning, transport_started - self.window_beginning,
-                        finished - self.window_beginning, scheduled - self.window_beginning,
-                        status or 0, int(error is not None), owner, expected_owner])
                 self.latencies.append((finished - started) * 1000)
                 self.corrected_latencies.append((finished - scheduled) * 1000)
                 if finished <= end:
@@ -342,9 +322,7 @@ class OpenLoop:
             if payload and not error:
                 if payload.get("nextUri"):
                     uri = urlsplit(payload["nextUri"])
-                    continuation = (uri.path + ("?" + uri.query if uri.query else ""), expected_backend)
-                    if self.owner_policy is not None:
-                        continuation += (query_id, owner)
+                    continuation = (uri.path + ("?" + uri.query if uri.query else ""), expected_backend, hostname)
                     self.pending.append(continuation)
                 else:
                     self.counts["sql_completed"] += 1
@@ -458,7 +436,7 @@ class OpenLoop:
                 "client_lag_ms": distribution(self.lags), "client_dropped_requests": dropped,
                 "client_bottleneck_detected": dropped > 0 or (percentile(self.lags, .99) or 0) > 5,
                 "client_concurrency": self.concurrency, "peak_client_inflight": self.peak_inflight,
-                "gateway_endpoints": len(self.gateways), "routing_groups": len(self.groups),
+                "gateway_endpoints": len(self.gateways), "hostnames": len(self.groups),
                 "per_gateway_counts": [dict(counts) for counts in self.gateway_counts],
                 "client_cpu_seconds": cpu_elapsed, "client_average_cpu_cores": cpu_elapsed / measured_elapsed,
                 "backend_result_rows": dict(self.backend_rows), "unconsumed_continuations": len(self.pending),
@@ -480,7 +458,7 @@ def main():
     if os.environ.get("TX_ALLOW_FIXTURE_MUTATION") != "yes":
         parser.error("Only explicitly authorized disposable fixtures may receive load")
     gateways = [item.rstrip("/") for item in os.environ.get("TX_GATEWAY_URLS", "").split(",") if item]
-    groups = [item for item in os.environ.get("TX_LOAD_ROUTING_GROUPS", "").split(",") if item]
+    groups = [item for item in os.environ.get("TX_LOAD_HOSTNAMES", "").split(",") if item]
     expected = json.loads(os.environ.get("TX_LOAD_EXPECTED_BACKENDS", "{}"))
     if args.warmup < 0 or args.warmup > 60:
         parser.error("Warmup must be between zero and sixty seconds")

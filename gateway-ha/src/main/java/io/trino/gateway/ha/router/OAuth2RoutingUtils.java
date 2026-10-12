@@ -126,7 +126,7 @@ public final class OAuth2RoutingUtils
      * the initiate and poll legs are already pinned by. We decode the JWT payload (base64url, without
      * verifying the signature — this only selects a backend; the coordinator still verifies it) and
      * return that {@code authIdHash} so the callback is pinned to the same coordinator that minted the
-     * handshake, without depending on {@link OAuth2GatewayCookie}. Empty if this is not a callback,
+     * handshake. Empty if this is not a callback,
      * the {@code state} is absent, it is a browser-UI login (no {@code handler_state}), or the state
      * cannot be parsed — in which case the caller falls back to normal (cookie/stochastic) routing.
      */

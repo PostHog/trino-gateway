@@ -236,7 +236,7 @@ class MultiprocessTests(unittest.TestCase):
                        "--rate", "100", "--duration", ".08", "--warmup", "0", "--concurrency", "8",
                        "--processes", "8", "--measurement-start-utc", "2000-01-01T00:00:00Z", "--output", str(output)]
             environment = dict(os.environ, TX_ALLOW_FIXTURE_MUTATION="yes", TX_GATEWAY_URLS="https://unused.invalid",
-                               TX_LOAD_ROUTING_GROUPS="fixture", TX_QUERY_AUTHORIZATION="runtime")
+                               TX_LOAD_HOSTNAMES="fixture", TX_QUERY_AUTHORIZATION="runtime")
             environment.pop("TX_CA_FILE", None)
             result = subprocess.run(command, env=environment, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 1, result.stderr)
@@ -261,7 +261,7 @@ class MultiprocessTests(unittest.TestCase):
                 self.requests = []
 
             def request(self, index, method, path, body, headers):
-                self.requests.append((index, headers["X-Trino-Routing-Group"]))
+                self.requests.append((index, headers["Host"]))
                 return super().request(index, method, path, body, headers)
 
         for rate in (100, 1000):

@@ -129,27 +129,9 @@ Returns a JSON array of active Trino clusters:
 curl -X POST http://localhost:8080/gateway/backend/activate/trino-2
 ```
 
-## Update routing rules
+## Hostname routing configuration
 
-This endpoint is part of the `/webapp` endpoint family and requires the
-`ADMIN` role.
-
-The API can be used to programmatically update the routing rules. Rule are
-updated based on the rule name. Storage of the rules must use a writeable file
-and the configuration 'rulesType: FILE'.
-
-For this feature to work with multiple replicas of the Trino Gateway, you must
-provide a shared storage that supports file locking for the routing rules file.
-If multiple replicas are used with local storage, then rules get out of
-sync when updated.
-
-```shell
-curl -X POST http://localhost:8080/webapp/updateRoutingRules \
- -H 'Content-Type: application/json' \
- -d '{  "name": "trino-rule",
-        "description": "updated rule description",
-        "priority": 0,
-        "actions": ["updated action"],
-        "condition": "updated condition"
-    }'
-```
+Hostname-to-pool placement is configured through `routing.hostnameToPool` and
+`routing.hostnameSuffixToPool`. See [Hostname routing](routing-rules.md).
+The legacy `/webapp/getRoutingRules` and `/webapp/updateRoutingRules` endpoints
+are no longer available.

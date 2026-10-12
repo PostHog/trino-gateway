@@ -23,7 +23,7 @@ class AggregateTests(unittest.TestCase):
             result = dict(target_http_rps=rate / 8, scheduled_http_requests=count, client_concurrency=concurrency // 8,
                           window_seconds=duration, window_start_utc="2026-01-01T00:00:00Z",
                           window_end_utc=end, gateway_endpoints=2,
-                          routing_groups=1, final_inflight=0, peak_client_inflight=min(count, 2),
+                          hostnames=1, final_inflight=0, peak_client_inflight=min(count, 2),
                           completion_elapsed_seconds=duration + .1, client_cpu_seconds=.01,
                           counts=dict(started=count, completed=count, started_in_window=count,
                                       completed_in_window=count, successful_in_window=count,

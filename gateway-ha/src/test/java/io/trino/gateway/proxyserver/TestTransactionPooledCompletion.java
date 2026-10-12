@@ -20,7 +20,6 @@ import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.HttpClient.HttpResponseFuture;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
-import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.module.HaGatewayProviderModule;
 import io.trino.gateway.ha.persistence.DatabaseDeadline;
@@ -30,9 +29,8 @@ import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.QueryHistoryManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
-import io.trino.gateway.ha.router.RoutingManager;
+import io.trino.gateway.ha.transaction.PooledTransactionStoreFixture;
 import io.trino.gateway.ha.transaction.TransactionAwarenessService;
-import io.trino.gateway.ha.transaction.TransactionStore;
 import io.trino.gateway.ha.transaction.TransactionStore.ResponseObservation;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import jakarta.servlet.http.HttpServletRequest;
@@ -131,12 +129,11 @@ class TestTransactionPooledCompletion
             configuration.getTransactionAwareness().setAdminToken("synthetic-admin-key-for-pooled-completion");
             configuration.getTransactionAwareness().setMaxInFlightRequests(1);
             configuration.getTransactionAwareness().setCompletionThreads(1);
-            GatewayCookieConfigurationPropertiesProvider.getInstance().initialize(configuration.getGatewayCookieConfiguration());
             FlywayMigration.migrate(database);
             Jdbi observer = Jdbi.create(schemaUrl, username, password);
             try (GatewayDataSource source = new GatewayDataSource(configuration)) {
                 Jdbi pooled = HaGatewayProviderModule.provideJdbi(source);
-                TransactionStore store = new TransactionStore(pooled);
+                PooledTransactionStoreFixture store = new PooledTransactionStoreFixture(pooled);
                 store.ensureBackend("blue", "http://blue.example.test", null, "group", "node", "abcde");
                 var initial = store.admitNew("blue", "owner", "group");
                 String capability = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(PATH.getBytes(UTF_8)));
@@ -147,15 +144,17 @@ class TestTransactionPooledCompletion
                 when(info.getStatusCode()).thenReturn(200);
                 when(info.getBody()).thenReturn("{\"coordinator\":true,\"starting\":false,\"nodeId\":\"node\",\"coordinatorId\":\"abcde\"}");
                 when(monitor.execute(any(), any())).thenReturn(info);
-                TransactionAwarenessService service = new TransactionAwarenessService(configuration, pooled, mock(GatewayBackendManager.class), monitor, mock(RoutingGroupSelector.class), new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
+                RoutingGroupSelector selector = mock(RoutingGroupSelector.class);
+                when(selector.findRoutingDestination(any())).thenReturn(new io.trino.gateway.ha.router.schema.RoutingSelectorResponse("group"));
+                TransactionAwarenessService service = new TransactionAwarenessService(configuration, pooled, mock(GatewayBackendManager.class), monitor, selector, new io.trino.gateway.ha.transaction.TransactionLifecycleStats());
                 HttpClient proxy = mock(HttpClient.class);
                 SettableFuture<ProxyResponse> raw = SettableFuture.create();
                 doReturn(new TestingResponseFuture(raw)).when(proxy).executeAsync(any(), any());
-                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(RoutingManager.class), mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), configuration);
+                ProxyRequestHandler handler = new ProxyRequestHandler(proxy, mock(QueryHistoryManager.class), mock(OAuth2RoutingStore.class), configuration);
                 handler.setTransactionAwareness(service);
                 try {
                     HttpServletRequest original = request();
-                    var target = service.resolve(original, () -> { throw new AssertionError("Unexpected ordinary routing"); }, _ -> { throw new AssertionError("Unexpected backend selection"); });
+                    var target = service.resolve(original);
                     UUID pending = observer.withHandle(handle -> handle.createQuery("SELECT admission_id FROM transaction_admission WHERE state = 'PENDING'").mapTo(UUID.class).one());
                     AsyncResponse client = mock(AsyncResponse.class);
                     doAnswer(_ -> {

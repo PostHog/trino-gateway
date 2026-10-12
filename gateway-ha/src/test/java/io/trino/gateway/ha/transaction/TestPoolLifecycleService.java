@@ -111,11 +111,10 @@ class TestPoolLifecycleService
     }
 
     @Test
-    void theProtocolIsAbsentUntilItIsExplicitlyEnabled()
+    void disabledPoolIsRefusedAtStartup()
     {
-        PoolLifecycleService service = service(false);
-        assertThat(service.isEnabled()).isFalse();
-        expect(404, "POOL_DISABLED", () -> service.requireAdmin(request(Map.of("Authorization", List.of("Bearer " + ADMIN_TOKEN)))));
+        assertThatThrownBy(() -> service(false)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("requires pooled");
     }
 
     @Test
@@ -130,15 +129,11 @@ class TestPoolLifecycleService
     }
 
     @Test
-    void theProtocolIsAlsoAbsentWhenTransactionAwarenessItselfIsDisabled()
+    void disabledTransactionAwarenessIsRefusedAtStartup()
     {
         configuration.getTransactionAwareness().setEnabled(false);
-        configuration.getTransactionAwareness().setIdentityKey(null);
-        configuration.getTransactionAwareness().setAdminToken(null);
-        PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
-        pool.setEnabled(false);
-        configuration.getTransactionAwareness().setPool(pool);
-        assertThat(service(false).isEnabled()).isFalse();
+        assertThatThrownBy(() -> service(true)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("requires transaction awareness");
     }
 
     @Test

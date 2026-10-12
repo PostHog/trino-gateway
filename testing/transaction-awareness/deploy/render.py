@@ -108,8 +108,14 @@ def render(namespace, password, fake_source=None, *, tls_files=None, proxy_sourc
                env=[{"name": "POSTGRES_DB", "value": "gateway"}, {"name": "POSTGRES_USER", "value": "gateway"},
                     {"name": "PGDATA", "value": "/var/lib/postgresql/data/pgdata"},
                     {"name": "POSTGRES_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "postgres-password", "key": "password"}}}])
-    gateway_config = {"serverConfig": {"node.environment": "transaction_test", "http-server.http.port": 8080},
-                      "routingRules": {"rulesEngineEnabled": False},
+    gateway_config = {"serverConfig": {"node.environment": "transaction_test", "http-server.http.port": 8080,
+                                       "http-server.process-forwarded": "ignore"},
+                      "routing": {"hostnameToPool": {"localhost": "transaction-test", "gateway": "transaction-test",
+                                                     f"gateway.{namespace}.svc": "transaction-test",
+                                                     f"gateway.{namespace}.svc.cluster.local": "transaction-test"}},
+                      "transactionAwareness": {"enabled": True, "pool": {"enabled": True},
+                                               "identityKey": hmac.new(password.encode(), b"lab-tx-identity", hashlib.sha256).hexdigest(),
+                                               "adminToken": hmac.new(password.encode(), b"lab-pool-admin", hashlib.sha256).hexdigest()},
                       "dataStore": {"jdbcUrl": "jdbc:postgresql://postgres:5432/gateway", "user": "gateway", "password": password,
                                     "driver": "org.postgresql.Driver", "queryHistoryHoursRetention": 24},
                       "clusterStatsConfiguration": {"monitorType": "INFO_API"}, "monitor": {"taskDelay": "1s", "queryTimeout": "5s"}}

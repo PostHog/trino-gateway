@@ -2,9 +2,11 @@ serverConfig:
   node.environment: test
   http-server.http.port: 8080
 
-routingRules:
-  rulesEngineEnabled: False
-  # rulesConfigPath: "src/main/resources/rules/routing_rules.yml"
+routing:
+  hostnameSuffixToPool:
+    dw.example.test: pool-one
+  hostnameToPool:
+    warehouse-two.dw.example.test: pool-two
 
 dataStore:
   jdbcUrl: jdbc:postgresql://postgres:5432/trino_gateway_db
@@ -15,3 +17,10 @@ dataStore:
 
 clusterStatsConfiguration:
   monitorType: INFO_API
+
+transactionAwareness:
+  enabled: true
+  identityKey: ${ENV:GATEWAY_TRANSACTION_IDENTITY_KEY}
+  adminToken: ${ENV:GATEWAY_TRANSACTION_ADMIN_TOKEN}
+  pool:
+    enabled: true

@@ -16,15 +16,11 @@ package io.trino.gateway.proxyserver;
 import com.google.common.collect.ImmutableListMultimap;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
-import io.trino.gateway.ha.config.GatewayCookieConfiguration;
-import io.trino.gateway.ha.config.GatewayCookieConfigurationPropertiesProvider;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.router.OAuth2RoutingStore;
 import io.trino.gateway.ha.router.QueryHistoryManager;
-import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.proxyserver.ProxyResponseHandler.ProxyResponse;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
@@ -53,13 +49,6 @@ final class TestProxyRequestHandlerOAuth2
     private static final URI REMOTE_URI = URI.create("http://coord-a:8080/oauth2/token/AUTH9");
 
     private final List<ProxyRequestHandler> handlers = new ArrayList<>();
-
-    @BeforeAll
-    void initCookieSingleton()
-    {
-        // ProxyRequestHandler reads the (disabled-by-default) cookie singleton in its constructor.
-        GatewayCookieConfigurationPropertiesProvider.getInstance().initialize(new GatewayCookieConfiguration());
-    }
 
     @AfterAll
     void cleanup()
@@ -117,7 +106,6 @@ final class TestProxyRequestHandlerOAuth2
         config.getRouting().setOauth2RoutingEnabled(oauth2RoutingEnabled);
         ProxyRequestHandler handler = new ProxyRequestHandler(
                 mock(HttpClient.class),
-                mock(RoutingManager.class),
                 mock(QueryHistoryManager.class),
                 store,
                 config);

@@ -1,310 +1,122 @@
-# Transaction-awareness integration tests
+# Pooled hostname-routing integration tests
 
-See [OPERATIONS.md](OPERATIONS.md) for supported modes, configuration, cutover
-steps and failure boundaries. See [BASELINE.md](BASELINE.md) for the baseline
-comparison procedure and [client/README.md](client/README.md) for the native JDBC
-fixture. [VALIDATION.md](VALIDATION.md) defines the verification checklist.
-Keep all execution results and deployment outcomes private, including sanitized
-summaries; publish only generic procedures, fixtures, and tests.
+Read [VALIDATION.md](VALIDATION.md) for the verification checklist and
+[BASELINE.md](BASELINE.md) for controlled comparisons. Keep execution results,
+artifact identities, generated credentials, and Gateway/database logs private,
+outside this public repository. Fixtures must never target customer services.
 
-This directory contains a Python standard-library black-box test suite and a protocol-focused Trino test double. Use Python 3.9 or newer on Linux and Python 3.10 or newer on macOS. The multi-process fixtures require a monotonic clock shared across processes, which macOS Python added in 3.10. The suite deliberately separates baseline controls from the new transaction-awareness contract. Contract failures against upstream are regression evidence, not a successful implementation.
+## Supported multi-process contracts
 
-All endpoints must belong to an isolated, disposable test environment. The suite changes backend activation, routing and drain state. It must never target customer services. Fixture control endpoints have no authentication and must remain restricted to the test network.
+`gateway_fixture.py` starts two independent Gateway JVMs, a shared disposable
+PostgreSQL database, and independent protocol-focused synthetic coordinators.
+Every test gets fresh database state, a shared generated identity key, and a
+generated administration credential. Both `transactionAwareness.enabled` and
+`transactionAwareness.pool.enabled` are true.
 
-After configuring the runtime variables below, `run_contracts.py --suite normal`
-runs the complete normal contract in order and stops at the first failure.
-Use `--suite fault` only in a separate expendable lab; coordinator replacement
-runs last. `--suite real` uses the real Trino endpoints. Add `--list` to inspect
-the selected tests without contacting any endpoint. The runner can derive
-`TX_QUERY_AUTHORIZATION` from the private `TX_TRINO_USER` and `TX_TRINO_PASSWORD`
-variables without printing either credential. Native JDBC and Gateway restart
-tests remain separate, exclusive operations.
+The fixture maps `routing.hostnameToPool.localhost` to `cell`. Gateway URLs are
+`http://localhost:<port>`: the real HTTP Host includes a mapped DNS name and port.
+There is no default routing group or header-based selection. Gateway's HTTP
+server ignores forwarded headers. Backend registry entries start active but
+cannot admit queries until certified through the pooled member protocol.
 
-## Components
-
-- `fake_trino.py`: independent backend-local transactions, standard statement and continuation responses, transaction lifecycle headers, replayable result pages and controllable response barriers.
-- `protocol.py`: HTTP client that preserves repeated headers and can send successive requests through different Gateway processes.
-- `test_fake_trino.py`: local fixture self-tests. These establish fixture behavior, not Gateway correctness.
-- `test_gateway.py`: baseline controls and transaction contract assertions against separate Gateway processes sharing one PostgreSQL database.
-- `test_adversarial.py`: additional identity, replay, query-error and seal-interleaving assertions.
-- `test_protocol_boundaries.py`: canonical statement paths, heartbeat accounting and unsupported method/result-mode checks.
-- `test_reincarnation.py`: three blue/green reuse cycles with stale-generation and old-query rejection.
-- `network_fault_proxy.py`: TCP-transparent database fault boundary with an isolated HTTP control port.
-- `test_faults.py`: response-loss, conflicting-header, cancellation, database-outage and coordinator-restart assertions.
-- `deploy/`: environment setup and runtime configuration, maintained separately from the protocol suite.
-
-Start two fake backends with different identities:
-
-```sh
-python3 fake_trino.py --host 0.0.0.0 --port 8080 --identity blue
-python3 fake_trino.py --host 0.0.0.0 --port 8081 --identity green
-```
-
-The fixture supports `GET /v1/info`, `GET /v1/cluster`, `POST /v1/statement`, `GET` continuation pages, `HEAD` heartbeats and query cancellation. It accepts a trailing slash on statement POSTs. `START TRANSACTION` returns `X-Trino-Started-Transaction-Id`; `COMMIT` and `ROLLBACK` return `X-Trino-Clear-Transaction-Id`. An unknown transaction produces a Trino-style JSON query error with HTTP 200, which differs from Gateway rejection before forwarding.
-
-Direct fixture controls are `GET /__test/state`, `POST /__test/reset`, `POST /__test/config`, `POST /__test/restart` and `POST /__test/release`. Each simulated process has a distinct `nodeId` and `coordinatorId`; query IDs use that coordinator suffix. Restart changes both identities and clears backend-local transactions and query results. It does not simulate process recovery or migrate a transaction.
-
-Configuration supports `start_header_page` and `clear_header_page` (0 for the initial response, 1 for the continuation), `hold_start`, `hold_poll`, `drop_start_response`, `drop_poll_response`, `duplicate_start_headers` (`same` or `conflict`), `force_transaction_id`, `query_error`, `fail_commit`, `lowercase_headers`, `malformed_terminal`, `terminal_trailing_bytes`, `terminal_padding_bytes` and `initial_status`. The last option changes the response status after backend acceptance; it tests ambiguous errors rather than authentication failures. Release can select a barrier with `{"kind":"start"}` or `{"kind":"poll"}`; the default releases both. State records request methods, paths, SQL and transaction headers, but not Authorization. Do not put real credentials or data in fixture queries.
-
-## Configuration
-
-Register the two fixture backends in the same Gateway routing group. Use distinct Gateway process endpoints, not two URLs for one load-balanced service. At least two Gateway URLs are required; six can be supplied to exercise every replica. Backend health and database connectivity must work before running either suite.
+From this directory, set these runtime variables outside the repository:
 
 | Variable | Meaning |
 | --- | --- |
-| `TX_ALLOW_FIXTURE_MUTATION` | Must be `yes`; explicit acknowledgement of test mutations. |
-| `TX_GATEWAY_URLS` | Comma-separated URLs for at least two independent Gateway processes. |
-| `TX_BACKEND_URLS` | Two directly reachable fixture URLs, in blue/green order. |
-| `TX_BACKEND_PROXY_URLS` | Corresponding URLs registered with Gateway; defaults to the direct URLs. |
-| `TX_BACKEND_NAMES` | Registered names; defaults to `blue,green`. |
-| `TX_ROUTING_GROUP` | Shared fixture group; defaults to `transaction-test`. |
-| `TX_ADMIN_TOKEN` | Required bearer token for feature-enabled admin calls. Omit it only for the feature-disabled upstream baseline. |
-| `TX_QUERY_AUTHORIZATION` | Required query authorization header, supplied from disposable fixture credentials at runtime. There is no working default. |
-| `TX_READINESS_TIMEOUT_SECONDS` | Backend health convergence deadline; defaults to 120 seconds for upstream health polling. |
-| `TX_CA_FILE` | Optional private CA file for HTTPS fixture endpoints. Certificate and hostname verification remain enabled. |
-| `TX_DATABASE_FAULT_URL` | Direct URL for the isolated TCP proxy's HTTP control port. |
-| `TX_ALLOW_IRREVERSIBLE_FAULTS` | Must be `yes` for fault suites that intentionally leave uncertain obligations or restart a coordinator. |
-
-Keep actual endpoint values, secrets and raw environment output outside the repository. For transaction-aware runs, enable the feature and configure the same randomly generated identity key on every Gateway. See the feature configuration documentation for the key requirements. Do not disable authentication binding to make tests pass.
-
-The fixture setup must generate its credentials outside the repository. Tests use those runtime credentials for successful requests and generate different credentials for negative cases. Do not publish environment files or successful Authorization values.
-
-## Run the suites independently
-
-From this directory:
+| `GATEWAY_TEST_JAVA` | Java executable compatible with the tested Gateway artifact. |
+| `GATEWAY_TEST_CLASSPATH` | Gateway compiled classes and dependencies, or its packaged classpath. |
+| `GATEWAY_TEST_PG_BIN` | Directory containing `initdb`, `pg_ctl`, and `psql`; run as a non-root user. |
+| `GATEWAY_TEST_LOG_DIR` | Optional private directory outside the repository retaining per-fixture JVM and PostgreSQL logs. |
 
 ```sh
-python3 -m unittest -v test_fake_trino
-python3 -m unittest -v test_network_fault_proxy
-python3 -m unittest -v test_gateway.BaselineControls
-python3 -m unittest -v test_gateway.TransactionContract
-python3 -m unittest -v test_adversarial
-python3 -m unittest -v test_protocol_boundaries
-python3 -m unittest -v test_reincarnation
+python3 -m unittest -v test_pool_lifecycle test_graceful_shutdown test_whole_query_cancel
 ```
 
-The separate `test_cross_group` suite needs a third independent fake backend and a different routing group. Supply `TX_DESTINATION_BACKEND_URL`, `TX_DESTINATION_BACKEND_NAME`, and `TX_DESTINATION_ROUTING_GROUP` after registering that backend. It changes the routing-group input for new requests and verifies that existing transactions and result continuations keep their original owner. This simulates a placement decision; it does not test customer provisioning, catalog migration, or tenant authorization.
+`test_pool_lifecycle` covers:
+
+- Host mapping on independent replicas; spoofed `X-Trino-Routing-Group` and
+  `X-Forwarded-Host` cannot change placement.
+- Unmapped valid Host rejection with HTTP 421 before coordinator dispatch.
+- No fallback to active nonpooled registry entries, including an absent or empty
+  pool, followed by a successfully admitted-member positive control.
+- Bootstrap, serving floors, surge and repair budgets, concurrent drain
+  serialization, replayed admissions, and controller-epoch fencing.
+- Cross-replica transaction and query affinity during drain: new statements
+  exclude the draining member while existing transactions and continuations
+  retain their original coordinator.
+- Suspect-member replacement, forgotten executing queries, authenticated absence
+  receipts, and lifecycle locks that do not stall admitted response completion.
+
+`test_graceful_shutdown` holds a continuation, sends SIGTERM to its Gateway,
+requires the admitted response to finish before process exit, and then replays
+that result and commits an existing transaction through the other replica.
+Its ten-second HTTP stop timeout is a bounded fixture setting, not proof of
+unlimited request survival or a production load-balancer drain guarantee.
+
+`test_whole_query_cancel` uses pooled bootstrap and lifecycle APIs. It preserves
+inflight admissions, result retention, and explicit transactions as seal blockers,
+checks partial cancellation and non-GET 404 boundaries, and verifies the handling
+replica's lifecycle metrics.
+
+These are real HTTP and PostgreSQL serialization tests, not mock-only distributed
+correctness claims. They start no Kubernetes resources, real Trino coordinator,
+or production credential store. They do not establish tenant authorization,
+transaction replication, coordinator-loss recovery, or throughput guarantees.
+
+## Protocol and fault tools
+
+`fake_trino.py` implements statement/result requests, backend-local transactions,
+replayable continuations, heartbeat and cancellation responses, independent
+coordinator identities, and observable response barriers. Its unauthenticated
+`/__test/*` controls must remain on an isolated test network. State records paths,
+SQL, and transaction headers, but never Authorization; use only synthetic SQL.
+
+`protocol.py` preserves repeated HTTP headers and verifies TLS. An explicitly
+supplied Host replaces, rather than duplicates, its automatic URL Host. Changing
+Host does not alter the verified TLS server identity. `network_fault_proxy.py`
+provides an isolated TCP-transparent PostgreSQL fault boundary and a separate
+HTTP control port. None of these tools authorizes clearing uncertain ledger rows.
 
 ```sh
-python3 -m unittest -v test_cross_group
-python3 -m unittest -v test_capabilities
+python3 -m unittest -v test_fake_trino test_network_fault_proxy test_protocol_tls
+python3 -m unittest -v test_fault_recovery
 ```
 
-`test_capabilities` verifies advertised result URLs across replicas and rejects forged result and cancellation paths before backend dispatch.
+The remaining externally configured protocol, adversarial, fault, restart, and
+real-client modules retain useful individual regression oracles. Their historical
+blue/green placement setup is not the supported pooled fixture and must be
+adapted before executing them against a pool-only Gateway. Do not treat a missing
+legacy administration endpoint, bootstrap error, or configuration rejection as
+transaction-affinity evidence. The former rollout/cutover clients and fixed
+blue/green load-checkpoint drivers have been removed rather than exported as
+supported operations.
 
-Missing fixture configuration is an error, not a skipped test. Baseline controls must pass before interpreting contract failures. There are no expected-failure annotations. Record the tested Gateway commit, image, process count, database configuration and commands with each run. Keep private runtime details in an untracked receipt outside the repository.
+For genuine baseline comparisons, establish healthy controls first and record
+any compatibility-only configuration differences privately. Contract assertion
+failures are distinct from compilation, readiness, TLS, authentication, and
+database failures. Preserve unresolved work rather than resetting its ledger.
 
-## Contract
+## Bounded load and deployment tooling
 
-The tests exercise transaction affinity across backend cutover and every configured Gateway, ownership discovered on continuation pages, unknown and malformed IDs, duplicate headers, identity replay, completion, backend URL reuse, pending admissions, drain races and explicit seal rejection. New transactions can move to the new backend; existing transactions cannot migrate between coordinators.
+The core `load_open_loop.py`, eight-process supervisor, and aggregation tools
+remain available. `TX_LOAD_HOSTNAMES` specifies explicitly mapped Host authorities,
+not routing-group headers; continuations preserve the originating Host when
+switching Gateway replicas. TLS name verification remains independent of Host.
+Expected synthetic result identities are keyed by the same hostname inputs.
+Use only approved, bounded disposable profiles and keep every receipt private.
 
-Modern clients can advertise spooled-result encodings while still accepting inline results. The boundary test requires Gateway to remove that advertisement before forwarding and return a complete inline query result. The fake backend records the encoding header so an ignored advertisement cannot falsely pass this check.
-
-The admin contract uses `/gateway/transactions/backends/{name}/drain`, `/seal`, `/resume`, and `/gateway/transactions/cutover`. Resume and seal carry the current `generation` from drain status. Cutover is removed with `DELETE /gateway/transactions/cutover/{routingGroup}` during cleanup. A drain snapshot is not shutdown authorization: `drained` is true only after an atomic seal succeeds.
-
-With the feature enabled, the fixture changes placement through durable cutover and resume operations. Legacy activate/deactivate operations and active-flag changes must reject with HTTP 409. The upstream baseline uses those legacy operations because the durable API does not exist there. The backend-affinity assertions are the same in both modes.
-
-Reusing a fixed backend URL requires routing away, draining and sealing its old incarnation before restarting its process. `POST /gateway/transactions/backends/{name}/reincarnate` receives the expected old `generation` and `incarnation`. The replacement starts in `DRAINING` and requires an explicit resume. Old query bindings remain attached to the sealed historical incarnation; they must never reach the new process.
-
-Run each complete contract against a fresh fixture when collecting upstream failure evidence. Upstream cannot reconcile its missing ownership ledger; failed scenarios can leave backend-local transactions. The fixture does not pretend that direct backend cleanup reconciles an enabled Gateway ledger. A failed run must be diagnosed before reusing its state for drain assertions.
-
-## Fault injection
-
-Point every test Gateway's JDBC connection at the TCP proxy, not directly at PostgreSQL:
+The deployment renderer emits hostname mappings and mandatory transaction/pool
+settings. Its generated administration and identity keys remain distinct. Local
+Gateway forwards use localhost, which is covered by the lab certificates and
+hostname map. Registry registration is not certification: configure the pool and
+admit its members through the pooled API before any load or real-client request.
+Use an explicitly selected compatible, pinned Gateway artifact, not a legacy
+upstream image with unsupported pooled configuration.
 
 ```sh
-python3 network_fault_proxy.py --host 0.0.0.0 --port 15432 \
-  --control-port 8080 --upstream-host postgres --upstream-port 5432
+python3 -m unittest discover -s deploy -p 'test_*.py' -v
 ```
 
-`POST /__test/config` with `{"available":false}` closes existing sockets and rejects new connections. `{"available":true}` permits new connections again. There is no bypass or fallback route. The tests force backend acceptance with an observable barrier before disabling database access, so response-recording failures are distinct from failures before admission.
-
-Run irreversible fault tests after all normal suites, preferably with a fresh fixture per method. Database-outage and uncertain-response tests intentionally leave durable obligations. The restarted-coordinator test is last and intentionally does not resume or clean up the old incarnation. Discard the lab afterward; do not delete ledger rows to describe these cases as successfully drained.
-
-```sh
-python3 -m unittest -v test_faults.DatabaseFaultContract
-python3 -m unittest -v test_partial_cancel
-python3 -m unittest -v test_faults.FaultContract
-```
-
-These suites require explicit fault opt-in. Their assertions compare obligation counts before and after each injected fault. Existing uncertain rows cannot substitute for evidence that the new fault was tracked. A PostgreSQL outage affects every fixture Gateway, so no other suite may run concurrently against that lab.
-
-`test_partial_cancel` uses the optional fake `partial_cancel` setting to advertise Trino's stage-cancellation URI shape. DELETE must remain on the original owner after cutover. A 204 response settles only that request, not its query or transaction. Unsupported-method checks retain uncertain admissions, so run this suite before the coordinator-restart test. It does not replace cancellation against real Trino.
-
-`test_whole_query_cancel` starts two Gateway processes with a shared disposable
-PostgreSQL instance. It verifies successful whole-query cancellation across
-replicas, concurrent result requests, retained results, late heartbeats, and
-independent transaction completion. Run it with the same `GATEWAY_TEST_JAVA`,
-`GATEWAY_TEST_CLASSPATH`, and `GATEWAY_TEST_PG_BIN` settings as `test_rollout_api`.
-The CI transaction suite includes it.
-
-### Abandoned-query drain recovery
-
-A successful whole-query `DELETE` response with HTTP 204 marks the query terminal
-and retains its binding for `terminalRetentionSeconds`. Existing requests still
-block sealing, and cancellation does not close an explicit transaction. Partial
-stage cancellation, failed cancellation, and query metadata reporting
-`FINISHED` do not establish that a whole query and its retained results are done.
-
-An HTTP 404 from a routed `GET` to an exact, previously issued executing-result
-capability also marks that query terminal. Gateway verifies the capability and
-coordinator identity before dispatch. The binding remains retained for
-`terminalRetentionSeconds`, and existing admissions and explicit transactions
-still block drain. The response remains HTTP 404: this releases an unavailable
-query's drain obligation; it does not recover the query or its results.
-
-This exception does not apply to `HEAD`, queued results, partial cancellation,
-metadata requests, or stale-result HTTP 410 responses. Those responses do not
-prove that executing results are unavailable. HTTP 404 from `DELETE` also keeps
-its existing conservative behavior.
-
-This change does not automatically clear historical abandoned queries. If a
-client never consumes its final response, the query binding remains a drain
-blocker; it has no unconditional age timeout. After confirming that the query is
-abandoned and obtaining authorization to cancel it, send an owner-authenticated
-`DELETE /v1/query/<query-id>` through Gateway. The request must use the original
-query owner's credentials. Only a successful upstream 204 acknowledges the whole
-query cancellation. Trino also acknowledges this operation when it has already
-forgotten the query. Wait for terminal retention to expire, then inspect the
-remaining requests and transactions before sealing. Do not delete ledger rows or
-infer successful drain from elapsed time. A lost or failed cancellation response
-remains unresolved and requires investigation.
-
-### Automatic pooled-query reconciliation
-
-A pool controller can reconcile abandoned queries without client credentials after
-an authenticated coordinator check proves that neither execution nor queued or
-cached results remain. Query metadata returning HTTP 410 is insufficient.
-
-The pool administration API exposes two endpoints:
-
-- `GET /gateway/v1/pools/{pool}/members/{instance}/drain-candidates?after={queryId}`
-  returns up to 100 nonterminal, nontransactional queries with their admission counts.
-  The opaque cursor is the last query ID returned; wrap after an empty page.
-- `POST /gateway/v1/pools/{pool}/members/{instance}/reconcile-queries` accepts the
-  existing operation/step, controller epoch and owner fields, `expectedGeneration`,
-  `nodeId`, `coordinatorId`, and `queries` containing the observed `queryId` and
-  `admissionCount` pairs. It returns the number of reconciled queries.
-
-Both endpoints require the pool administration credential. The controller must
-obtain an explicit `absent=true` response from the same coordinator's authenticated
-`/v1/query/{queryId}/drain-status` endpoint for each candidate. Missing endpoints,
-authentication failures, timeouts and metadata absence never authorize cleanup.
-Gateway independently verifies the live coordinator identity before accepting the
-receipt. Under its pool and backend locks, it checks the controller epoch, member
-generation and phase, absence of pending or uncertain admissions, and unchanged
-per-query admission counts. A request that completes during the check invalidates
-the receipt. Transactional query bindings remain excluded.
-
-A successful reconciliation starts the configured terminal retention window; it
-does not seal or retire the member. The normal zero-obligation check remains
-required. Replays return the original outcome without extending retention.
-
-Deploy the supporting Trino endpoint before enabling controller reconciliation.
-An older coordinator without the endpoint still requires the owner-authorized
-recovery described above. Trino must also expire completed history eventually;
-retaining a minimum number of historical queries indefinitely can prevent an
-otherwise quiet member from producing an absence proof.
-
-The query-admission index builds concurrently. PostgreSQL migrations use a
-session advisory lock so Flyway's transaction does not block the index snapshot
-wait. An interrupted build can leave an invalid index; the migration drops its
-own index before rebuilding it on retry. Do not remove the Flyway lock or run
-multiple uncoordinated migration processes.
-
-The optional `duplicate_next_uri` setting emits two conflicting raw JSON fields: a URL followed by `null`. Rejection must preserve uncertainty instead of making the query appear complete.
-
-## Pooled member lifecycle
-
-### Replacement capacity during drain
-
-A repair may replace a `DRAINING`, `SEALED`, `RETIRING`, or `RETIRED` member when
-`ACTIVE + PREPARING` is below the larger of the pool's desired and minimum serving
-counts. Counting preparing members reserves their future capacity. Including the
-later departure phases allows an unchanged registration request to finish even
-when its target completes a clean drain during replacement startup.
-
-The existing suspect, lost, and failure-retired repair paths remain available.
-All repair registrations share the configured `maxRepair` allowance and permit
-only one live repair per target. These checks run under the pool transaction
-lock, so different Gateway replicas cannot spend the same allowance concurrently.
-Accepted registration retries still replay their recorded result after capacity
-or target state changes. No replacement registration discards pinned queries or
-transactions, reactivates a draining member, or grants retirement authority.
-
-Deploy this Gateway support before a controller starts selecting departing repair
-targets. The controller must also exclude departures from future serving capacity,
-count live repairs against its allowance, and reserve a target for each replacement.
-Provision sufficient bounded repair headroom; this protocol does not override
-serving, repair, or compute limits when capacity is exhausted.
-
-The PostgreSQL store tests cover budget limits, concurrent duplicate targets,
-reservation accounting, idempotency, and targets finishing their drain. The
-two-process HTTP test also exercises restored routing while an old transaction
-and its query continuation remain pinned to a draining member.
-
-Known limitation: live replacements keep their `repair` classification even after
-their target retires. They continue consuming repair allowance. Automatic budget
-normalization is a separate follow-up; do not infer unlimited repeated-failure
-recovery or clear this accounting manually.
-
-### Multi-process contract fixture
-
-`test_pool_lifecycle` runs the pooled member protocol through the same two-JVM,
-one-PostgreSQL fixture as `test_rollout_api`, with synthetic coordinators. It
-covers bootstrap to the desired member count without deadlocking on the serving
-floor, one allowed surge member and the refusal of the next, a replayed
-admission resolved from the other replica, three concurrent drains of which the
-serving floor grants two, dispatch restricted to serving members from both
-replicas, leader takeover with its own step identity and the refusal of the
-predecessor's epoch, and a transaction plus a query continuation staying pinned
-to a draining member while new independent work is routed elsewhere. It also
-covers replacing a member that never recovered: a suspected member drains, keeps
-its pinned work, refuses re-admission, and retires as drained with no failure
-receipt, while a planned drain of a serving member is still refused by the
-serving floor.
-
-`local_gateways` takes an optional `pool` block and `backend_names`. Both
-default to the previous behaviour, so every other suite runs the legacy
-configuration with two backends and no pool configuration at all.
-
-This is the Gateway's own multi-process serialization and routing over real
-HTTP. It starts no Kubernetes, no real coordinator and no credential store, so
-it establishes nothing about backend authentication, tenant admission against a
-real password store, or any timing or zero-downtime property.
-
-## Limits of this suite
-
-### Gateway process shutdown
-
-`test_graceful_shutdown` starts two real Gateway JVMs and a disposable PostgreSQL
-instance. It holds a continuation response at the protocol fixture, sends
-SIGTERM to the Gateway handling that response, and verifies response completion
-before process exit. The other Gateway must then replay the result and complete
-a transaction opened through the stopped Gateway. CI runs this test alongside
-`test_rollout_api`, using the same `GATEWAY_TEST_JAVA`,
-`GATEWAY_TEST_CLASSPATH`, and `GATEWAY_TEST_PG_BIN` settings.
-
-The fixture explicitly sets `http-server.stop-timeout: 10s` and releases its
-backend response after a one-second shutdown observation. This is a bounded
-HTTP shutdown test, not a load-balancer deregistration test or proof that an
-unlimited request survives process termination. It neither restarts a Trino
-coordinator nor migrates a transaction.
-
-Deployment configuration must provide a positive HTTP stop timeout. Budget for
-the effective request timeout plus transaction completion processing. The
-Kubernetes termination grace period must also include the pre-stop hook and
-shutdown overhead. Load-balancer deregistration must stop new traffic before
-process shutdown. An immediate stop timeout cannot preserve an admitted HTTP
-response, even when a second healthy Gateway shares the database.
-
-Gateway-generated admission failures distinguish `CAPACITY_EXHAUSTED` from
-`GATEWAY_STOPPING` in the `X-Trino-Gateway-Error` response header. Ledger
-rejections and unexpected routing failures use `ROUTING_STATE_*` codes. The
-rollout client retains only allowlisted diagnostic codes, not exception text or
-arbitrary response bodies. These codes support diagnosis; they do not authorize
-replaying a statement or clearing an uncertain admission.
-
-The fake server implements the protocol subset needed for deterministic routing tests. It does not execute SQL, implement connector transactions, enforce backend authentication or reproduce Trino memory loss. It is not a substitute for real-Trino tests using supported clients and transaction-capable catalogs.
-
-Production acceptance also requires real coordinator restart/loss and Gateway restart between database commit and response delivery. The fake-process restart and TCP fault boundary do not replace those process-level experiments. Passing fixture self-tests only validates the test tools; the black-box assertions still need execution against the actual implementation. Never claim that an in-memory transaction survives the loss of its coordinator.
+The PostgreSQL-backed observer tests additionally require an explicitly owned
+local database and `TX_OBSERVER_LOCAL_PG=yes`. Rendering tests are not deployment
+execution receipts. Read the deployment safety guidance before operating any lab.

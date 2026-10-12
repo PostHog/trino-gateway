@@ -15,6 +15,8 @@ package io.trino.gateway.ha.config;
 
 import io.airlift.units.Duration;
 
+import java.util.Map;
+
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 public class RoutingConfiguration
@@ -23,7 +25,8 @@ public class RoutingConfiguration
 
     private boolean forwardedHeadersEnabled = true;
 
-    private String defaultRoutingGroup = "adhoc";
+    private Map<String, String> hostnameToPool = Map.of();
+    private Map<String, String> hostnameSuffixToPool = Map.of();
 
     /**
      * Protocol the proxy asserts to Trino in {@code X-Forwarded-Proto}, instead of the scheme of
@@ -70,14 +73,28 @@ public class RoutingConfiguration
         this.forwardedHeadersEnabled = forwardedHeadersEnabled;
     }
 
-    public String getDefaultRoutingGroup()
+    public Map<String, String> getHostnameToPool()
     {
-        return defaultRoutingGroup;
+        return hostnameToPool;
     }
 
-    public void setDefaultRoutingGroup(String defaultRoutingGroup)
+    public void setHostnameToPool(Map<String, String> hostnameToPool)
     {
-        this.defaultRoutingGroup = defaultRoutingGroup;
+        this.hostnameToPool = Map.copyOf(hostnameToPool);
+    }
+
+    /**
+     * A suffix maps exactly one leading DNS label to its pool, excluding the apex and nested hosts.
+     * Use only for domains whose tenant placements share one pool.
+     */
+    public Map<String, String> getHostnameSuffixToPool()
+    {
+        return hostnameSuffixToPool;
+    }
+
+    public void setHostnameSuffixToPool(Map<String, String> hostnameSuffixToPool)
+    {
+        this.hostnameSuffixToPool = Map.copyOf(hostnameSuffixToPool);
     }
 
     public String getForwardedProto()
