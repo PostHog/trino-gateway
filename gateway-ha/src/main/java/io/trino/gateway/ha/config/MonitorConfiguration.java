@@ -39,6 +39,12 @@ public class MonitorConfiguration
 
     private String queuedQueriesMetricName = "trino_execution_name_QueryManager_QueuedQueries";
 
+    // Optional. When set, the metrics monitor reads reserved and maximum query memory for load-aware
+    // pooled routing. A missing metric does not make the backend unhealthy.
+    private String reservedQueryMemoryMetricName;
+
+    private String maxQueryMemoryMetricName;
+
     // Require 1 node for health by default. This configuration only applies to the ClusterStatsMetricsMonitor
     private Map<String, Float> metricMinimumValues = ImmutableMap.of("trino_metadata_name_DiscoveryNodeManager_ActiveNodeCount", 1f);
 
@@ -114,6 +120,26 @@ public class MonitorConfiguration
     public void setQueuedQueriesMetricName(String queuedQueriesMetricName)
     {
         this.queuedQueriesMetricName = queuedQueriesMetricName;
+    }
+
+    public String getReservedQueryMemoryMetricName()
+    {
+        return reservedQueryMemoryMetricName;
+    }
+
+    public void setReservedQueryMemoryMetricName(String reservedQueryMemoryMetricName)
+    {
+        this.reservedQueryMemoryMetricName = reservedQueryMemoryMetricName;
+    }
+
+    public String getMaxQueryMemoryMetricName()
+    {
+        return maxQueryMemoryMetricName;
+    }
+
+    public void setMaxQueryMemoryMetricName(String maxQueryMemoryMetricName)
+    {
+        this.maxQueryMemoryMetricName = maxQueryMemoryMetricName;
     }
 
     public Map<String, Float> getMetricMinimumValues()

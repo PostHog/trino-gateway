@@ -55,6 +55,10 @@ public class RoutingConfiguration
     // See OAuth2RoutingUtils.
     private boolean oauth2RoutingEnabled;
 
+    // Default false. If true, pooled routing orders eligible members by load (queued queries plus
+    // running queries weighted by memory pressure), after health. See BackendLoad.
+    private boolean loadAwarePooledRoutingEnabled;
+
     public Duration getAsyncTimeout()
     {
         return asyncTimeout;
@@ -137,5 +141,15 @@ public class RoutingConfiguration
     public void setOauth2RoutingEnabled(boolean oauth2RoutingEnabled)
     {
         this.oauth2RoutingEnabled = oauth2RoutingEnabled;
+    }
+
+    public boolean isLoadAwarePooledRoutingEnabled()
+    {
+        return loadAwarePooledRoutingEnabled;
+    }
+
+    public void setLoadAwarePooledRoutingEnabled(boolean loadAwarePooledRoutingEnabled)
+    {
+        this.loadAwarePooledRoutingEnabled = loadAwarePooledRoutingEnabled;
     }
 }

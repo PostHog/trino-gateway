@@ -16,8 +16,10 @@ package io.trino.gateway.ha.clustermonitor;
 import com.google.common.collect.ImmutableMap;
 
 import java.util.Map;
+import java.util.OptionalLong;
 
 import static java.util.Objects.requireNonNull;
+import static java.util.Objects.requireNonNullElse;
 
 public record ClusterStats(
         String clusterId,
@@ -28,8 +30,16 @@ public record ClusterStats(
         String proxyTo,
         String externalUrl,
         String routingGroup,
-        Map<String, Integer> userQueuedCount)
+        Map<String, Integer> userQueuedCount,
+        OptionalLong reservedQueryMemoryBytes,
+        OptionalLong maxQueryMemoryBytes)
 {
+    public ClusterStats
+    {
+        reservedQueryMemoryBytes = requireNonNullElse(reservedQueryMemoryBytes, OptionalLong.empty());
+        maxQueryMemoryBytes = requireNonNullElse(maxQueryMemoryBytes, OptionalLong.empty());
+    }
+
     public static Builder builder(String clusterId)
     {
         return new Builder(clusterId);
@@ -46,6 +56,8 @@ public record ClusterStats(
         private String externalUrl;
         private String routingGroup;
         private Map<String, Integer> userQueuedCount;
+        private OptionalLong reservedQueryMemoryBytes = OptionalLong.empty();
+        private OptionalLong maxQueryMemoryBytes = OptionalLong.empty();
 
         private Builder(String clusterId)
         {
@@ -100,6 +112,18 @@ public record ClusterStats(
             return this;
         }
 
+        public Builder reservedQueryMemoryBytes(long reservedQueryMemoryBytes)
+        {
+            this.reservedQueryMemoryBytes = OptionalLong.of(reservedQueryMemoryBytes);
+            return this;
+        }
+
+        public Builder maxQueryMemoryBytes(long maxQueryMemoryBytes)
+        {
+            this.maxQueryMemoryBytes = OptionalLong.of(maxQueryMemoryBytes);
+            return this;
+        }
+
         public ClusterStats build()
         {
             return new ClusterStats(
@@ -111,7 +135,9 @@ public record ClusterStats(
                     proxyTo,
                     externalUrl,
                     routingGroup,
-                    userQueuedCount);
+                    userQueuedCount,
+                    reservedQueryMemoryBytes,
+                    maxQueryMemoryBytes);
         }
     }
 }

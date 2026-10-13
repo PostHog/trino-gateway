@@ -32,6 +32,7 @@ import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.config.TransactionAwarenessConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingDestination;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
+import io.trino.gateway.ha.router.BackendLoad;
 import io.trino.gateway.ha.router.GatewayBackendManager;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingManager;
@@ -56,7 +57,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -95,6 +98,7 @@ public class TransactionAwarenessService
     private final TransactionRequestCapacity capacity;
     private final PoolStore pools;
     private final PoolLifecycleConfiguration poolConfig;
+    private final boolean loadAwarePooledRouting;
     private RoutingManager routingManager;
 
     /**
@@ -116,6 +120,7 @@ public class TransactionAwarenessService
         store = new TransactionStore(jdbi);
         pools = new PoolStore(jdbi);
         poolConfig = config.getPool();
+        loadAwarePooledRouting = configuration.getRouting().isLoadAwarePooledRoutingEnabled();
         identity = config.isEnabled() ? new TransactionIdentity(config.getIdentityKey()) : null;
         this.backendManager = backendManager;
         this.httpClient = httpClient;
@@ -276,7 +281,19 @@ public class TransactionAwarenessService
                 .filter(candidate -> registrations.contains(candidate.backendName()))
                 .toList());
         Collections.shuffle(eligible);
-        eligible.sort(java.util.Comparator.comparing(candidate -> cachedHealth(candidate.backendName()) ? 0 : 1));
+        if (!loadAwarePooledRouting) {
+            eligible.sort(Comparator.comparing(candidate -> cachedHealth(candidate.backendName()) ? 0 : 1));
+            return eligible;
+        }
+        // Advisory only. Read health and load once per candidate, so that a concurrent stats update
+        // cannot make the comparator inconsistent. The sort is stable, so the shuffle breaks ties.
+        Map<PoolStore.Candidate, Integer> health = new HashMap<>();
+        Map<PoolStore.Candidate, Double> load = new HashMap<>();
+        for (PoolStore.Candidate candidate : eligible) {
+            health.put(candidate, cachedHealth(candidate.backendName()) ? 0 : 1);
+            load.put(candidate, cachedLoad(candidate.backendName()));
+        }
+        eligible.sort(Comparator.<PoolStore.Candidate>comparingInt(health::get).thenComparingDouble(load::get));
         return eligible;
     }
 
@@ -340,6 +357,22 @@ public class TransactionAwarenessService
     {
         return routingManager != null && routingManager.getBackEndHealth(backendName)
                 .filter(status -> status == TrinoStatus.HEALTHY).isPresent();
+    }
+
+    /**
+     * Advisory: unknown statistics, or a failure to read them, give the highest load.
+     */
+    private double cachedLoad(String backendName)
+    {
+        if (routingManager == null) {
+            return BackendLoad.load(Optional.empty());
+        }
+        try {
+            return BackendLoad.load(routingManager.getClusterStats(backendName));
+        }
+        catch (RuntimeException e) {
+            return BackendLoad.load(Optional.empty());
+        }
     }
 
     public RequestContext captureRequestContext(HttpServletRequest request)

@@ -15,6 +15,7 @@ package io.trino.gateway.ha.transaction;
 
 import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
+import io.trino.gateway.ha.clustermonitor.ClusterStats;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
@@ -261,6 +262,76 @@ class TestPooledRouting
     }
 
     @Test
+    void loadAwareRoutingPicksTheLeastLoadedHealthyMember()
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        member("i-3", true);
+        probeSucceeds();
+        // i-2 runs many queries under low memory pressure, so it carries the lowest load.
+        stats("i-1", 5, 0, 0, 100);
+        stats("i-2", 0, 40, 5, 100);
+        stats("i-3", 0, 10, 90, 100);
+        for (int attempt = 0; attempt < 20; attempt++) {
+            assertThat(resolve().routingDestination().clusterHost()).isEqualTo("http://i-2.example.test");
+        }
+    }
+
+    @Test
+    void loadAwareRoutingSpreadsEqualLoadsAndKeepsHealthFirst()
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        member("i-3", true);
+        probeSucceeds();
+        stats("i-1", 1, 0, 0, 100);
+        stats("i-2", 1, 0, 0, 100);
+        stats("i-3", 0, 0, 0, 100);
+        when(routingManager.getBackEndHealth("backend-i-3")).thenReturn(Optional.of(TrinoStatus.UNHEALTHY));
+        Set<String> selected = new HashSet<>();
+        for (int attempt = 0; attempt < 40; attempt++) {
+            selected.add(resolve().routingDestination().clusterHost());
+        }
+        assertThat(selected).containsExactlyInAnyOrder("http://i-1.example.test", "http://i-2.example.test");
+    }
+
+    @Test
+    void loadAwareRoutingPrefersMembersWithStatsAndNeverFailsWithoutThem()
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        probeSucceeds();
+        stats("i-2", 50, 50, 100, 100);
+        for (int attempt = 0; attempt < 10; attempt++) {
+            assertThat(resolve().routingDestination().clusterHost()).isEqualTo("http://i-2.example.test");
+        }
+        when(routingManager.getClusterStats(anyString())).thenReturn(Optional.empty());
+        Set<String> selected = new HashSet<>();
+        for (int attempt = 0; attempt < 30; attempt++) {
+            selected.add(resolve().routingDestination().clusterHost());
+        }
+        assertThat(selected).containsExactlyInAnyOrder("http://i-1.example.test", "http://i-2.example.test");
+    }
+
+    @Test
+    void disabledLoadAwareRoutingIgnoresLoad()
+    {
+        member("i-1", true);
+        member("i-2", true);
+        probeSucceeds();
+        stats("i-1", 100, 100, 100, 100);
+        stats("i-2", 0, 0, 0, 100);
+        Set<String> selected = new HashSet<>();
+        for (int attempt = 0; attempt < 30; attempt++) {
+            selected.add(resolve().routingDestination().clusterHost());
+        }
+        assertThat(selected).containsExactlyInAnyOrder("http://i-1.example.test", "http://i-2.example.test");
+    }
+
+    @Test
     void reselectionIsBoundedAndOnlyHappensBeforeDispatch()
     {
         member("i-1", true);
@@ -487,6 +558,24 @@ class TestPooledRouting
         RoutingTargetResponse response = resolveWithoutRelease();
         service.completeRequest(response.modifiedRequest());
         return response;
+    }
+
+    private void enableLoadAwareRouting()
+    {
+        service.shutdown();
+        configuration.getRouting().setLoadAwarePooledRoutingEnabled(true);
+        service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector, new TransactionLifecycleStats());
+        service.setRoutingManager(routingManager);
+    }
+
+    private void stats(String instanceId, int queued, int running, long reservedBytes, long maxBytes)
+    {
+        when(routingManager.getClusterStats("backend-" + instanceId)).thenReturn(Optional.of(ClusterStats.builder("backend-" + instanceId)
+                .queuedQueryCount(queued)
+                .runningQueryCount(running)
+                .reservedQueryMemoryBytes(reservedBytes)
+                .maxQueryMemoryBytes(maxBytes)
+                .build()));
     }
 
     /**

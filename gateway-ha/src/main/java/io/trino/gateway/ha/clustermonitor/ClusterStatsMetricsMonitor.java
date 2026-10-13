@@ -32,8 +32,10 @@ import java.io.IOException;
 import java.net.URI;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
+import static com.google.common.base.Strings.emptyToNull;
 import static com.google.common.base.Strings.isNullOrEmpty;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
 import static io.airlift.http.client.HeaderNames.CONTENT_TYPE;
@@ -57,6 +59,8 @@ public class ClusterStatsMetricsMonitor
     private final String metricsEndpoint;
     private final String runningQueriesMetricName;
     private final String queuedQueriesMetricName;
+    private final Optional<String> reservedQueryMemoryMetricName;
+    private final Optional<String> maxQueryMemoryMetricName;
     private final ImmutableSet<String> metricNames;
     private final Map<String, Float> metricMinimumValues;
     private final Map<String, Float> metricMaximumValues;
@@ -79,12 +83,20 @@ public class ClusterStatsMetricsMonitor
         queuedQueriesMetricName = monitorConfiguration.getQueuedQueriesMetricName();
         metricMinimumValues = ImmutableMap.copyOf(monitorConfiguration.getMetricMinimumValues());
         metricMaximumValues = ImmutableMap.copyOf(monitorConfiguration.getMetricMaximumValues());
-        metricNames = ImmutableSet.<String>builder()
+        reservedQueryMemoryMetricName = Optional.ofNullable(emptyToNull(monitorConfiguration.getReservedQueryMemoryMetricName()));
+        maxQueryMemoryMetricName = Optional.ofNullable(emptyToNull(monitorConfiguration.getMaxQueryMemoryMetricName()));
+        ImmutableSet<String> requiredMetricNames = ImmutableSet.<String>builder()
                 .add(runningQueriesMetricName, queuedQueriesMetricName)
                 .addAll(metricMinimumValues.keySet())
                 .addAll(metricMaximumValues.keySet())
                 .build();
-        metricsResponseHandler = new MetricsResponseHandler(metricNames);
+        // Memory metrics are optional: they are requested, but a response without them is accepted.
+        metricNames = ImmutableSet.<String>builder()
+                .addAll(requiredMetricNames)
+                .addAll(reservedQueryMemoryMetricName.stream().iterator())
+                .addAll(maxQueryMemoryMetricName.stream().iterator())
+                .build();
+        metricsResponseHandler = new MetricsResponseHandler(requiredMetricNames);
         xForwardedProtoHeader = backendStateConfiguration.getXForwardedProtoHeader();
     }
 
@@ -122,14 +134,32 @@ public class ClusterStatsMetricsMonitor
                 return getUnhealthyStats(backend);
             }
         }
-        return ClusterStats.builder(backend.getName())
+        ClusterStats.Builder stats = ClusterStats.builder(backend.getName())
                 .trinoStatus(TrinoStatus.HEALTHY)
                 .runningQueryCount((int) Float.parseFloat(metrics.get(runningQueriesMetricName)))
                 .queuedQueryCount((int) Float.parseFloat(metrics.get(queuedQueriesMetricName)))
                 .proxyTo(backend.getProxyTo())
                 .externalUrl(backend.getExternalUrl())
-                .routingGroup(backend.getRoutingGroup())
-                .build();
+                .routingGroup(backend.getRoutingGroup());
+        reservedQueryMemoryMetricName.flatMap(name -> optionalBytes(metrics, name)).ifPresent(stats::reservedQueryMemoryBytes);
+        maxQueryMemoryMetricName.flatMap(name -> optionalBytes(metrics, name)).ifPresent(stats::maxQueryMemoryBytes);
+        return stats.build();
+    }
+
+    private static Optional<Long> optionalBytes(Map<String, String> metrics, String name)
+    {
+        String value = metrics.get(name);
+        if (value == null) {
+            return Optional.empty();
+        }
+        try {
+            double bytes = Double.parseDouble(value);
+            return Double.isFinite(bytes) && bytes >= 0 ? Optional.of((long) bytes) : Optional.empty();
+        }
+        catch (NumberFormatException e) {
+            log.debug("Ignoring unparsable metric %s=%s", name, value);
+            return Optional.empty();
+        }
     }
 
     private Map<String, String> getMetrics(String baseUrl, int retriesRemaining)
