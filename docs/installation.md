@@ -277,6 +277,15 @@ dataStore:
   oauth2RoutingRetention: "1h"    # e.g. "90s", "10m", "2h"
 ```
 
+Order pooled members by load (queued queries plus running queries weighted by
+memory pressure) with the setting below. Refer to
+[pooled routing](pooled-routing.md#load-aware-ordering).
+
+```yaml
+routing:
+  loadAwarePooledRoutingEnabled: true   # default false
+```
+
 ### Configure logging <a name="logging">
 
 To configure the logging level for various classes, specify the path to the
@@ -583,6 +592,16 @@ and queued queries respectively, however these metrics can be configured as foll
 monitor:
     runningQueriesMetricName: io_starburst_galaxy_name_GalaxyMetrics_RunningQueries
     queuedQueriesMetricName: io_starburst_galaxy_name_GalaxyMetrics_QueuedQueries
+```
+
+Optionally, set the metrics for reserved and maximum query memory. Load-aware
+pooled routing uses them. A missing memory metric does not make a backend
+unhealthy. The names below are examples; use the names that your cluster exports:
+
+```yaml
+monitor:
+    reservedQueryMemoryMetricName: trino_memory_type_ClusterMemoryPool_name_general_ReservedDistributedBytes
+    maxQueryMemoryMetricName: trino_memory_type_ClusterMemoryPool_name_general_TotalDistributedBytes
 ```
 
 Similarly, by default the monitor pulls the metrics using the `/metrics` endpoint, but it

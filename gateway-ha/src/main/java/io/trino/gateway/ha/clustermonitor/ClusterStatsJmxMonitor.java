@@ -14,6 +14,7 @@
 package io.trino.gateway.ha.clustermonitor;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.google.common.annotations.VisibleForTesting;
 import io.airlift.http.client.BasicAuthRequestFilter;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
@@ -28,6 +29,7 @@ import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import java.net.URI;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import static io.airlift.http.client.HeaderNames.X_FORWARDED_PROTO;
@@ -43,18 +45,30 @@ public class ClusterStatsJmxMonitor
     private static final Logger log = Logger.get(ClusterStatsJmxMonitor.class);
     private static final JsonResponseHandler<JsonNode> JMX_JSON_RESPONSE_HANDLER = createJsonResponseHandler(jsonCodec(JsonNode.class));
     private static final String JMX_PATH = "/v1/jmx/mbean";
+    private static final String MEMORY_POOL_MBEAN = "trino.memory:type=ClusterMemoryPool,name=general";
 
     private final HttpClient client;
     private final String username;
     private final String password;
     private final boolean xForwardedProtoHeader;
+    private final boolean readQueryMemory;
 
     public ClusterStatsJmxMonitor(HttpClient client, BackendStateConfiguration backendStateConfiguration)
+    {
+        this(client, backendStateConfiguration, false);
+    }
+
+    /**
+     * @param readQueryMemory also read reserved and total query memory of the general memory pool,
+     *         for load-aware pooled routing. A failed read leaves the memory statistics unknown.
+     */
+    public ClusterStatsJmxMonitor(HttpClient client, BackendStateConfiguration backendStateConfiguration, boolean readQueryMemory)
     {
         this.client = requireNonNull(client, "client is null");
         this.username = backendStateConfiguration.getUsername();
         this.password = backendStateConfiguration.getPassword();
         this.xForwardedProtoHeader = backendStateConfiguration.getXForwardedProtoHeader();
+        this.readQueryMemory = readQueryMemory;
     }
 
     private static void updateClusterStatsFromDiscoveryNodeManagerResponse(JmxResponse response, ClusterStats.Builder clusterStats)
@@ -119,11 +133,47 @@ public class ClusterStatsJmxMonitor
 
         discoveryResponse.ifPresent(response -> updateClusterStatsFromDiscoveryNodeManagerResponse(response, clusterStatsBuilder));
         queryResponse.ifPresent(response -> updateClusterStatsFromQueryManagerResponse(response, clusterStatsBuilder));
+        if (readQueryMemory) {
+            queryJmx(backend, MEMORY_POOL_MBEAN, json -> json).ifPresent(response -> updateClusterStatsFromMemoryPoolResponse(response, clusterStatsBuilder));
+        }
 
         return clusterStatsBuilder.build();
     }
 
+    @VisibleForTesting
+    static void updateClusterStatsFromMemoryPoolResponse(JsonNode response, ClusterStats.Builder clusterStats)
+    {
+        // Byte values do not fit in JmxAttribute, which holds an int, so read them directly.
+        JsonNode attributes = response.get("attributes");
+        if (attributes == null || !attributes.isArray()) {
+            return;
+        }
+        Long reserved = null;
+        Long total = null;
+        for (JsonNode attribute : attributes) {
+            JsonNode name = attribute.get("name");
+            JsonNode value = attribute.get("value");
+            if (name == null || value == null || !value.isIntegralNumber() || !value.canConvertToLong() || value.asLong() < 0) {
+                continue;
+            }
+            switch (name.asText()) {
+                case "ReservedDistributedBytes" -> reserved = value.asLong();
+                case "TotalDistributedBytes" -> total = value.asLong();
+                default -> {}
+            }
+        }
+        if (reserved != null && total != null) {
+            clusterStats.reservedQueryMemoryBytes(reserved);
+            clusterStats.maxQueryMemoryBytes(total);
+        }
+    }
+
     private Optional<JmxResponse> queryJmx(ProxyBackendConfiguration backend, String mbeanName)
+    {
+        return queryJmx(backend, mbeanName, JmxResponse::fromJson);
+    }
+
+    private <T> Optional<T> queryJmx(ProxyBackendConfiguration backend, String mbeanName, Function<JsonNode, T> parser)
     {
         requireNonNull(backend, "backend is null");
         requireNonNull(mbeanName, "mbeanName is null");
@@ -151,13 +201,22 @@ public class ClusterStatsJmxMonitor
 
         try {
             JsonNode response = client.execute(preparedRequest, JMX_JSON_RESPONSE_HANDLER);
-            return Optional.of(response).map(JmxResponse::fromJson);
+            return Optional.of(response).map(parser);
         }
         catch (UnexpectedResponseException e) {
+            if (MEMORY_POOL_MBEAN.equals(mbeanName)) {
+                // Advisory read: do not log an error for each poll when the MBean is not available.
+                log.debug("Failed to fetch JMX data for %s, response code: %d", mbeanName, e.getStatusCode());
+                return Optional.empty();
+            }
             log.error(e, "Failed to fetch JMX data for %s, response code: %d", mbeanName, e.getStatusCode());
             return Optional.empty();
         }
         catch (Exception e) {
+            if (MEMORY_POOL_MBEAN.equals(mbeanName)) {
+                log.debug(e, "Exception while querying JMX at %s for %s", jmxUrl, mbeanName);
+                return Optional.empty();
+            }
             log.error(e, "Exception while querying JMX at %s", jmxUrl);
             return Optional.empty();
         }

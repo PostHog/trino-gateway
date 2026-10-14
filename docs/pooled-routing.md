@@ -123,6 +123,51 @@ Bounded reselection is allowed only before dispatch, within the original request
 deadline. After dispatch, Gateway does not replay or move a statement whose
 acceptance or outcome is uncertain.
 
+#### Load-aware ordering
+
+Set `routing.loadAwarePooledRoutingEnabled: true` to order members by load. The
+default is `false`. When the flag is off, ordering does not change.
+
+```yaml
+routing:
+  loadAwarePooledRoutingEnabled: true
+```
+
+Gateway calculates the load of each member from its last cluster statistics:
+
+```text
+load = queued + running * memoryPressure
+memoryPressure = reservedQueryMemory / maxQueryMemory, clipped to [0, 1]
+```
+
+Gateway keeps healthy members first. Then it sorts by load, lowest first. Equal
+loads keep the shuffled order, so ties spread across members.
+
+Load is advisory, as health is:
+
+- If memory statistics are not known, running queries count at full weight, and
+  the load is `queued + running`.
+- A member without statistics sorts after members with statistics. It stays
+  eligible.
+- Missing statistics never cause a routing failure.
+- If reserved memory is `0`, running queries add no load. Queued queries still
+  count.
+
+Statistics refresh at the interval `monitor.taskDelay`. Between refreshes, new
+statements go to the same least-loaded member. Use a short `taskDelay` with this
+feature.
+
+The `JMX` monitor reads memory from the
+`trino.memory:type=ClusterMemoryPool,name=general` MBean when the flag is on. The
+`METRICS` monitor reads memory only when you set
+`monitor.reservedQueryMemoryMetricName` and `monitor.maxQueryMemoryMetricName`.
+Other monitors do not supply memory statistics. Trino exports the memory pool
+on `/metrics` only if `openmetrics.jmx-object-names` includes the MBean.
+
+Members that report memory statistics can have a lower load than members that
+do not, because unknown memory pressure counts as `1`. Configure all members of
+a pool the same way.
+
 ### Durable transaction and query ownership
 
 PostgreSQL records the coordinator incarnation that owns a transaction or query,

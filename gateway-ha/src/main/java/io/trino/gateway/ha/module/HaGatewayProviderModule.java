@@ -229,7 +229,7 @@ public class HaGatewayProviderModule
             case INFO_API -> new ClusterStatsInfoApiMonitor(httpClient, configuration.getMonitor());
             case UI_API -> new ClusterStatsHttpMonitor(configuration.getBackendState());
             case JDBC -> new ClusterStatsJdbcMonitor(configuration.getBackendState(), configuration.getMonitor());
-            case JMX -> new ClusterStatsJmxMonitor(httpClient, configuration.getBackendState());
+            case JMX -> new ClusterStatsJmxMonitor(httpClient, configuration.getBackendState(), configuration.getRouting().isLoadAwarePooledRoutingEnabled());
             case METRICS -> new ClusterStatsMetricsMonitor(httpClient, configuration.getBackendState(), configuration.getMonitor());
             case NOOP -> new NoopClusterStatsMonitor();
         };
