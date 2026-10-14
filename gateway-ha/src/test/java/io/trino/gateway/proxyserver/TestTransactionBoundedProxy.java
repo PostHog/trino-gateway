@@ -59,6 +59,7 @@ import static io.trino.gateway.ha.handler.HttpUtils.TRINO_REQUEST_USER;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -150,7 +151,7 @@ class TestTransactionBoundedProxy
         try {
             assertThat(processing.await(5, TimeUnit.SECONDS)).isTrue();
             assertOverloaded();
-            verify(store, never()).markUncertain(any());
+            verify(store, never()).markUncertain(any(), anyBoolean());
         }
         finally {
             release.countDown();
@@ -166,7 +167,7 @@ class TestTransactionBoundedProxy
         when(proxy.executeAsync(any(), any())).thenThrow(new IllegalStateException("synthetic queue rejection"));
         assertThatThrownBy(() -> handler.getRequest(target.modifiedRequest(), mock(AsyncResponse.class), target.routingDestination()))
                 .isInstanceOf(IllegalStateException.class);
-        verify(store).markUncertain(any());
+        verify(store).markUncertain(any(), eq(true));
         service.requestRejectedBeforeDispatch(resolve().modifiedRequest());
     }
 
@@ -203,7 +204,7 @@ class TestTransactionBoundedProxy
         assertOverloaded();
         raw.set(results());
         awaitAvailable();
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
     }
 
     @Test
@@ -305,7 +306,7 @@ class TestTransactionBoundedProxy
         else {
             raw.set(new ProxyResponse(200, ImmutableListMultimap.of(), "{"));
         }
-        verify(store, timeout(1000)).markUncertain(expected.id());
+        verify(store, timeout(1000)).markUncertain(eq(expected.id()), eq(transportFailure));
         verify(store, never()).recordResponse(any(), any());
         awaitAvailable();
     }
@@ -324,7 +325,7 @@ class TestTransactionBoundedProxy
         }
         raw.set(new ProxyResponse(method.equals("HEAD") ? 200 : 204, ImmutableListMultimap.of(), ""));
         awaitAvailable();
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
     }
 
     private RoutingTargetResponse resolve()

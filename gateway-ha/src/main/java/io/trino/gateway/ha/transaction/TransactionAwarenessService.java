@@ -23,6 +23,7 @@ import com.google.inject.Singleton;
 import io.airlift.http.client.HeaderName;
 import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
+import io.airlift.log.Logger;
 import io.airlift.units.Duration;
 import io.trino.gateway.ha.clustermonitor.ForMonitor;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
@@ -66,8 +67,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Supplier;
 
+import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.airlift.http.client.Request.Builder.prepareGet;
 import static io.airlift.http.client.StringResponseHandler.createStringResponseHandler;
 import static io.trino.gateway.ha.handler.HttpUtils.TRINO_REQUEST_USER;
@@ -79,11 +83,17 @@ import static io.trino.gateway.ha.transaction.TransactionIdentity.error;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 @Singleton
 public class TransactionAwarenessService
 {
+    private static final Logger log = Logger.get(TransactionAwarenessService.class);
+    private static final long SUPERSEDED_SWEEP_INITIAL_DELAY_SECONDS = 10;
+    private static final long SUPERSEDED_SWEEP_INTERVAL_SECONDS = 60;
+    private static final int SUPERSEDED_SWEEP_BATCH = 100;
     private static final String ADMISSION_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".admission";
+    private static final String RESPONSE_RECEIVED_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".responseReceived";
     private static final String CAPACITY_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".capacity";
     private static final ObjectMapper JSON = new ObjectMapper(JsonFactory.builder().enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build())
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -99,6 +109,7 @@ public class TransactionAwarenessService
     private final PoolStore pools;
     private final PoolLifecycleConfiguration poolConfig;
     private final boolean loadAwarePooledRouting;
+    private final ScheduledExecutorService maintenance;
     private RoutingManager routingManager;
 
     /**
@@ -127,6 +138,40 @@ public class TransactionAwarenessService
         statementPaths = configuration.getStatementPaths();
         this.routingGroupSelector = routingGroupSelector;
         capacity = config.isEnabled() ? new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout()) : null;
+        maintenance = config.isEnabled() ? startSupersededSweep() : null;
+    }
+
+    private ScheduledExecutorService startSupersededSweep()
+    {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(daemonThreadsNamed("transaction-superseded-sweep-%s"));
+        executor.scheduleWithFixedDelay(this::settleSupersededAdmissions, SUPERSEDED_SWEEP_INITIAL_DELAY_SECONDS, SUPERSEDED_SWEEP_INTERVAL_SECONDS, SECONDS);
+        return executor;
+    }
+
+    /**
+     * Settles uncertain admissions whose query result a sibling admission already delivered. An
+     * uncertainty recorded before that terminal result has no later request to settle it, so this
+     * periodic sweep is the only path that releases it. Unproven uncertainty is never settled.
+     */
+    void settleSupersededAdmissions()
+    {
+        // scheduleWithFixedDelay stops future runs once a task throws.
+        try {
+            TransactionStore.SupersededSweep sweep;
+            do {
+                sweep = store.settleSupersededAdmissions(SUPERSEDED_SWEEP_BATCH);
+                if (sweep == null) {
+                    return;
+                }
+                sweep.settled().forEach(admission -> lifecycleStats.superseded(admission, true));
+                sweep.failure().ifPresent(failure -> log.warn(failure, "Superseded admission sweep could not settle some admissions; will retry on next run"));
+            }
+                // Continue only after a fully settled batch: failed candidates stay selectable, so looping on them would never end.
+            while (sweep.settled().size() == SUPERSEDED_SWEEP_BATCH);
+        }
+        catch (RuntimeException failure) {
+            log.warn(failure, "Superseded admission sweep failed; will retry on next run");
+        }
     }
 
     public boolean isEnabled()
@@ -392,6 +437,7 @@ public class TransactionAwarenessService
         private final String method;
         private final String requestUri;
         private final Optional<String> username;
+        private volatile boolean responseReceived;
 
         private RequestContext(Admission admission, TransactionRequestCapacity.Lease lease, String method, String requestUri, Optional<String> username)
         {
@@ -459,6 +505,15 @@ public class TransactionAwarenessService
     @PreDestroy
     public void shutdown()
     {
+        if (maintenance != null) {
+            maintenance.shutdownNow();
+            try {
+                maintenance.awaitTermination(5, SECONDS);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         if (capacity != null) {
             capacity.shutdown();
         }
@@ -466,11 +521,13 @@ public class TransactionAwarenessService
 
     public ProxyResponse recordResponse(HttpServletRequest request, ProxyResponse response)
     {
+        request.setAttribute(RESPONSE_RECEIVED_ATTRIBUTE, true);
         return recordResponse(admission(request), request.getMethod(), request.getRequestURI(), response);
     }
 
     public ProxyResponse recordResponse(RequestContext context, ProxyResponse response)
     {
+        context.responseReceived = true;
         return recordResponse(context.admission, context.method, context.requestUri, response);
     }
 
@@ -506,7 +563,7 @@ public class TransactionAwarenessService
                 return response;
             }
             if (response.statusCode() != 200) {
-                markUncertain(admission, response.statusCode());
+                markUncertain(admission, response.statusCode(), false);
                 return response;
             }
             if (method.equals("HEAD")) {
@@ -605,19 +662,24 @@ public class TransactionAwarenessService
 
     public void requestFailed(HttpServletRequest request)
     {
-        requestFailed(admission(request));
+        requestFailed(admission(request), Boolean.TRUE.equals(request.getAttribute(RESPONSE_RECEIVED_ATTRIBUTE)));
     }
 
     public void requestFailed(RequestContext context)
     {
-        requestFailed(context.admission);
+        requestFailed(context.admission, context.responseReceived);
     }
 
-    private void requestFailed(Admission admission)
+    /**
+     * @param responseReceived true when a backend response reached recording but could not be recorded.
+     *         It may carry effects the ledger never saw, so it is never settled as superseded. A response
+     *         that failed before recording was never forwarded, so the client saw nothing from it.
+     */
+    private void requestFailed(Admission admission, boolean responseReceived)
     {
         if (admission != null) {
             try {
-                markUncertain(admission, 0);
+                markUncertain(admission, 0, !responseReceived);
             }
             catch (RuntimeException ignored) {
                 // The durable admission remains a drain blocker when the database is unavailable.
@@ -625,16 +687,22 @@ public class TransactionAwarenessService
         }
     }
 
-    private void markUncertain(Admission admission, int status)
+    private void markUncertain(Admission admission, int status, boolean supersedable)
     {
+        boolean superseded;
         try {
-            store.markUncertain(admission.id());
+            superseded = store.markUncertain(admission.id(), supersedable);
         }
         catch (RuntimeException failure) {
             lifecycleStats.uncertain(admission, status, false);
             throw failure;
         }
-        lifecycleStats.uncertain(admission, status, true);
+        if (superseded) {
+            lifecycleStats.superseded(admission, false);
+        }
+        else {
+            lifecycleStats.uncertain(admission, status, true);
+        }
     }
 
     public void requestRejectedBeforeDispatch(HttpServletRequest request)

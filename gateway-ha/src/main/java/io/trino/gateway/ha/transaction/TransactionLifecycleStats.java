@@ -33,7 +33,7 @@ public final class TransactionLifecycleStats
 
     private enum Event
     {
-        EXECUTING_RESULT_NOT_FOUND, MARK_UNCERTAIN_SUCCEEDED, MARK_UNCERTAIN_FAILED, POOL_DRAIN_BLOCKED
+        EXECUTING_RESULT_NOT_FOUND, MARK_UNCERTAIN_SUCCEEDED, MARK_UNCERTAIN_FAILED, ADMISSION_SUPERSEDED, POOL_DRAIN_BLOCKED
     }
 
     private final CounterStat terminalResults = new CounterStat();
@@ -42,6 +42,8 @@ public final class TransactionLifecycleStats
     private final CounterStat executingNotFoundResponses = new CounterStat();
     private final CounterStat markUncertainSuccesses = new CounterStat();
     private final CounterStat markUncertainFailures = new CounterStat();
+    private final CounterStat supersededAdmissions = new CounterStat();
+    private final CounterStat sweptSupersededAdmissions = new CounterStat();
     private final CounterStat blockedDrainObservations = new CounterStat();
     private final EnumMap<Event, AtomicLong> lastLogNanos = new EnumMap<>(Event.class);
     private final LongSupplier nanoTime;
@@ -77,6 +79,23 @@ public final class TransactionLifecycleStats
     {
         (persisted ? markUncertainSuccesses : markUncertainFailures).update(1);
         requestLog(persisted ? Event.MARK_UNCERTAIN_SUCCEEDED : Event.MARK_UNCERTAIN_FAILED, admission, status);
+    }
+
+    /**
+     * @param swept true when the maintenance sweep settled an admission already marked uncertain,
+     *         false when a failed request settled it directly
+     */
+    void superseded(Admission admission, boolean swept)
+    {
+        (swept ? sweptSupersededAdmissions : supersededAdmissions).update(1);
+        if (mayLog(Event.ADMISSION_SUPERSEDED)) {
+            log.info("reason=%s admission=%s query=%s incarnation=%s source=%s",
+                    Event.ADMISSION_SUPERSEDED,
+                    admission.id(),
+                    safeIdentifier(admission.queryId()),
+                    admission.backend().incarnation(),
+                    swept ? "sweep" : "request");
+        }
     }
 
     void drain(String instance, UUID incarnation, String phase, long pending, long transactions, long queries)
@@ -160,6 +179,20 @@ public final class TransactionLifecycleStats
     public CounterStat getMarkUncertainFailures()
     {
         return markUncertainFailures;
+    }
+
+    @Managed
+    @Nested
+    public CounterStat getSupersededAdmissions()
+    {
+        return supersededAdmissions;
+    }
+
+    @Managed
+    @Nested
+    public CounterStat getSweptSupersededAdmissions()
+    {
+        return sweptSupersededAdmissions;
     }
 
     @Managed

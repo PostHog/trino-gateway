@@ -20,6 +20,7 @@ import org.jdbi.v3.core.Jdbi;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -43,6 +44,21 @@ public final class TransactionStore
               (SELECT count(*) FROM transaction_query q WHERE q.incarnation = b.incarnation AND NOT q.terminal)
                 + (SELECT count(*) FROM transaction_query q WHERE q.incarnation = b.incarnation AND q.terminal AND q.retain_until > statement_timestamp()) AS queries
             FROM transaction_backend b WHERE b.incarnation = :id
+            """;
+
+    static final String SUPERSEDED_OBSERVATION = "SUPERSEDED";
+    // Only COMPLETE admissions require an observation. On an UNCERTAIN one it records whether a response was seen.
+    static final String UNRECORDED_RESPONSE_OBSERVATION = "RESPONSE_UNRECORDED";
+    static final String NO_RESPONSE_OBSERVATION = "NO_RESPONSE";
+    // Anchored suffix of fingerprint(): "<clear>:<terminal>:<retry seconds>[:capabilities:<hashes>]"; encoded identities precede it.
+    static final String TERMINAL_OBSERVATION = "(true|false):true:[0-9]+(:capabilities:[0-9a-f,]+)?$";
+    private static final String SUPERSEDED_PROOF =
+            """
+            a.query_id IS NOT NULL
+            AND a.observation = 'NO_RESPONSE'
+            AND EXISTS (SELECT 1 FROM transaction_query q WHERE q.query_id = a.query_id AND q.incarnation = a.incarnation AND q.terminal)
+            AND EXISTS (SELECT 1 FROM transaction_admission s WHERE s.query_id = a.query_id AND s.incarnation = a.incarnation
+              AND s.admission_id <> a.admission_id AND s.state = 'COMPLETE' AND s.observation ~ :terminal)
             """;
 
     private final GatewayDatabase jdbi;
@@ -264,13 +280,81 @@ public final class TransactionStore
         });
     }
 
-    public void markUncertain(UUID admissionId)
+    /**
+     * Records that a request's outcome is unknown, which keeps its admission blocking drain. A
+     * request that failed without any backend response may instead settle as superseded: its query
+     * is terminal and a sibling admission of that query recorded the terminal observation. That
+     * happens when a client polls one query over concurrent requests and drops the rest once one
+     * delivers the final result. Responses are forwarded only after they are recorded, so the client
+     * never saw anything the failed request carried, and the terminal query has nothing left to run.
+     *
+     * @param supersedable true only when no backend response was forwarded or recorded. Otherwise the
+     *         admission is marked so that neither this call nor the sweep ever settles it.
+     * @return true when this call settled the admission as superseded
+     */
+    public boolean markUncertain(UUID admissionId, boolean supersedable)
     {
-        jdbi.withOperation(GatewayDatabase.Operation.MARK_UNCERTAIN).useIdempotentTransaction(handle -> {
+        return jdbi.withOperation(GatewayDatabase.Operation.MARK_UNCERTAIN).inIdempotentTransaction(handle -> {
             lockAdmissionBackend(handle, admissionId);
-            handle.createUpdate("UPDATE transaction_admission SET state = 'UNCERTAIN' WHERE admission_id = :id AND state <> 'COMPLETE'")
-                    .bind("id", admissionId).execute();
+            handle.createUpdate(
+                            """
+                            UPDATE transaction_admission SET state = 'UNCERTAIN',
+                              observation = CASE WHEN NOT :supersedable THEN :unrecorded WHEN state = 'PENDING' THEN :noResponse ELSE observation END
+                            WHERE admission_id = :id AND state <> 'COMPLETE'
+                            """)
+                    .bind("id", admissionId).bind("supersedable", supersedable).bind("unrecorded", UNRECORDED_RESPONSE_OBSERVATION).bind("noResponse", NO_RESPONSE_OBSERVATION).execute();
+            return supersedable && settleIfSuperseded(handle, admissionId);
         });
+    }
+
+    /**
+     * Settles uncertain admissions that meet the superseded proof, typically because they failed
+     * before a sibling recorded their query's terminal result. Only proven
+     * discharged obligations settle; every other uncertain admission keeps blocking drain.
+     *
+     * @return the admissions this call settled, and the first failure that did not stop it
+     */
+    public SupersededSweep settleSupersededAdmissions(int limit)
+    {
+        List<UUID> candidates = jdbi.withOperation(GatewayDatabase.Operation.SETTLE_SUPERSEDED).withHandle(handle -> handle.createQuery(
+                        "SELECT a.admission_id FROM transaction_admission a WHERE a.state = 'UNCERTAIN' AND " + SUPERSEDED_PROOF + " ORDER BY a.created_at LIMIT :limit")
+                .bind("terminal", TERMINAL_OBSERVATION).bind("limit", limit).mapTo(UUID.class).list());
+        List<Admission> settled = new ArrayList<>();
+        RuntimeException firstFailure = null;
+        for (UUID candidate : candidates) {
+            // One failing candidate must not starve the rest, which are ordered oldest first.
+            try {
+                jdbi.withOperation(GatewayDatabase.Operation.SETTLE_SUPERSEDED).inIdempotentTransaction(handle -> {
+                    Admission admission = lockAdmissionBackend(handle, candidate);
+                    return settleIfSuperseded(handle, candidate) ? Optional.of(admission) : Optional.<Admission>empty();
+                }).ifPresent(settled::add);
+            }
+            catch (RuntimeException failure) {
+                if (firstFailure == null) {
+                    firstFailure = failure;
+                }
+                else {
+                    firstFailure.addSuppressed(failure);
+                }
+            }
+        }
+        return new SupersededSweep(settled, candidates.size(), Optional.ofNullable(firstFailure));
+    }
+
+    /**
+     * @param candidates the number of candidates read, which bounds settled plus failed ones
+     * @param failure the first per-candidate failure, with later ones suppressed into it
+     */
+    public record SupersededSweep(List<Admission> settled, int candidates, Optional<RuntimeException> failure) {}
+
+    // The admission row is locked by the caller. Terminal state and completed admissions are monotonic, so the proof cannot be revoked.
+    // Reports only a settlement this call made, so a repeated call is not counted twice.
+    private static boolean settleIfSuperseded(Handle handle, UUID admissionId)
+    {
+        return handle.createUpdate(
+                        "UPDATE transaction_admission a SET state = 'COMPLETE', observation = '" + SUPERSEDED_OBSERVATION + "' " +
+                                "WHERE a.admission_id = :id AND a.state <> 'COMPLETE' AND " + SUPERSEDED_PROOF)
+                .bind("id", admissionId).bind("terminal", TERMINAL_OBSERVATION).execute() > 0;
     }
 
     public void rejectAdmission(UUID admissionId)

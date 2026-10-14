@@ -451,6 +451,168 @@ class TestTransactionStore
     }
 
     @Test
+    void droppedConcurrentPollSettlesOnceSiblingDeliveredTerminalResult()
+    {
+        String capability = "c".repeat(64);
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, false, 0, List.of(capability)));
+        Admission delivering = second.admitQuery("query", Optional.of("owner"), Optional.empty());
+        Admission dropped = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        second.recordResponse(delivering.id(), new ResponseObservation("query", null, false, true, 0));
+        long generation = second.beginDrain("blue").generation();
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+
+        assertThat(first.markUncertain(dropped.id(), true)).isTrue();
+        assertThat(admissionState(dropped)).isEqualTo("COMPLETE:" + TransactionStore.SUPERSEDED_OBSERVATION);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+        assertThat(second.markUncertain(dropped.id(), true)).isFalse();
+        assertThat(admissionState(dropped)).isEqualTo("COMPLETE:" + TransactionStore.SUPERSEDED_OBSERVATION);
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(first.seal("blue", generation).drained()).isTrue();
+    }
+
+    @Test
+    void receivedButUnrecordedResponseIsNeverSuperseded()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, true, 0));
+        Admission unrecorded = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        assertThat(first.markUncertain(unrecorded.id(), false)).isFalse();
+        assertThat(admissionState(unrecorded)).isEqualTo("UNCERTAIN:" + TransactionStore.UNRECORDED_RESPONSE_OBSERVATION);
+        assertThat(second.markUncertain(unrecorded.id(), true)).isFalse();
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(unrecorded)).isEqualTo("UNCERTAIN:" + TransactionStore.UNRECORDED_RESPONSE_OBSERVATION);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void uncertaintyMarkerDoesNotPreventALaterOutcome()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, false, 0));
+        Admission continuation = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        assertThat(first.markUncertain(continuation.id(), true)).isFalse();
+        first.recordResponse(continuation.id(), new ResponseObservation("query", null, false, true, 0));
+        assertThat(admissionState(continuation)).startsWith("COMPLETE:").doesNotContain(TransactionStore.SUPERSEDED_OBSERVATION);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void terminalObservationWithCapabilitiesProvesDelivery()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, true, 0, List.of("d".repeat(64), "e".repeat(64))));
+        Admission dropped = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        assertThat(first.markUncertain(dropped.id(), true)).isTrue();
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void uncertainContinuationOfRunningQueryStillBlocksDrain()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, false, 0));
+        Admission dropped = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        assertThat(first.markUncertain(dropped.id(), true)).isFalse();
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(dropped)).isEqualTo("UNCERTAIN:" + TransactionStore.NO_RESPONSE_OBSERVATION);
+        long generation = second.beginDrain("blue").generation();
+        expect(NOT_DRAINED, () -> first.seal("blue", generation));
+    }
+
+    @Test
+    void terminalQueryWithoutCompletedTerminalSiblingStillBlocksDrain()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, false, 120, List.of("f".repeat(64), "0".repeat(64))));
+        Admission dropped = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        // Terminal state without a sibling that recorded it does not prove this request's obligation discharged.
+        database.useHandle(handle -> handle.execute("UPDATE transaction_query SET terminal = TRUE, retain_until = clock_timestamp() WHERE query_id = 'query'"));
+        Admission rejected = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        first.rejectAdmission(rejected.id());
+        assertThat(first.markUncertain(dropped.id(), true)).isFalse();
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(dropped)).isEqualTo("UNCERTAIN:" + TransactionStore.NO_RESPONSE_OBSERVATION);
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void uncertainSubmissionIsNeverSuperseded()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, true, 0));
+        Admission unknown = first.admitNew("blue", "owner", "group");
+        assertThat(first.markUncertain(unknown.id(), true)).isFalse();
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void completedAdmissionKeepsItsOutcome()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        ResponseObservation terminal = new ResponseObservation("query", null, false, true, 0);
+        first.recordResponse(submit.id(), terminal);
+        Admission rejected = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        first.rejectAdmission(rejected.id());
+        assertThat(first.markUncertain(rejected.id(), true)).isFalse();
+        assertThat(first.markUncertain(submit.id(), true)).isFalse();
+        assertThat(admissionState(rejected)).isEqualTo("COMPLETE:REJECTED");
+        first.recordResponse(submit.id(), terminal);
+        assertThat(first.drainStatus("blue").pendingRequests()).isZero();
+    }
+
+    @Test
+    void sweepSettlesProvenOrphansExactlyOnce()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, false, 0));
+        Admission early = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        Admission delivering = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        // The dropped poll failed before its sibling recorded the terminal result.
+        assertThat(first.markUncertain(early.id(), true)).isFalse();
+        first.recordResponse(delivering.id(), new ResponseObservation("query", null, false, true, 0));
+
+        Admission running = first.admitNew("green", "owner", "group");
+        first.recordResponse(running.id(), new ResponseObservation("running", null, false, false, 0));
+        Admission unproven = first.admitQuery("running", Optional.of("owner"), Optional.empty());
+        first.markUncertain(unproven.id(), true);
+        Admission pending = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(2);
+        assertThat(second.settleSupersededAdmissions(10)).extracting(Admission::id).containsExactly(early.id());
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(early)).isEqualTo("COMPLETE:" + TransactionStore.SUPERSEDED_OBSERVATION);
+        assertThat(admissionState(unproven)).isEqualTo("UNCERTAIN:" + TransactionStore.NO_RESPONSE_OBSERVATION);
+        assertThat(admissionState(pending)).isEqualTo("PENDING:null");
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+        assertThat(first.drainStatus("green").pendingRequests()).isEqualTo(1);
+    }
+
+    @Test
+    void sweepNeverSettlesUnmarkedUncertainty()
+    {
+        Admission submit = first.admitNew("blue", "owner", "group");
+        first.recordResponse(submit.id(), new ResponseObservation("query", null, false, true, 0));
+        Admission legacy = first.admitQuery("query", Optional.of("owner"), Optional.empty());
+        database.useHandle(handle -> handle.createUpdate("UPDATE transaction_admission SET state = 'UNCERTAIN' WHERE admission_id = :id").bind("id", legacy.id()).execute());
+        // Without a marker it is unknown whether a response was forwarded.
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(legacy)).isEqualTo("UNCERTAIN:null");
+        // A later failure report cannot supply the missing fact either.
+        assertThat(first.markUncertain(legacy.id(), true)).isFalse();
+        assertThat(first.settleSupersededAdmissions(10)).isEmpty();
+        assertThat(admissionState(legacy)).isEqualTo("UNCERTAIN:null");
+        assertThat(first.drainStatus("blue").pendingRequests()).isEqualTo(1);
+    }
+
+    private String admissionState(Admission admission)
+    {
+        return database.withHandle(handle -> handle.createQuery("SELECT state || ':' || coalesce(observation, 'null') FROM transaction_admission WHERE admission_id = :id")
+                .bind("id", admission.id()).mapTo(String.class).one());
+    }
+
+    @Test
     void rejectedContinuationDoesNotEraseQueryOrTransactionObligations()
     {
         Admission start = first.admitNew("blue", "owner", "group");

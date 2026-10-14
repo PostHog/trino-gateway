@@ -67,7 +67,7 @@ public final class GatewayDatabase
 
     public enum Operation
     {
-        TRANSACTION_STORE, RECORD_RESPONSE, MARK_UNCERTAIN, REJECT_ADMISSION, POOL_STORE, ROLLOUT_STORE, BACKEND_DAO, HISTORY_DAO
+        TRANSACTION_STORE, RECORD_RESPONSE, MARK_UNCERTAIN, REJECT_ADMISSION, POOL_STORE, ROLLOUT_STORE, BACKEND_DAO, HISTORY_DAO, SETTLE_SUPERSEDED
     }
 
     private record FailureKey(Operation operation, String outcome, String exceptionClass, String state, int vendorCode) {}
