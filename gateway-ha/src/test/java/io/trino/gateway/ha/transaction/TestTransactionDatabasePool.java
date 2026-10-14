@@ -348,7 +348,7 @@ class TestTransactionDatabasePool
                         blocker.begin();
                         blocker.createQuery("SELECT admission_id FROM " + schema + ".transaction_admission WHERE admission_id = :id FOR UPDATE")
                                 .bind("id", admission.id()).mapTo(UUID.class).one();
-                        var update = executor.submit(() -> store.markUncertain(admission.id()));
+                        var update = executor.submit(() -> store.markUncertain(admission.id(), false));
                         try {
                             assertThatThrownBy(() -> update.get(2, java.util.concurrent.TimeUnit.SECONDS))
                                     .isInstanceOf(java.util.concurrent.ExecutionException.class)

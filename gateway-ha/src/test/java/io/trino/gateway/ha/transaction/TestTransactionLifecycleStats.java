@@ -47,8 +47,10 @@ class TestTransactionLifecycleStats
                 stats.drain("unsafe\ninstance", backend.incarnation(), "DRAINING", 2, 3, 4);
                 stats.terminalResult(false);
                 stats.terminalResult(true);
+                stats.superseded(admission, index % 2 == 0);
             }
-            assertThat(logs.messages).hasSize(4);
+            assertThat(logs.messages).hasSize(5);
+            assertThat(logs.messages).anySatisfy(message -> assertThat(message).contains("reason=ADMISSION_SUPERSEDED", "source=sweep"));
             assertThat(logs.messages).anySatisfy(message -> assertThat(message).contains("reason=POOL_DRAIN_BLOCKED", "instance=redacted", "pendingRequests=2", "openTransactions=3", "activeQueries=4"));
             assertThat(logs.messages).allSatisfy(message -> assertThat(message).doesNotContain("private.example", "owner-secret", "transaction-secret", "\n"));
             assertThat(stats.getExecutingNotFoundResponses().getTotalCount()).isEqualTo(1000);
@@ -57,9 +59,11 @@ class TestTransactionLifecycleStats
             assertThat(stats.getBlockedDrainObservations().getTotalCount()).isEqualTo(1000);
             assertThat(stats.getTerminalResults().getTotalCount()).isEqualTo(1000);
             assertThat(stats.getCancellationAcknowledgements().getTotalCount()).isEqualTo(1000);
+            assertThat(stats.getSupersededAdmissions().getTotalCount()).isEqualTo(500);
+            assertThat(stats.getSweptSupersededAdmissions().getTotalCount()).isEqualTo(500);
             time.addAndGet(SECONDS.toNanos(30));
             stats.uncertain(admission, 503, true);
-            assertThat(logs.messages).hasSize(5);
+            assertThat(logs.messages).hasSize(6);
         }
     }
 

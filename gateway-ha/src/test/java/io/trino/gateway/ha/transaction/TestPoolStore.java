@@ -2086,7 +2086,7 @@ class TestPoolStore
             var completion = executor.submit(() -> {
                 switch (outcome) {
                     case "response" -> transactions.recordResponse(admission.id(), new ResponseObservation("query-before-drain", "transaction-before-drain", false, false, 120));
-                    case "uncertain" -> transactions.markUncertain(admission.id());
+                    case "uncertain" -> transactions.markUncertain(admission.id(), false);
                     case "rejected" -> transactions.rejectAdmission(admission.id());
                     default -> throw new IllegalArgumentException("Unknown test outcome");
                 }

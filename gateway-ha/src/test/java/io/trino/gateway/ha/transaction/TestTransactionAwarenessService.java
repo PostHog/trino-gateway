@@ -59,6 +59,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.SoftAssertions.assertSoftly;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -135,7 +137,7 @@ class TestTransactionAwarenessService
         expectStatus(502, () -> service.recordResponse(request, response(200, body)));
         verifyNoInteractions(store);
         service.requestFailed(request);
-        verify(store).markUncertain(any(UUID.class));
+        verify(store).markUncertain(any(UUID.class), eq(false));
     }
 
     @ParameterizedTest
@@ -220,8 +222,41 @@ class TestTransactionAwarenessService
         ProxyResponse forgotten = response(404, "Query not found");
         assertThat(service.recordResponse(request, forgotten)).isSameAs(forgotten);
         verify(store).recordResponse(admission(request).id(), new ResponseObservation(QUERY, null, false, true, 120));
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
         verify(store, never()).rejectAdmission(any());
+    }
+
+    @Test
+    void failedRequestWhoseResultWasDeliveredCountsAsSuperseded()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        when(store.markUncertain(admission(request).id(), true)).thenReturn(true);
+        service.requestFailed(request);
+        assertThat(lifecycleStats.getSupersededAdmissions().getTotalCount()).isEqualTo(1);
+        assertThat(lifecycleStats.getMarkUncertainSuccesses().getTotalCount()).isZero();
+    }
+
+    @Test
+    void failedRecordingOfReceivedResponseIsNeverSuperseded()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        doThrow(new IllegalStateException("synthetic database outage")).when(store).recordResponse(any(), any());
+        expectStatus(503, () -> service.recordResponse(request, response(200, RESULTS)));
+        service.requestFailed(request);
+        verify(store).markUncertain(admission(request).id(), false);
+        verify(store, never()).markUncertain(any(), eq(true));
+    }
+
+    @Test
+    void sweepCountsSettledAdmissionsAndSurvivesFailures()
+    {
+        HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, TRANSACTION);
+        service.shutdown();
+        Admission settled = admission(request);
+        when(store.settleSupersededAdmissions(anyInt())).thenReturn(new TransactionStore.SupersededSweep(List.of(settled), 1, Optional.empty())).thenThrow(new IllegalStateException("database unavailable"));
+        service.settleSupersededAdmissions();
+        service.settleSupersededAdmissions();
+        assertThat(lifecycleStats.getSweptSupersededAdmissions().getTotalCount()).isEqualTo(1);
     }
 
     @ParameterizedTest
@@ -230,7 +265,7 @@ class TestTransactionAwarenessService
     {
         HttpServletRequest request = admitted("GET", path, QUERY, TRANSACTION);
         service.recordResponse(request, response(410, "Gone"));
-        verify(store).markUncertain(admission(request).id());
+        verify(store).markUncertain(admission(request).id(), false);
         verify(store, never()).recordResponse(any(), any());
     }
 
@@ -240,7 +275,7 @@ class TestTransactionAwarenessService
     {
         HttpServletRequest request = admitted("GET", "/v1/query/" + QUERY, QUERY, TRANSACTION);
         service.recordResponse(request, response(410, "Gone", header, TRANSACTION));
-        verify(store).markUncertain(admission(request).id());
+        verify(store).markUncertain(admission(request).id(), false);
         verify(store, never()).recordResponse(any(), any());
     }
 
@@ -307,7 +342,7 @@ class TestTransactionAwarenessService
         Admission admission = admission(request);
         ProxyResponse response = response(status, "upstream outcome unavailable");
         assertThat(service.recordResponse(request, response)).isSameAs(response);
-        verify(store).markUncertain(admission.id());
+        verify(store).markUncertain(admission.id(), false);
         verify(store, never()).rejectAdmission(any());
         verify(store, never()).recordResponse(any(), any());
     }
@@ -316,7 +351,7 @@ class TestTransactionAwarenessService
     void uncertaintyPersistenceFailureIsCountedWithoutChangingFailureHandling()
     {
         HttpServletRequest request = admitted("GET", CONTINUATION, QUERY, null);
-        doThrow(new IllegalStateException("private database connection detail")).when(store).markUncertain(any());
+        doThrow(new IllegalStateException("private database connection detail")).when(store).markUncertain(any(), anyBoolean());
         expectStatus(503, () -> service.recordResponse(request, response(503, "private upstream detail")));
         assertThat(lifecycleStats.getMarkUncertainFailures().getTotalCount()).isEqualTo(1);
         assertThat(lifecycleStats.getMarkUncertainSuccesses().getTotalCount()).isZero();
@@ -344,7 +379,7 @@ class TestTransactionAwarenessService
         ProxyResponse rejected = response(404, "Query not found");
         assertThat(service.recordResponse(request, rejected)).isSameAs(rejected);
         verify(store).rejectAdmission(admission.id());
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
         verify(store, never()).recordResponse(any(), any());
     }
 
@@ -406,7 +441,7 @@ class TestTransactionAwarenessService
         assertThat(service.recordResponse(request, acknowledged)).isSameAs(acknowledged);
         verify(store).recordResponse(admission.id(), new ResponseObservation(QUERY, null, false, true, 120));
         verify(store, never()).rejectAdmission(any());
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
     }
 
     @ParameterizedTest
@@ -418,7 +453,7 @@ class TestTransactionAwarenessService
         ProxyResponse acknowledged = response(204, "");
         assertThat(service.recordResponse(request, acknowledged)).isSameAs(acknowledged);
         verify(store).rejectAdmission(admission.id());
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
         verify(store, never()).recordResponse(any(), any());
     }
 
@@ -428,7 +463,7 @@ class TestTransactionAwarenessService
     {
         HttpServletRequest request = admitted(method, method.equals("POST") ? "/v1/statement" : CONTINUATION, method.equals("POST") ? null : QUERY, TRANSACTION);
         service.recordResponse(request, response(204, ""));
-        verify(store).markUncertain(admission(request).id());
+        verify(store).markUncertain(admission(request).id(), false);
         verify(store, never()).rejectAdmission(any());
         verify(store, never()).recordResponse(any(), any());
     }
@@ -439,7 +474,7 @@ class TestTransactionAwarenessService
     {
         HttpServletRequest request = admitted("DELETE", CONTINUATION, QUERY, TRANSACTION);
         service.recordResponse(request, response(204, "", header, TRANSACTION));
-        verify(store).markUncertain(admission(request).id());
+        verify(store).markUncertain(admission(request).id(), false);
         verify(store, never()).rejectAdmission(any());
         verify(store, never()).recordResponse(any(), any());
     }
@@ -451,7 +486,7 @@ class TestTransactionAwarenessService
         HttpServletRequest request = admitted(method, CONTINUATION, QUERY, TRANSACTION);
         Admission admission = admission(request);
         service.recordResponse(request, response(404, "Query not found", "X-Trino-Started-Transaction-Id", TRANSACTION));
-        verify(store).markUncertain(admission.id());
+        verify(store).markUncertain(admission.id(), false);
         verify(store, never()).rejectAdmission(any());
         verify(store, never()).recordResponse(any(), any());
     }
@@ -462,7 +497,7 @@ class TestTransactionAwarenessService
         HttpServletRequest request = admitted("POST", "/v1/statement", null, null);
         Admission admission = admission(request);
         service.recordResponse(request, response(404, "Query not found"));
-        verify(store).markUncertain(admission.id());
+        verify(store).markUncertain(admission.id(), false);
         verify(store, never()).rejectAdmission(any());
     }
 
@@ -474,7 +509,7 @@ class TestTransactionAwarenessService
         doThrow(new IllegalStateException("synthetic database outage")).when(store).recordResponse(any(), any());
         expectStatus(503, () -> service.recordResponse(request, response(200, RESULTS)));
         service.requestFailed(request);
-        verify(store).markUncertain(admission.id());
+        verify(store).markUncertain(admission.id(), false);
         verifyNoInteractions(selector, backendManager, httpClient);
     }
 
@@ -794,7 +829,7 @@ class TestTransactionAwarenessService
         expectStatus(504, () -> service.resolve(
                 request("GET", CONTINUATION, Map.of())));
         verify(store).rejectAdmission(admission.id());
-        verify(store, never()).markUncertain(any());
+        verify(store, never()).markUncertain(any(), anyBoolean());
     }
 
     private static HttpServletRequest admitted(String method, String path, String queryId, String transactionId)

@@ -128,9 +128,23 @@ public final class PooledTransactionStoreFixture
         transactions.recordResponse(admission, observation);
     }
 
-    public void markUncertain(UUID admission)
+    public boolean markUncertain(UUID admission)
     {
-        transactions.markUncertain(admission);
+        return transactions.markUncertain(admission, false);
+    }
+
+    public boolean markUncertain(UUID admission, boolean supersedable)
+    {
+        return transactions.markUncertain(admission, supersedable);
+    }
+
+    public List<Admission> settleSupersededAdmissions(int limit)
+    {
+        TransactionStore.SupersededSweep sweep = transactions.settleSupersededAdmissions(limit);
+        sweep.failure().ifPresent(failure -> {
+            throw failure;
+        });
+        return sweep.settled();
     }
 
     public void rejectAdmission(UUID admission)

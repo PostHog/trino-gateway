@@ -230,6 +230,33 @@ retain an unresolved admission. Reconcile it against authoritative coordinator
 state before retirement; do not assume it never executed and do not replay it
 automatically. This deliberately favors safety over guaranteed drain completion.
 
+One case is already resolved by the ledger itself. A continuation request failed
+with no backend response forwarded or recorded, its query is terminal, and a sibling admission of that query on the same incarnation completed with a terminal
+observation: the final page, a cancellation acknowledgement, or the query no longer
+being known. The ledger does not know what that request's response would have
+carried. But responses reach the client only after they are recorded, so the client
+saw nothing from it, and the terminal query has nothing left to run on the backend.
+Retirement therefore cannot break anything the client can observe. That includes a
+transaction the lost response may have started or cleared: the client never received
+that header, so it cannot address the transaction, and retirement discards it with the backend, and any header it did receive on
+a sibling response was recorded with that response. This is common
+when a client polls one query over concurrent requests and drops the rest once one
+of them returns the final result. Such an admission becomes `COMPLETE` with
+observation `SUPERSEDED` instead of remaining uncertain, both when its failure is
+recorded and through a periodic sweep for failures recorded before the terminal
+observation. The proxy reports a request's failure only after any attempt to record its
+response, and never records a response afterwards, so the settlement cannot
+conflict with a later observation of the same request.
+
+Uncertain admissions record which case applies: `NO_RESPONSE` may settle this way,
+while `RESPONSE_UNRECORDED`, written when a non-success response was forwarded or a
+received response could not be recorded, never does. Uncertain admissions without a
+marker, written before this rule or by an older replica during a rolling upgrade, never
+settle automatically; settling one requires an operator decision based on evidence
+outside the ledger. Admissions not bound
+to a query, such as submissions and transaction statements, and continuations
+without that proof keep blocking drain.
+
 An authenticated coordinator query/transaction inventory can support reconciliation,
 but a snapshot alone does not resolve a request still in flight. Reconciliation
 must fence admissions and establish that the observed process is the original
@@ -267,7 +294,7 @@ or request rejection. Passing happy-path affinity tests is not sufficient.
 | Q-4 | Transaction cleared with query/results still outstanding | Transaction tombstone does not erase result obligation |
 | Q-5 | Final page recorded, then client disconnects or gateway crashes | Defined retry contract holds; no claim of client acknowledgement |
 | Q-6 | Reordered continuation responses or terminal-page retries | Lifecycle state is monotonic and affinity remains exact |
-| Q-7 | DELETE races with GET, timeout, or transaction clear | No double release; uncertainty remains an obligation |
+| Q-7 | DELETE races with GET, timeout, or transaction clear | No double release; uncertainty remains an obligation unless no response was forwarded, the query is terminal, and a sibling admission on the same incarnation recorded the terminal observation, which settles it as superseded |
 | Q-8 | Malformed, oversized, contradictory, or unexpected response | Fail closed without declaring accepted work complete |
 | Q-9 | Completed admission callback repeats or a late failure callback arrives | Identical observation is idempotent; conflicting observation fails; completion never becomes uncertain again |
 | D-1 | New admission races with drain on another replica | Admission is fenced or remains counted against old incarnation |

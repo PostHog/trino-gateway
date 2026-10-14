@@ -200,16 +200,20 @@ counters under `io_trino_gateway_ha_transaction_name_TransactionLifecycleStats_`
 | `ExecutingNotFoundResponses` | The subset received for exact admitted executing-result GET requests. |
 | `MarkUncertainSuccesses` | Calls to mark an admission uncertain that returned successfully. |
 | `MarkUncertainFailures` | Calls to mark an admission uncertain that failed. |
+| `SupersededAdmissions` | Failed requests whose admission this process settled as superseded instead of uncertain, because a sibling admission already recorded a terminal observation for the query. |
+| `SweptSupersededAdmissions` | Uncertain admissions the periodic sweep settled as superseded. |
 | `BlockedDrainObservations` | Draining members with nonzero obligations observed in member-list or obligation reads. |
 
 These counters describe observations on each Gateway process, not distinct queries,
 current obligations, or completed state transitions. Retries and repeated polls can
 increment them again. Marking an already-complete admission uncertain is a successful
-no-op. Counters reset when the process restarts. Use the pool obligation API for
+no-op. A superseded settlement counts only as `SupersededAdmissions`, not as
+`MarkUncertainSuccesses`. Counters reset when the process restarts. Use the pool obligation API for
 current authoritative counts; never use these counters to authorize retirement.
 
 Diagnostic logs use the fixed reasons `EXECUTING_RESULT_NOT_FOUND`,
-`MARK_UNCERTAIN_SUCCEEDED`, `MARK_UNCERTAIN_FAILED`, and `POOL_DRAIN_BLOCKED`.
+`MARK_UNCERTAIN_SUCCEEDED`, `MARK_UNCERTAIN_FAILED`, `ADMISSION_SUPERSEDED`, and
+`POOL_DRAIN_BLOCKED`. `ADMISSION_SUPERSEDED` carries `source=request` or `source=sweep`.
 Each reason has an independent limit of one log per 30 seconds per process; counters
 remain unsampled. Logs include admission/query/incarnation identifiers or member
 obligation counts, but not SQL, credentials, transaction identifiers, result
@@ -219,6 +223,30 @@ responses and cancellation acknowledgements update counters without success logs
 
 An executing-result 404 observation does not claim that query recovery occurred.
 This instrumentation does not add a reconciler or change any drain decision.
+
+## Superseded admissions
+
+Clients may poll one query over concurrent requests and drop the others once one
+of them returns the final result. The dropped request fails, and its admission
+would otherwise stay uncertain and block the member's drain forever: no later
+request goes through that admission to settle it. An admission instead becomes
+`COMPLETE` with observation `SUPERSEDED` when its request failed with no backend
+response forwarded or recorded (marked `NO_RESPONSE` while uncertain), its query is
+terminal, and another admission of the same query on the same incarnation completed
+with a terminal observation (final page, cancellation acknowledgement, or query
+no longer known). Only that proof settles it. An uncertain admission
+marked `RESPONSE_UNRECORDED`, because a non-success response was forwarded or a
+received response could not be recorded, never settles this way; neither does an
+uncertain submission or transaction statement, or a continuation without that proof.
+Uncertain admissions without a marker, written before this rule or by an older
+replica during a rolling upgrade, do not record whether a response was forwarded,
+so they never settle automatically; settling one requires an operator decision
+based on evidence outside the ledger.
+
+A failed request applies the rule when it is marked. With transaction-aware routing enabled,
+every Gateway replica also sweeps independently, 10 seconds after startup and then
+60 seconds after each sweep finishes. The sweep is the only path that settles a request that failed before its
+sibling recorded the terminal observation; sweep failures are logged as warnings.
 
 ## Trino Gateway health endpoints
 
