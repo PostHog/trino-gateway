@@ -18,6 +18,7 @@ import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import io.airlift.http.client.HeaderName;
@@ -65,10 +66,12 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Supplier;
 
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
@@ -109,6 +112,8 @@ public class TransactionAwarenessService
     private final PoolStore pools;
     private final PoolLifecycleConfiguration poolConfig;
     private final boolean loadAwarePooledRouting;
+    // Null uses ThreadLocalRandom. Tests set a seeded Random.
+    private volatile Random random;
     private final ScheduledExecutorService maintenance;
     private RoutingManager routingManager;
 
@@ -325,20 +330,40 @@ public class TransactionAwarenessService
         List<PoolStore.Candidate> eligible = new ArrayList<>(pooled.candidates().stream()
                 .filter(candidate -> registrations.contains(candidate.backendName()))
                 .toList());
-        Collections.shuffle(eligible);
+        Collections.shuffle(eligible, random());
         if (!loadAwarePooledRouting) {
             eligible.sort(Comparator.comparing(candidate -> cachedHealth(candidate.backendName()) ? 0 : 1));
             return eligible;
         }
         // Advisory only. Read health and load once per candidate, so that a concurrent stats update
-        // cannot make the comparator inconsistent. The sort is stable, so the shuffle breaks ties.
+        // cannot make the comparator inconsistent.
         Map<PoolStore.Candidate, Integer> health = new HashMap<>();
         Map<PoolStore.Candidate, Double> load = new HashMap<>();
         for (PoolStore.Candidate candidate : eligible) {
             health.put(candidate, cachedHealth(candidate.backendName()) ? 0 : 1);
             load.put(candidate, cachedLoad(candidate.backendName()));
         }
+        // Power of two choices: the first candidate is the lower-load one of two random draws from the best
+        // health tier. Load data can be older than one refresh, and all gateway replicas see the same data.
+        // Strict lowest-load order would send all new work to the same member until the next refresh. The
+        // draws are independent (with replacement), so a tier of two members also spreads work. Unknown
+        // load is the highest load: it loses each comparison, and wins only when both draws select members
+        // with unknown load. Excluding such members would herd onto the members that report. The fallback
+        // candidates follow in health and load order.
+        int bestHealth = eligible.stream().mapToInt(health::get).min().orElse(0);
+        List<PoolStore.Candidate> tier = eligible.stream()
+                .filter(candidate -> health.get(candidate) == bestHealth)
+                .toList();
+        List<PoolStore.Candidate> pool = tier;
         eligible.sort(Comparator.<PoolStore.Candidate>comparingInt(health::get).thenComparingDouble(load::get));
+        if (pool.size() > 1) {
+            Random generator = random();
+            PoolStore.Candidate firstDraw = pool.get(generator.nextInt(pool.size()));
+            PoolStore.Candidate secondDraw = pool.get(generator.nextInt(pool.size()));
+            PoolStore.Candidate first = load.get(secondDraw) < load.get(firstDraw) ? secondDraw : firstDraw;
+            eligible.remove(first);
+            eligible.addFirst(first);
+        }
         return eligible;
     }
 
@@ -402,6 +427,18 @@ public class TransactionAwarenessService
     {
         return routingManager != null && routingManager.getBackEndHealth(backendName)
                 .filter(status -> status == TrinoStatus.HEALTHY).isPresent();
+    }
+
+    @VisibleForTesting
+    void setRandom(Random random)
+    {
+        this.random = requireNonNull(random, "random is null");
+    }
+
+    private Random random()
+    {
+        Random seeded = random;
+        return seeded != null ? seeded : ThreadLocalRandom.current();
     }
 
     /**

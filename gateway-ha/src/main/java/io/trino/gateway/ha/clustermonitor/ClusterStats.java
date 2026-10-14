@@ -16,6 +16,7 @@ package io.trino.gateway.ha.clustermonitor;
 import com.google.common.collect.ImmutableMap;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 
 import static java.util.Objects.requireNonNull;
@@ -32,17 +33,36 @@ public record ClusterStats(
         String routingGroup,
         Map<String, Integer> userQueuedCount,
         OptionalLong reservedQueryMemoryBytes,
-        OptionalLong maxQueryMemoryBytes)
+        OptionalLong maxQueryMemoryBytes,
+        Optional<ExternalLoad> externalLoad)
 {
     public ClusterStats
     {
         reservedQueryMemoryBytes = requireNonNullElse(reservedQueryMemoryBytes, OptionalLong.empty());
         maxQueryMemoryBytes = requireNonNullElse(maxQueryMemoryBytes, OptionalLong.empty());
+        externalLoad = requireNonNullElse(externalLoad, Optional.empty());
     }
 
     public static Builder builder(String clusterId)
     {
         return new Builder(clusterId);
+    }
+
+    public Builder toBuilder()
+    {
+        Builder builder = new Builder(clusterId)
+                .runningQueryCount(runningQueryCount)
+                .queuedQueryCount(queuedQueryCount)
+                .numWorkerNodes(numWorkerNodes)
+                .trinoStatus(trinoStatus)
+                .proxyTo(proxyTo)
+                .externalUrl(externalUrl)
+                .routingGroup(routingGroup)
+                .externalLoad(externalLoad);
+        builder.userQueuedCount = userQueuedCount;
+        builder.reservedQueryMemoryBytes = reservedQueryMemoryBytes;
+        builder.maxQueryMemoryBytes = maxQueryMemoryBytes;
+        return builder;
     }
 
     public static final class Builder
@@ -58,6 +78,7 @@ public record ClusterStats(
         private Map<String, Integer> userQueuedCount;
         private OptionalLong reservedQueryMemoryBytes = OptionalLong.empty();
         private OptionalLong maxQueryMemoryBytes = OptionalLong.empty();
+        private Optional<ExternalLoad> externalLoad = Optional.empty();
 
         private Builder(String clusterId)
         {
@@ -124,6 +145,12 @@ public record ClusterStats(
             return this;
         }
 
+        public Builder externalLoad(Optional<ExternalLoad> externalLoad)
+        {
+            this.externalLoad = requireNonNull(externalLoad, "externalLoad is null");
+            return this;
+        }
+
         public ClusterStats build()
         {
             return new ClusterStats(
@@ -137,7 +164,8 @@ public record ClusterStats(
                     routingGroup,
                     userQueuedCount,
                     reservedQueryMemoryBytes,
-                    maxQueryMemoryBytes);
+                    maxQueryMemoryBytes,
+                    externalLoad);
         }
     }
 }

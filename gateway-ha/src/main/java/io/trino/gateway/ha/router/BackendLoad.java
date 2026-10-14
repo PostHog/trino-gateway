@@ -14,16 +14,19 @@
 package io.trino.gateway.ha.router;
 
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
+import io.trino.gateway.ha.clustermonitor.ExternalLoad;
 
 import java.util.Optional;
 import java.util.OptionalDouble;
+import java.util.OptionalLong;
 
 /**
  * Load of one coordinator: {@code queued + running * memoryPressure}.
  * <p>
  * {@code memoryPressure} is {@code reserved / max} query memory, clipped to {@code [0, 1]}. When the
  * memory statistics are not known, running queries count at full weight, so the load is
- * {@code queued + running}.
+ * {@code queued + running}. When {@link ClusterStats#externalLoad()} is present, only its values are
+ * used, and unknown query counts give {@link Double#POSITIVE_INFINITY}.
  */
 public final class BackendLoad
 {
@@ -34,20 +37,36 @@ public final class BackendLoad
      */
     public static OptionalDouble memoryPressure(ClusterStats stats)
     {
-        if (stats.reservedQueryMemoryBytes().isEmpty() || stats.maxQueryMemoryBytes().isEmpty()) {
+        if (stats.externalLoad().isPresent()) {
+            ExternalLoad external = stats.externalLoad().orElseThrow();
+            return memoryPressure(external.reservedQueryMemoryBytes(), external.maxQueryMemoryBytes());
+        }
+        return memoryPressure(stats.reservedQueryMemoryBytes(), stats.maxQueryMemoryBytes());
+    }
+
+    private static OptionalDouble memoryPressure(OptionalLong reserved, OptionalLong max)
+    {
+        if (reserved.isEmpty() || max.isEmpty() || max.orElseThrow() <= 0) {
             return OptionalDouble.empty();
         }
-        long max = stats.maxQueryMemoryBytes().orElseThrow();
-        if (max <= 0) {
-            return OptionalDouble.empty();
-        }
-        double pressure = (double) stats.reservedQueryMemoryBytes().orElseThrow() / max;
+        double pressure = (double) reserved.orElseThrow() / max.orElseThrow();
         return OptionalDouble.of(Math.min(1, Math.max(0, pressure)));
     }
 
     public static double load(ClusterStats stats)
     {
-        return Math.max(0, stats.queuedQueryCount()) + Math.max(0, stats.runningQueryCount()) * memoryPressure(stats).orElse(1);
+        int queued = stats.queuedQueryCount();
+        int running = stats.runningQueryCount();
+        if (stats.externalLoad().isPresent()) {
+            // An external load source replaces the load of the monitor. Unknown counts give the highest load.
+            ExternalLoad external = stats.externalLoad().orElseThrow();
+            if (external.queuedQueryCount().isEmpty() || external.runningQueryCount().isEmpty()) {
+                return Double.POSITIVE_INFINITY;
+            }
+            queued = external.queuedQueryCount().orElseThrow();
+            running = external.runningQueryCount().orElseThrow();
+        }
+        return Math.max(0, queued) + Math.max(0, running) * memoryPressure(stats).orElse(1);
     }
 
     /**

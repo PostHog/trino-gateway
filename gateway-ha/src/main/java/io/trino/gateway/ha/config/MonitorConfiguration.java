@@ -45,6 +45,19 @@ public class MonitorConfiguration
 
     private String maxQueryMemoryMetricName;
 
+    // Optional load source for load-aware pooled routing. Empty disables it. See PrometheusClusterLoadSource.
+    private String loadPrometheusUrl = "";
+
+    private String loadQueuedQueriesQuery = "";
+
+    private String loadRunningQueriesQuery = "";
+
+    private String loadReservedMemoryQuery = "";
+
+    private String loadMaxMemoryQuery = "";
+
+    private Duration loadQueryTimeout = new Duration(5, SECONDS);
+
     // Require 1 node for health by default. This configuration only applies to the ClusterStatsMetricsMonitor
     private Map<String, Float> metricMinimumValues = ImmutableMap.of("trino_metadata_name_DiscoveryNodeManager_ActiveNodeCount", 1f);
 
@@ -170,5 +183,65 @@ public class MonitorConfiguration
     public void setClusterMetricsRegistryRefreshPeriod(Duration clusterMetricsRegistryRefreshPeriod)
     {
         this.clusterMetricsRegistryRefreshPeriod = clusterMetricsRegistryRefreshPeriod;
+    }
+
+    public String getLoadPrometheusUrl()
+    {
+        return loadPrometheusUrl;
+    }
+
+    public void setLoadPrometheusUrl(String loadPrometheusUrl)
+    {
+        this.loadPrometheusUrl = loadPrometheusUrl;
+    }
+
+    public String getLoadQueuedQueriesQuery()
+    {
+        return loadQueuedQueriesQuery;
+    }
+
+    public void setLoadQueuedQueriesQuery(String loadQueuedQueriesQuery)
+    {
+        this.loadQueuedQueriesQuery = loadQueuedQueriesQuery;
+    }
+
+    public String getLoadRunningQueriesQuery()
+    {
+        return loadRunningQueriesQuery;
+    }
+
+    public void setLoadRunningQueriesQuery(String loadRunningQueriesQuery)
+    {
+        this.loadRunningQueriesQuery = loadRunningQueriesQuery;
+    }
+
+    public String getLoadReservedMemoryQuery()
+    {
+        return loadReservedMemoryQuery;
+    }
+
+    public void setLoadReservedMemoryQuery(String loadReservedMemoryQuery)
+    {
+        this.loadReservedMemoryQuery = loadReservedMemoryQuery;
+    }
+
+    public String getLoadMaxMemoryQuery()
+    {
+        return loadMaxMemoryQuery;
+    }
+
+    public void setLoadMaxMemoryQuery(String loadMaxMemoryQuery)
+    {
+        this.loadMaxMemoryQuery = loadMaxMemoryQuery;
+    }
+
+    public Duration getLoadQueryTimeout()
+    {
+        return loadQueryTimeout;
+    }
+
+    public void setLoadQueryTimeout(Duration loadQueryTimeout)
+    {
+        this.loadQueryTimeout = loadQueryTimeout;
     }
 }

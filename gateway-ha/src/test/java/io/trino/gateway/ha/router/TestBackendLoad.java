@@ -14,6 +14,7 @@
 package io.trino.gateway.ha.router;
 
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
+import io.trino.gateway.ha.clustermonitor.ExternalLoad;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
@@ -21,6 +22,8 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.OptionalLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
@@ -54,6 +57,47 @@ final class TestBackendLoad
 
         ClusterStats zeroMax = stats("a", 3, 4, 10, 0);
         assertThat(BackendLoad.load(zeroMax)).isEqualTo(7);
+    }
+
+    @Test
+    void unknownQueryCountsGiveTheHighestLoad()
+    {
+        ClusterStats unknown = stats("a", 0, 0, 0, 100).toBuilder().externalLoad(Optional.of(ExternalLoad.unknown())).build();
+        assertThat(BackendLoad.load(unknown)).isInfinite();
+        assertThat(BackendLoad.load(Optional.of(unknown))).isEqualTo(BackendLoad.load(Optional.empty()));
+    }
+
+    @Test
+    void toBuilderKeepsEveryField()
+    {
+        ClusterStats stats = ClusterStats.builder("a")
+                .runningQueryCount(1)
+                .queuedQueryCount(2)
+                .numWorkerNodes(3)
+                .trinoStatus(io.trino.gateway.ha.clustermonitor.TrinoStatus.PENDING)
+                .proxyTo("http://a.example.test")
+                .externalUrl("https://a.example.test")
+                .routingGroup("group")
+                .userQueuedCount(Map.of("user", 4))
+                .reservedQueryMemoryBytes(5)
+                .maxQueryMemoryBytes(6)
+                .externalLoad(Optional.of(ExternalLoad.unknown()))
+                .build();
+        assertThat(stats.toBuilder().build()).isEqualTo(stats);
+    }
+
+    @Test
+    void externalLoadReplacesMonitorLoad()
+    {
+        ClusterStats stats = stats("a", 50, 50, 100, 100).toBuilder()
+                .externalLoad(Optional.of(new ExternalLoad(OptionalInt.of(1), OptionalInt.of(8), OptionalLong.empty(), OptionalLong.empty())))
+                .build();
+        assertThat(BackendLoad.memoryPressure(stats)).isEmpty();
+        assertThat(BackendLoad.load(stats)).isEqualTo(9);
+        ClusterStats withMemory = stats.toBuilder()
+                .externalLoad(Optional.of(new ExternalLoad(OptionalInt.of(1), OptionalInt.of(8), OptionalLong.of(25), OptionalLong.of(100))))
+                .build();
+        assertThat(BackendLoad.load(withMemory)).isEqualTo(3);
     }
 
     @Test

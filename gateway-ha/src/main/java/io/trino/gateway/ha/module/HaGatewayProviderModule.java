@@ -32,6 +32,7 @@ import io.trino.gateway.ha.clustermonitor.ClusterStatsObserver;
 import io.trino.gateway.ha.clustermonitor.ForMonitor;
 import io.trino.gateway.ha.clustermonitor.HealthCheckObserver;
 import io.trino.gateway.ha.clustermonitor.NoopClusterStatsMonitor;
+import io.trino.gateway.ha.clustermonitor.PrometheusClusterLoadSource;
 import io.trino.gateway.ha.clustermonitor.TrinoClusterStatsObserver;
 import io.trino.gateway.ha.config.AuthenticationConfiguration;
 import io.trino.gateway.ha.config.AuthorizationConfiguration;
@@ -211,6 +212,13 @@ public class HaGatewayProviderModule
             throw new IllegalArgumentException("The upstream selector requires a router HTTP client");
         }
         return getRoutingGroupSelector(null, configuration);
+    }
+
+    @Provides
+    @Singleton
+    public static PrometheusClusterLoadSource getPrometheusClusterLoadSource(@ForMonitor HttpClient httpClient, HaGatewayConfiguration configuration)
+    {
+        return new PrometheusClusterLoadSource(httpClient, configuration.getMonitor(), configuration.getRouting().isLoadAwarePooledRoutingEnabled());
     }
 
     @Provides
