@@ -132,7 +132,49 @@ An explicit resume makes it eligible for new statements. Old query and admission
 operations still lock their historical incarnation, so they cannot reach a newly
 started coordinator at the same URL. Stale seal, resume, and replacement requests
 must not affect the replacement. This permits repeated blue/green deployment
-cycles without deleting transaction tombstones or reassigning old query IDs.
+cycles without reassigning old query IDs. Tombstones are kept at least for the retry
+window plus the ledger retention period described below.
+
+### Ledger retention
+
+Settled history is deleted after a configurable retention period
+(`ledgerRetentionDays`, default 7, 0 disables). The foreign keys are
+admission → query, binding and incarnation; query → binding and incarnation;
+capability → query; binding → incarnation; and the pool certificate, failure
+receipt and publication receipt tables → incarnation. Readers are drain status
+and pool obligations (unsettled admissions, open bindings, running or retained
+queries of one incarnation), drain candidates and reconciliation (running
+queries and their admission counts), the superseded proof (a terminal query and a
+`COMPLETE` terminal sibling admission), and continuation admission (query,
+binding and capability rows).
+
+A query is deleted, with its admissions and capabilities, only when it is
+terminal, `retain_until` is at least the retention period in the past, every
+admission of it is `COMPLETE`, and its transaction, if any, is `CLOSED`. A
+rejected admission is deleted once older than the retention period. A `CLOSED`
+binding is deleted once nothing references it. None of these rows is counted by
+drain status, and keeping every admission of a query while any of them is
+unsettled preserves the superseded proof. Incarnations and pool rows are never
+deleted, because identity non-reuse depends on them.
+
+Each batch reads one window of the expiry index after a per-run cursor, first tries
+the query and transaction identity locks that admission, continuation and completion
+hold, then locks query, admission and binding rows with `SKIP LOCKED`, and rechecks
+the predicate under those locks, including that it locked every admission of the
+query. It does not queue behind a request that already holds a query, transaction or
+admission, and acquires nothing a request holds before its identity lock, so it
+cannot form a lock cycle with a request, a lifecycle operation or another replica. A continuation racing deletion
+either takes the identity lock first, which leaves its query unsettled, or finds the
+query unknown and is refused. Every writer of a row referencing a query or
+transaction holds that identity's lock, so no reference can appear between the
+recheck and the delete.
+
+Deleting a tombstone permits an identifier to be recorded again. Trino query
+identifiers combine a timestamp, a per-coordinator sequence and a random coordinator
+suffix, and
+transaction identifiers are random UUIDs, so they do not recur after the retry window
+plus a retention period of days; a reused identifier still cannot reach a retired
+incarnation, because admission locks the incarnation the row names.
 
 Where the supported coordinator exposes `nodeId` and `coordinatorId`, bind both
 to the registered incarnation and reject a mismatch. They detect ordinary

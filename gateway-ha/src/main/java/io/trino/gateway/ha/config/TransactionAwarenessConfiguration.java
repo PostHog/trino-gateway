@@ -29,6 +29,9 @@ public class TransactionAwarenessConfiguration
     private int requestTimeoutMillis = 120000;
     private int processInfoTimeoutMillis = 5000;
     private int completionTimeoutMillis = 10000;
+    private int ledgerRetentionDays = 7;
+    private int ledgerRetentionBatchSize = 100;
+    private int ledgerRetentionBatchPauseMillis = 500;
     private PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
 
     public PoolLifecycleConfiguration getPool()
@@ -123,6 +126,40 @@ public class TransactionAwarenessConfiguration
         this.adminToken = adminToken;
     }
 
+    /**
+     * Days settled ledger history is kept after its terminal retry window or rejection. Zero
+     * disables ledger retention; obligations are never deleted, whatever this value is.
+     */
+    public int getLedgerRetentionDays()
+    {
+        return ledgerRetentionDays;
+    }
+
+    public void setLedgerRetentionDays(int ledgerRetentionDays)
+    {
+        this.ledgerRetentionDays = ledgerRetentionDays;
+    }
+
+    public int getLedgerRetentionBatchSize()
+    {
+        return ledgerRetentionBatchSize;
+    }
+
+    public void setLedgerRetentionBatchSize(int ledgerRetentionBatchSize)
+    {
+        this.ledgerRetentionBatchSize = ledgerRetentionBatchSize;
+    }
+
+    public int getLedgerRetentionBatchPauseMillis()
+    {
+        return ledgerRetentionBatchPauseMillis;
+    }
+
+    public void setLedgerRetentionBatchPauseMillis(int ledgerRetentionBatchPauseMillis)
+    {
+        this.ledgerRetentionBatchPauseMillis = ledgerRetentionBatchPauseMillis;
+    }
+
     public int getTerminalRetentionSeconds()
     {
         return terminalRetentionSeconds;
@@ -163,6 +200,10 @@ public class TransactionAwarenessConfiguration
         }
         if (terminalRetentionSeconds < 1 || terminalRetentionSeconds > 86400) {
             throw new IllegalArgumentException("terminalRetentionSeconds must be between 1 and 86400");
+        }
+        if (ledgerRetentionDays < 0 || ledgerRetentionDays > 3650 || ledgerRetentionBatchSize < 1 || ledgerRetentionBatchSize > 500
+                || ledgerRetentionBatchPauseMillis < 0 || ledgerRetentionBatchPauseMillis > 60000) {
+            throw new IllegalArgumentException("Ledger retention needs 0 to 3650 days, a batch size of 1 to 500 and a pause of at most 60000 ms");
         }
         if (maxInFlightRequests < 1 || maxInFlightRequests > 10000 || completionThreads < 1 || completionThreads > maxInFlightRequests) {
             throw new IllegalArgumentException("Completion threads must be between 1 and maxInFlightRequests, which must not exceed 10000");
