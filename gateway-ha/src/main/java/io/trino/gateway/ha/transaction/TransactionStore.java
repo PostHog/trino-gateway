@@ -21,8 +21,12 @@ import org.jdbi.v3.core.Jdbi;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
 
@@ -31,7 +35,7 @@ import static java.util.Objects.requireNonNull;
 public final class TransactionStore
 {
     private static final Pattern SERVICE_PRINCIPAL = Pattern.compile("[a-z0-9]([a-z0-9-]*[a-z0-9])?[.]svc_[0-9a-f]{24}");
-    private static final int QUERY_LOCK_NAMESPACE = 0x54585152;
+    static final int QUERY_LOCK_NAMESPACE = 0x54585152;
     private static final int TRANSACTION_LOCK_NAMESPACE = 0x54585452;
     private static final int ADMISSION_BARRIER_NAMESPACE = 0x5458534C;
 
@@ -355,6 +359,191 @@ public final class TransactionStore
                         "UPDATE transaction_admission a SET state = 'COMPLETE', observation = '" + SUPERSEDED_OBSERVATION + "' " +
                                 "WHERE a.admission_id = :id AND a.state <> 'COMPLETE' AND " + SUPERSEDED_PROOF)
                 .bind("id", admissionId).bind("terminal", TERMINAL_OBSERVATION).execute() > 0;
+    }
+
+    /**
+     * Position of a retention scan in its index order. A run starts from {@link #START} and passes
+     * each batch's cursor to the next, so rows a batch left alone are not selected again in that run.
+     */
+    public record RetentionCursor(String timestamp, String id)
+    {
+        public static final RetentionCursor START = new RetentionCursor("-infinity", "");
+
+        // Sorts before every query identifier and every admission UUID, so the start of a scan includes the first row.
+        String uuid()
+        {
+            return id.isEmpty() ? "00000000-0000-0000-0000-000000000000" : id;
+        }
+    }
+
+    /**
+     * One retention batch. {@code scanned} counts the index entries the batch examined, eligible or
+     * not, so {@code scanned < limit} means the run reached the end of the expired range.
+     */
+    public record RetentionBatch(int scanned, int queries, int admissions, int capabilities, int bindings, RetentionCursor cursor)
+    {
+        public long rows()
+        {
+            return (long) queries + admissions + capabilities + bindings;
+        }
+    }
+
+    // A query row is settled history only when nothing still counts it, completes it, or settles a sibling through it.
+    private static final String SETTLED_QUERY =
+            """
+            q.terminal AND q.retain_until < statement_timestamp() - make_interval(days => :days)
+            AND NOT EXISTS (SELECT 1 FROM transaction_admission a WHERE a.query_id = q.query_id AND a.state <> 'COMPLETE')
+            AND (q.transaction_id IS NULL OR EXISTS (SELECT 1 FROM transaction_binding t WHERE t.transaction_id = q.transaction_id AND t.state = 'CLOSED'))
+            """;
+
+    /**
+     * Deletes settled query history from one bounded window of the expiry index: terminal queries
+     * whose retry window ended at least {@code retentionDays} ago, whose admissions are all COMPLETE
+     * and whose transaction, if any, is CLOSED, together with their admissions, capabilities and
+     * finally unreferenced CLOSED transaction bindings. Nothing this deletes is counted by drain
+     * status, read by the superseded proof, or reachable by a continuation inside its retry window.
+     * <p>
+     * Ineligible rows in the window, such as queries pinned by an uncertain admission or an open
+     * transaction, only advance the cursor, so they cannot starve the rows behind them. Identity locks
+     * are tried before any row lock and rows are locked with SKIP LOCKED, so concurrent replicas
+     * partition the backlog and the batch never queues behind a request that already holds a query.
+     */
+    public RetentionBatch purgeSettledQueries(int retentionDays, int limit, RetentionCursor after)
+    {
+        checkRetention(retentionDays, limit);
+        return jdbi.withOperation(GatewayDatabase.Operation.LEDGER_RETENTION).inReadCommittedIdempotentTransaction(handle -> {
+            List<String[]> window = handle.createQuery(
+                            """
+                            SELECT q.query_id, q.retain_until::text AS retain_until, q.transaction_id,
+                              (SELECT NOT EXISTS (SELECT 1 FROM transaction_admission a WHERE a.query_id = q.query_id AND a.state <> 'COMPLETE')
+                                AND (q.transaction_id IS NULL OR EXISTS (SELECT 1 FROM transaction_binding t WHERE t.transaction_id = q.transaction_id AND t.state = 'CLOSED'))) AS settled
+                            FROM transaction_query q
+                            WHERE q.terminal AND q.retain_until < statement_timestamp() - make_interval(days => :days)
+                              AND (q.retain_until, q.query_id) > (CAST(:afterTimestamp AS timestamptz), :afterId)
+                            ORDER BY q.retain_until, q.query_id LIMIT :limit
+                            """)
+                    .bind("days", retentionDays).bind("limit", limit).bind("afterTimestamp", after.timestamp()).bind("afterId", after.id())
+                    .map((rs, _) -> new String[] {rs.getString("query_id"), rs.getString("retain_until"), rs.getString("transaction_id"), rs.getBoolean("settled") ? "y" : null}).list();
+            if (window.isEmpty()) {
+                return new RetentionBatch(0, 0, 0, 0, 0, after);
+            }
+            RetentionCursor cursor = new RetentionCursor(window.getLast()[1], window.getLast()[0]);
+            List<String[]> settled = window.stream().filter(row -> row[3] != null).toList();
+            // Admission, continuation and completion hold a query's identity lock while they use its rows; never wait for one.
+            Set<String> lockedQueries = tryLockIdentities(handle, QUERY_LOCK_NAMESPACE, settled.stream().map(row -> row[0]).toList());
+            List<String[]> candidates = settled.stream().filter(row -> lockedQueries.contains(row[0])).toList();
+            Set<String> lockedTransactions = tryLockIdentities(
+                    handle,
+                    TRANSACTION_LOCK_NAMESPACE,
+                    candidates.stream().map(row -> row[2]).filter(Objects::nonNull).distinct().toList());
+            List<String> lockedIds = candidates.stream().filter(row -> row[2] == null || lockedTransactions.contains(row[2])).map(row -> row[0]).toList();
+            if (lockedIds.isEmpty()) {
+                return new RetentionBatch(window.size(), 0, 0, 0, 0, cursor);
+            }
+            List<String> rowLocked = handle.createQuery("SELECT query_id FROM transaction_query WHERE query_id = ANY(:queries) FOR UPDATE SKIP LOCKED")
+                    .bindArray("queries", String.class, lockedIds).mapTo(String.class).list();
+            Map<String, Long> lockedAdmissions = new HashMap<>();
+            if (!rowLocked.isEmpty()) {
+                handle.createQuery("SELECT query_id FROM transaction_admission WHERE query_id = ANY(:queries) FOR UPDATE SKIP LOCKED")
+                        .bindArray("queries", String.class, rowLocked).mapTo(String.class)
+                        .forEach(query -> lockedAdmissions.merge(query, 1L, Long::sum));
+            }
+            // Recheck under the locks: no admission can join or leave these queries any more, and every admission must be locked here.
+            List<String> doomed = rowLocked.isEmpty() ? List.of() : handle.createQuery(
+                    "SELECT q.query_id, (SELECT count(*) FROM transaction_admission a WHERE a.query_id = q.query_id) AS admissions " +
+                            "FROM transaction_query q WHERE q.query_id = ANY(:queries) AND " + SETTLED_QUERY)
+                                                                    .bindArray("queries", String.class, rowLocked).bind("days", retentionDays)
+                                                                    .map((rs, _) -> rs.getLong("admissions") == lockedAdmissions.getOrDefault(rs.getString("query_id"), 0L) ? rs.getString("query_id") : null)
+                                                                    .list().stream().filter(Objects::nonNull).toList();
+            if (doomed.isEmpty()) {
+                return new RetentionBatch(window.size(), 0, 0, 0, 0, cursor);
+            }
+            int admissions = handle.createUpdate("DELETE FROM transaction_admission WHERE query_id = ANY(:queries)")
+                    .bindArray("queries", String.class, doomed).execute();
+            int capabilities = handle.createUpdate("DELETE FROM transaction_query_capability WHERE query_id = ANY(:queries)")
+                    .bindArray("queries", String.class, doomed).execute();
+            int queries = handle.createUpdate("DELETE FROM transaction_query WHERE query_id = ANY(:queries)")
+                    .bindArray("queries", String.class, doomed).execute();
+            Set<String> doomedSet = Set.copyOf(doomed);
+            List<String> transactions = candidates.stream().filter(row -> doomedSet.contains(row[0]) && row[2] != null).map(row -> row[2]).distinct().toList();
+            return new RetentionBatch(window.size(), queries, admissions, capabilities, deleteClosedBindings(handle, transactions), cursor);
+        });
+    }
+
+    /**
+     * Deletes rejected admissions created at least {@code retentionDays} ago from one bounded window.
+     * A rejection is COMPLETE without a query, so it is neither an obligation nor superseded-proof
+     * evidence. A CLOSED transaction binding it was the last reference to goes with it.
+     */
+    public RetentionBatch purgeRejectedAdmissions(int retentionDays, int limit, RetentionCursor after)
+    {
+        checkRetention(retentionDays, limit);
+        return jdbi.withOperation(GatewayDatabase.Operation.LEDGER_RETENTION).inReadCommittedIdempotentTransaction(handle -> {
+            List<String[]> window = handle.createQuery(
+                            """
+                            SELECT admission_id::text AS admission_id, created_at::text AS created_at, transaction_id FROM transaction_admission
+                            WHERE query_id IS NULL AND state = 'COMPLETE' AND created_at < statement_timestamp() - make_interval(days => :days)
+                              AND (created_at, admission_id) > (CAST(:afterTimestamp AS timestamptz), CAST(:afterId AS uuid))
+                            ORDER BY created_at, admission_id LIMIT :limit
+                            """)
+                    .bind("days", retentionDays).bind("limit", limit).bind("afterTimestamp", after.timestamp()).bind("afterId", after.uuid())
+                    .map((rs, _) -> new String[] {rs.getString("admission_id"), rs.getString("created_at"), rs.getString("transaction_id")}).list();
+            if (window.isEmpty()) {
+                return new RetentionBatch(0, 0, 0, 0, 0, after);
+            }
+            RetentionCursor cursor = new RetentionCursor(window.getLast()[1], window.getLast()[0]);
+            Set<String> lockedTransactions = tryLockIdentities(
+                    handle,
+                    TRANSACTION_LOCK_NAMESPACE,
+                    window.stream().map(row -> row[2]).filter(Objects::nonNull).distinct().toList());
+            List<String> lockedIds = window.stream().filter(row -> row[2] == null || lockedTransactions.contains(row[2])).map(row -> row[0]).toList();
+            // A COMPLETE admission never changes again, so the locked rows still satisfy the predicate.
+            List<String[]> doomed = lockedIds.isEmpty() ? List.of() : handle.createQuery(
+                    "SELECT admission_id::text AS admission_id, transaction_id FROM transaction_admission WHERE admission_id = ANY(CAST(:admissions AS uuid[])) " +
+                            "AND query_id IS NULL AND state = 'COMPLETE' FOR UPDATE SKIP LOCKED")
+                                                                      .bindArray("admissions", String.class, lockedIds)
+                                                                      .map((rs, _) -> new String[] {rs.getString("admission_id"), rs.getString("transaction_id")}).list();
+            int admissions = doomed.isEmpty() ? 0 : handle.createUpdate("DELETE FROM transaction_admission WHERE admission_id = ANY(CAST(:admissions AS uuid[]))")
+                                                    .bindArray("admissions", String.class, doomed.stream().map(row -> row[0]).toList()).execute();
+            List<String> transactions = doomed.stream().map(row -> row[1]).filter(Objects::nonNull).distinct().toList();
+            return new RetentionBatch(window.size(), 0, admissions, 0, deleteClosedBindings(handle, transactions), cursor);
+        });
+    }
+
+    // The caller holds each transaction's identity lock, which every writer of a reference to it holds too.
+    private static int deleteClosedBindings(Handle handle, List<String> transactionIds)
+    {
+        if (transactionIds.isEmpty()) {
+            return 0;
+        }
+        return handle.createUpdate(
+                        """
+                        DELETE FROM transaction_binding WHERE transaction_id IN (
+                          SELECT t.transaction_id FROM transaction_binding t WHERE t.transaction_id = ANY(:transactions) AND t.state = 'CLOSED'
+                          AND NOT EXISTS (SELECT 1 FROM transaction_query q WHERE q.transaction_id = t.transaction_id)
+                          AND NOT EXISTS (SELECT 1 FROM transaction_admission a WHERE a.transaction_id = t.transaction_id)
+                          FOR UPDATE OF t SKIP LOCKED)
+                        """)
+                .bindArray("transactions", String.class, transactionIds).execute();
+    }
+
+    private static Set<String> tryLockIdentities(Handle handle, int namespace, List<String> identities)
+    {
+        if (identities.isEmpty()) {
+            return Set.of();
+        }
+        return Set.copyOf(handle.createQuery(
+                        "SELECT x.identity FROM unnest(CAST(:identities AS text[]), CAST(:hashes AS int[])) AS x(identity, hash) WHERE pg_try_advisory_xact_lock(:namespace, x.hash)")
+                .bindArray("identities", String.class, identities)
+                .bindArray("hashes", Integer.class, identities.stream().map(String::hashCode).toList())
+                .bind("namespace", namespace).mapTo(String.class).list());
+    }
+
+    private static void checkRetention(int retentionDays, int limit)
+    {
+        if (retentionDays < 1 || limit < 1 || limit > 500) {
+            throw new IllegalArgumentException("Invalid ledger retention bounds");
+        }
     }
 
     public void rejectAdmission(UUID admissionId)

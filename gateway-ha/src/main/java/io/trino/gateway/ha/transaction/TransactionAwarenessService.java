@@ -92,6 +92,10 @@ public class TransactionAwarenessService
     private static final long SUPERSEDED_SWEEP_INITIAL_DELAY_SECONDS = 10;
     private static final long SUPERSEDED_SWEEP_INTERVAL_SECONDS = 60;
     private static final int SUPERSEDED_SWEEP_BATCH = 100;
+    private static final long LEDGER_RETENTION_INITIAL_DELAY_SECONDS = 60;
+    private static final long LEDGER_RETENTION_INTERVAL_SECONDS = 300;
+    // Bounds one run; a remaining backlog continues on the next run.
+    private static final int LEDGER_RETENTION_MAX_BATCHES = 1000;
     private static final String ADMISSION_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".admission";
     private static final String RESPONSE_RECEIVED_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".responseReceived";
     private static final String CAPACITY_ATTRIBUTE = TransactionAwarenessService.class.getName() + ".capacity";
@@ -110,6 +114,9 @@ public class TransactionAwarenessService
     private final PoolLifecycleConfiguration poolConfig;
     private final boolean loadAwarePooledRouting;
     private final ScheduledExecutorService maintenance;
+    private final ScheduledExecutorService retention;
+    private final RetentionScan queryRetention = new RetentionScan();
+    private final RetentionScan rejectionRetention = new RetentionScan();
     private RoutingManager routingManager;
 
     /**
@@ -139,6 +146,78 @@ public class TransactionAwarenessService
         this.routingGroupSelector = routingGroupSelector;
         capacity = config.isEnabled() ? new TransactionRequestCapacity(config, configuration.getRouting().getAsyncTimeout()) : null;
         maintenance = config.isEnabled() ? startSupersededSweep() : null;
+        retention = config.isEnabled() && config.getLedgerRetentionDays() > 0 ? startLedgerRetention() : null;
+    }
+
+    // A separate thread, so a long retention run never delays the superseded sweep that releases drain blockers.
+    private ScheduledExecutorService startLedgerRetention()
+    {
+        ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor(daemonThreadsNamed("transaction-ledger-retention-%s"));
+        executor.scheduleWithFixedDelay(this::purgeSettledLedger, LEDGER_RETENTION_INITIAL_DELAY_SECONDS, LEDGER_RETENTION_INTERVAL_SECONDS, SECONDS);
+        return executor;
+    }
+
+    /**
+     * Deletes settled ledger history in small batches, one short transaction each, pausing between
+     * batches so retention never competes with request admission for long. Every replica runs it;
+     * batches skip rows another replica holds, so concurrent runs share the backlog.
+     */
+    void purgeSettledLedger()
+    {
+        int days = config.getLedgerRetentionDays();
+        if (days <= 0) {
+            return;
+        }
+        // Each phase has its own budget and failure handling, so a large query backlog or a failing phase never starves the other.
+        queryRetention.run(days, store::purgeSettledQueries);
+        rejectionRetention.run(days, store::purgeRejectedAdmissions);
+    }
+
+    private interface RetentionPhase
+    {
+        TransactionStore.RetentionBatch purge(int days, int limit, TransactionStore.RetentionCursor after);
+    }
+
+    /**
+     * One retention phase. Its cursor survives runs and wraps to the start only at the end of the
+     * expired range, so rows that must be kept cost one pass per cycle and never starve rows behind
+     * them. A failed batch halves the next batch, down to one row, so a window that cannot finish
+     * within the statement timeout still makes progress.
+     */
+    private final class RetentionScan
+    {
+        private TransactionStore.RetentionCursor cursor = TransactionStore.RetentionCursor.START;
+        private int failures;
+
+        void run(int days, RetentionPhase phase)
+        {
+            int configured = config.getLedgerRetentionBatchSize();
+            // scheduleWithFixedDelay stops future runs once a task throws.
+            try {
+                for (int batches = 0; batches < LEDGER_RETENTION_MAX_BATCHES && !Thread.currentThread().isInterrupted(); batches++) {
+                    int limit = Math.max(1, configured >> Math.min(failures, 30));
+                    TransactionStore.RetentionBatch batch = phase.purge(days, limit, cursor);
+                    failures = 0;
+                    lifecycleStats.ledgerRetention(batch.queries(), batch.admissions(), batch.capabilities(), batch.bindings());
+                    // The cursor moves past every scanned row, deleted or not, so a short window is the end of the expired range.
+                    if (batch.scanned() < limit) {
+                        cursor = TransactionStore.RetentionCursor.START;
+                        return;
+                    }
+                    cursor = batch.cursor();
+                    if (config.getLedgerRetentionBatchPauseMillis() > 0) {
+                        MILLISECONDS.sleep(config.getLedgerRetentionBatchPauseMillis());
+                    }
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            catch (RuntimeException failure) {
+                failures++;
+                lifecycleStats.ledgerRetentionFailed(failure);
+            }
+        }
     }
 
     private ScheduledExecutorService startSupersededSweep()
@@ -509,6 +588,15 @@ public class TransactionAwarenessService
             maintenance.shutdownNow();
             try {
                 maintenance.awaitTermination(5, SECONDS);
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        if (retention != null) {
+            retention.shutdownNow();
+            try {
+                retention.awaitTermination(5, SECONDS);
             }
             catch (InterruptedException e) {
                 Thread.currentThread().interrupt();

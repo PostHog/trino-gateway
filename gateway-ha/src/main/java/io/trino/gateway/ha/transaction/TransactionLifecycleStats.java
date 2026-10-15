@@ -33,7 +33,7 @@ public final class TransactionLifecycleStats
 
     private enum Event
     {
-        EXECUTING_RESULT_NOT_FOUND, MARK_UNCERTAIN_SUCCEEDED, MARK_UNCERTAIN_FAILED, ADMISSION_SUPERSEDED, POOL_DRAIN_BLOCKED
+        EXECUTING_RESULT_NOT_FOUND, MARK_UNCERTAIN_SUCCEEDED, MARK_UNCERTAIN_FAILED, ADMISSION_SUPERSEDED, POOL_DRAIN_BLOCKED, LEDGER_RETENTION, LEDGER_RETENTION_FAILED
     }
 
     private final CounterStat terminalResults = new CounterStat();
@@ -45,6 +45,8 @@ public final class TransactionLifecycleStats
     private final CounterStat supersededAdmissions = new CounterStat();
     private final CounterStat sweptSupersededAdmissions = new CounterStat();
     private final CounterStat blockedDrainObservations = new CounterStat();
+    private final CounterStat ledgerRowsDeleted = new CounterStat();
+    private final CounterStat ledgerRetentionFailures = new CounterStat();
     private final EnumMap<Event, AtomicLong> lastLogNanos = new EnumMap<>(Event.class);
     private final LongSupplier nanoTime;
 
@@ -111,6 +113,30 @@ public final class TransactionLifecycleStats
                     pending,
                     transactions,
                     queries);
+        }
+    }
+
+    void ledgerRetention(long queries, long admissions, long capabilities, long bindings)
+    {
+        long rows = queries + admissions + capabilities + bindings;
+        ledgerRowsDeleted.update(rows);
+        if (rows > 0 && mayLog(Event.LEDGER_RETENTION)) {
+            log.info("reason=LEDGER_RETENTION queries=%s admissions=%s capabilities=%s bindings=%s", queries, admissions, capabilities, bindings);
+        }
+    }
+
+    void ledgerRetentionFailed(RuntimeException failure)
+    {
+        ledgerRetentionFailures.update(1);
+        if (mayLog(Event.LEDGER_RETENTION_FAILED)) {
+            String state = "NONE";
+            for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+                if (cause instanceof java.sql.SQLException sql && sql.getSQLState() != null) {
+                    state = sql.getSQLState().replaceAll("[^0-9A-Z]", "");
+                    break;
+                }
+            }
+            log.warn("reason=LEDGER_RETENTION_FAILED exception=%s sqlState=%s; will retry on next run", failure.getClass().getSimpleName(), state);
         }
     }
 
@@ -200,5 +226,19 @@ public final class TransactionLifecycleStats
     public CounterStat getBlockedDrainObservations()
     {
         return blockedDrainObservations;
+    }
+
+    @Managed
+    @Nested
+    public CounterStat getLedgerRowsDeleted()
+    {
+        return ledgerRowsDeleted;
+    }
+
+    @Managed
+    @Nested
+    public CounterStat getLedgerRetentionFailures()
+    {
+        return ledgerRetentionFailures;
     }
 }
