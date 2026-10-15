@@ -1827,7 +1827,7 @@ class TestPoolStore
         assertThat(snapshot).containsExactly(new PoolStore.DrainCandidate(queryId, 1));
         var poll = transactions.admitQuery(queryId, Optional.of("owner"), Optional.empty());
         assertThat(second.drainCandidates(POOL, "i-1", "")).isEmpty();
-        assertThatThrownBy(() -> second.reconcileQueries(
+        assertThat(second.reconcileQueries(
                 POOL,
                 "i-1",
                 guard("op-reconcile", "pending"),
@@ -1835,8 +1835,7 @@ class TestPoolStore
                 "node-i-1",
                 "coord-i-1",
                 snapshot,
-                120))
-                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+                120).reconciled()).isZero();
         transactions.recordResponse(poll.id(), new ResponseObservation(queryId, null, false, false, 120));
         assertThat(second.reconcileQueries(
                 POOL,
@@ -1869,6 +1868,81 @@ class TestPoolStore
                 "coord-i-1",
                 fresh,
                 120).reconciled()).isEqualTo(1);
+    }
+
+    @Test
+    void phantomQueriesReconcileWhileAnotherQueryIsStillPolled()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        // A long query whose client keeps polling: one continuation is always in flight.
+        String live = "20260101_000000_00010_abcde";
+        transactions.recordResponse(transactions.admitPooledMember(POOL, "backend-i-1", "owner").id(), new ResponseObservation(live, null, false, false, 120));
+        // Queries whose clients stopped polling before the final page: every admission completed, none was terminal.
+        List<String> phantoms = List.of("20260101_000000_00011_abcde", "20260101_000000_00012_abcde");
+        for (String phantom : phantoms) {
+            transactions.recordResponse(transactions.admitPooledMember(POOL, "backend-i-1", "owner").id(), new ResponseObservation(phantom, null, false, false, 120));
+            for (int poll = 0; poll < 3; poll++) {
+                transactions.recordResponse(transactions.admitQuery(phantom, Optional.of("owner"), Optional.empty()).id(), new ResponseObservation(phantom, null, false, false, 120));
+            }
+        }
+        var inFlight = transactions.admitQuery(live, Optional.of("owner"), Optional.empty());
+        Member draining = drain(first, "i-1", "op-drain");
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
+
+        var candidates = first.drainCandidates(POOL, "i-1", "");
+        assertThat(candidates).containsExactly(new PoolStore.DrainCandidate(phantoms.get(0), 4), new PoolStore.DrainCandidate(phantoms.get(1), 4));
+        // A fabricated receipt for the polled query is never honored while its request is in flight.
+        List<PoolStore.DrainCandidate> receipts = new ArrayList<>(candidates);
+        receipts.add(new PoolStore.DrainCandidate(live, 2));
+        assertThat(second.reconcileQueries(POOL, "i-1", guard("op-reconcile", "phantoms"), draining.generation(), "node-i-1", "coord-i-1", receipts, 120).reconciled()).isEqualTo(2);
+        assertThat(first.obligations(POOL, "i-1").orElseThrow().activeQueries()).isEqualTo(3);
+        assertThat(transactions.getQuery(live).orElseThrow().terminal()).isFalse();
+        phantoms.forEach(phantom -> assertThat(transactions.getQuery(phantom).orElseThrow().terminal()).isTrue());
+        assertThat(first.drainCandidates(POOL, "i-1", "")).isEmpty();
+
+        // Once its request completes, the query is an ordinary candidate whose absence the controller must still attest.
+        transactions.recordResponse(inFlight.id(), new ResponseObservation(live, null, false, false, 120));
+        assertThat(first.drainCandidates(POOL, "i-1", "")).containsExactly(new PoolStore.DrainCandidate(live, 2));
+        // A rejected request is a recorded outcome and does not pin its query.
+        transactions.rejectAdmission(transactions.admitQuery(live, Optional.of("owner"), Optional.empty()).id());
+        assertThat(first.drainCandidates(POOL, "i-1", "")).containsExactly(new PoolStore.DrainCandidate(live, 3));
+    }
+
+    @Test
+    void candidateThatGainsAnAdmissionAfterSelectionIsNotReconciled()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        String queryId = "20260101_000000_00013_abcde";
+        transactions.recordResponse(transactions.admitPooledMember(POOL, "backend-i-1", "owner").id(), new ResponseObservation(queryId, null, false, false, 120));
+        // Another query keeps a request in flight for the whole test.
+        String other = "20260101_000000_00014_abcde";
+        transactions.recordResponse(transactions.admitPooledMember(POOL, "backend-i-1", "owner").id(), new ResponseObservation(other, null, false, false, 120));
+        transactions.admitQuery(other, Optional.of("owner"), Optional.empty());
+        Member draining = drain(first, "i-1", "op-drain");
+        var snapshot = first.drainCandidates(POOL, "i-1", "");
+        assertThat(snapshot).containsExactly(new PoolStore.DrainCandidate(queryId, 1));
+
+        var poll = transactions.admitQuery(queryId, Optional.of("owner"), Optional.empty());
+        assertThat(second.reconcileQueries(POOL, "i-1", guard("op-reconcile", "pending"), draining.generation(), "node-i-1", "coord-i-1", snapshot, 120).reconciled()).isZero();
+        transactions.recordResponse(poll.id(), new ResponseObservation(queryId, null, false, false, 120));
+        assertThat(second.reconcileQueries(POOL, "i-1", guard("op-reconcile", "completed"), draining.generation(), "node-i-1", "coord-i-1", snapshot, 120).reconciled()).isZero();
+        var uncertain = transactions.admitQuery(queryId, Optional.of("owner"), Optional.empty());
+        transactions.markUncertain(uncertain.id(), false);
+        assertThat(first.drainCandidates(POOL, "i-1", "")).isEmpty();
+        assertThat(second.reconcileQueries(
+                POOL,
+                "i-1",
+                guard("op-reconcile", "uncertain"),
+                draining.generation(),
+                "node-i-1",
+                "coord-i-1",
+                List.of(new PoolStore.DrainCandidate(queryId, 3)),
+                120).reconciled()).isZero();
+        assertThat(transactions.getQuery(queryId).orElseThrow().terminal()).isFalse();
     }
 
     @Test
@@ -2187,7 +2261,7 @@ class TestPoolStore
     }
 
     @Test
-    void candidateEnumerationFencesAdmissionsBetweenPendingAndCountSnapshots()
+    void candidateEnumerationFencesConcurrentAdmissions()
             throws Exception
     {
         configure(1, 1, 1, 1);
@@ -2205,7 +2279,8 @@ class TestPoolStore
             @Override
             public void logAfterExecution(StatementContext context)
             {
-                if (context.getRawSql().equals(TransactionStore.DRAIN_STATUS_SQL)) {
+                // Pause the scan once it holds the admission barrier.
+                if (context.getRawSql().equals("SELECT pg_advisory_xact_lock(:namespace, :identity)")) {
                     try (var statement = context.getConnection().createStatement(); var result = statement.executeQuery("SELECT pg_backend_pid()")) {
                         result.next();
                         scannerPid.set(result.getInt(1));

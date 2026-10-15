@@ -637,6 +637,14 @@ public final class PoolStore
         });
     }
 
+    // Every request of the query has a recorded outcome: no PENDING or UNCERTAIN admission (a rejected
+    // request is COMPLETE). Admissions serialize with candidate enumeration and reconciliation through the
+    // incarnation's admission barrier, so a request that starts after the snapshot changes the admission
+    // count, and one in flight or uncertain fails this condition. A submission still in flight has no
+    // query identity yet, but its response always names a new query, never one already in the ledger.
+    private static final String SETTLED_ADMISSIONS =
+            "NOT EXISTS (SELECT 1 FROM transaction_admission a WHERE a.query_id = q.query_id AND a.state <> 'COMPLETE')\n";
+
     public record DrainCandidate(String queryId, long admissionCount) {}
 
     public record ReconciliationResult(int reconciled) {}
@@ -651,16 +659,17 @@ public final class PoolStore
             Row row = lockedMember(handle, poolId, instanceId);
             TransactionStore.admissionBarrier(handle, row.incarnation, true);
             check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
-            if (obligations(handle, poolId, instanceId).pendingRequests() != 0) {
-                return List.of();
-            }
+            // A pending or uncertain request on another query must not hide this one: a client that keeps
+            // polling a long query would otherwise keep every abandoned query on the member unreconciled.
             return handle.createQuery(
                             """
                             SELECT q.query_id, (SELECT count(*) FROM transaction_admission a WHERE a.query_id = q.query_id) AS admissions
                             FROM transaction_query q
                             WHERE q.incarnation = :incarnation AND NOT q.terminal AND q.transaction_id IS NULL AND q.query_id > :after
-                            ORDER BY q.query_id LIMIT 100
-                            """).bind("incarnation", row.incarnation).bind("after", after)
+                              AND\s""" + SETTLED_ADMISSIONS +
+                                    """
+                                    ORDER BY q.query_id LIMIT 100
+                                    """).bind("incarnation", row.incarnation).bind("after", after)
                     .map((rs, _) -> new DrainCandidate(rs.getString("query_id"), rs.getLong("admissions"))).list();
         });
     }
@@ -668,7 +677,9 @@ public final class PoolStore
     /**
      * The controller attests explicit absence of execution AND queued/cached results on this process.
      * A metadata 410 or query timeout is not such evidence. The admission count fences requests that
-     * began and finished during that observation, including a late result-cache insertion.
+     * began and finished during that observation, including a late result-cache insertion. A query
+     * with a pending or uncertain request is never reconciled, but requests on other queries of the
+     * member do not prevent it.
      */
     public ReconciliationResult reconcileQueries(
             String poolId,
@@ -696,7 +707,6 @@ public final class PoolStore
             check(Objects.equals(row.nodeId, nodeId) && Objects.equals(row.coordinatorId, coordinatorId),
                     POOL_IDENTITY_CONFLICT,
                     "The absence receipt identifies a different coordinator process");
-            check(obligations(handle, poolId, instanceId).pendingRequests() == 0, POOL_NOT_DRAINED, "Pending or uncertain requests still pin this member");
             int reconciled = 0;
             for (DrainCandidate query : queries) {
                 reconciled += handle.createUpdate(
@@ -705,7 +715,7 @@ public final class PoolStore
                                     retain_until = clock_timestamp() + make_interval(secs => :retention)
                                 WHERE q.query_id = :query AND q.incarnation = :incarnation AND NOT q.terminal AND q.transaction_id IS NULL
                                   AND (SELECT count(*) FROM transaction_admission a WHERE a.query_id = q.query_id) = :admissions
-                                """).bind("query", query.queryId()).bind("incarnation", row.incarnation)
+                                  AND\s""" + SETTLED_ADMISSIONS).bind("query", query.queryId()).bind("incarnation", row.incarnation)
                         .bind("admissions", query.admissionCount()).bind("retention", retentionSeconds).execute();
             }
             return new ReconciliationResult(reconciled);
