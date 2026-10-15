@@ -83,6 +83,49 @@ final class TestPrometheusClusterLoadSource
     }
 
     @Test
+    void queryWithLabelReplaceRegexReachesTheServerUnchanged()
+    {
+        // Regression: in a URL query string, the raw '+' of "(.+)" was decoded as a space by the server.
+        // The regex then matched nothing, the series lost the backend label, and every load was unknown.
+        String queued =
+                """
+                max by (backend) (label_replace(trino_execution_querymanager_queuedqueries{namespace="example",pool="pool-a"}, \
+                "backend", "pool-a-$1", "instance_name", "(.+)"))""";
+        String running = queued.replace("queuedqueries", "runningqueries");
+        prometheus.respond(queued, () -> json(victoriaMetricsVector("pool-a-b1", "2")));
+        prometheus.respond(running, () -> json(victoriaMetricsVector("pool-a-b1", "3")));
+        MonitorConfiguration configuration = configuration(false);
+        configuration.setLoadQueuedQueriesQuery(queued);
+        configuration.setLoadRunningQueriesQuery(running);
+
+        ClusterStats stats = source(configuration).enrich(List.of(health("pool-a-b1", TrinoStatus.HEALTHY))).getFirst();
+
+        assertThat(stats.externalLoad().orElseThrow().queuedQueryCount()).isEqualTo(OptionalInt.of(2));
+        assertThat(stats.externalLoad().orElseThrow().runningQueryCount()).isEqualTo(OptionalInt.of(3));
+        assertThat(BackendLoad.load(stats)).isEqualTo(5);
+    }
+
+    @Test
+    void seriesWithoutBackendLabelAreCounted()
+    {
+        // The response shape of a query whose label_replace regex matched nothing.
+        PrometheusClusterLoadSource.Vector vector = PrometheusClusterLoadSource.parse(
+                """
+                {"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{},"value":[1700000000,"0"]}]},\
+                "stats":{"seriesFetched": "3","executionTimeMsec":1}}""").orElseThrow();
+        assertThat(vector.values()).isEmpty();
+        assertThat(vector.seriesCount()).isEqualTo(1);
+        assertThat(vector.seriesWithoutBackend()).isEqualTo(1);
+    }
+
+    private static String victoriaMetricsVector(String backend, String value)
+    {
+        return """
+               {"status":"success","isPartial":false,"data":{"resultType":"vector","result":[{"metric":{"backend":"%s"},\
+               "value":[1700000000,"%s"]}]},"stats":{"seriesFetched": "1","executionTimeMsec":0}}""".formatted(backend, value);
+    }
+
+    @Test
     void requestCountPerRefreshIsIndependentOfBackendCount()
     {
         PrometheusClusterLoadSource source = source(configuration(true));

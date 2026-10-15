@@ -27,7 +27,9 @@ import io.trino.gateway.ha.config.MonitorConfiguration;
 import io.trino.gateway.ha.router.BackendLoad;
 
 import java.net.URI;
+import java.net.URLEncoder;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -41,9 +43,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static com.google.common.base.Strings.isNullOrEmpty;
+import static io.airlift.http.client.HeaderNames.CONTENT_TYPE;
 import static io.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
-import static io.airlift.http.client.Request.Builder.prepareGet;
+import static io.airlift.http.client.Request.Builder.preparePost;
+import static io.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerator;
 import static io.airlift.http.client.StringResponseHandler.createStringResponseHandler;
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
 
 /**
@@ -155,8 +160,12 @@ public class PrometheusClusterLoadSource
             for (ClusterStats clusterStats : stats) {
                 enriched.add(merge(clusterStats, queuedValues, runningValues, reservedValues, maxValues));
             }
-            if (!enriched.isEmpty() && enriched.stream().allMatch(clusterStats -> BackendLoad.load(clusterStats) == Double.POSITIVE_INFINITY)) {
-                warn("Load source returned no load for any backend. Check that the series have a backend label equal to the backend name");
+            // A query that returned no usable series has already logged its own reason.
+            if (!queuedValues.isEmpty() && !runningValues.isEmpty() && !enriched.isEmpty()
+                    && enriched.stream().allMatch(clusterStats -> BackendLoad.load(clusterStats) == Double.POSITIVE_INFINITY)) {
+                List<String> monitored = stats.stream().map(ClusterStats::clusterId).sorted().toList();
+                warn("Load source gave no backend both queued and running values. The backend label must equal the backend name. "
+                        + "Monitored: %s; queued: %s; running: %s".formatted(sample(monitored), sample(queuedValues.keySet()), sample(runningValues.keySet())));
             }
             return enriched;
         }
@@ -209,8 +218,12 @@ public class PrometheusClusterLoadSource
 
     private HttpResponseFuture<StringResponse> send(String query, List<HttpResponseFuture<StringResponse>> sent)
     {
-        Request request = prepareGet()
-                .setUri(uriBuilderFrom(queryUri.orElseThrow()).addParameter("query", query).build())
+        // Send the query as a form body. In a URL query string, a raw '+' (as in the regex "(.+)") is
+        // decoded as a space by Prometheus-compatible servers, which silently changes the query.
+        Request request = preparePost()
+                .setUri(queryUri.orElseThrow())
+                .setHeader(CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .setBodyGenerator(createStaticBodyGenerator("query=" + URLEncoder.encode(query, UTF_8), UTF_8))
                 .build();
         HttpResponseFuture<StringResponse> future = httpClient.executeAsync(request, createStringResponseHandler());
         sent.add(future);
@@ -225,10 +238,20 @@ public class PrometheusClusterLoadSource
                 warn("Load source query for %s returned HTTP %s".formatted(metric, response.getStatusCode()));
                 return Map.of();
             }
-            return parse(response.getBody()).orElseGet(() -> {
+            Optional<Vector> parsed = parse(response.getBody());
+            if (parsed.isEmpty()) {
                 warn("Load source query for %s returned an unexpected response".formatted(metric));
                 return Map.of();
-            });
+            }
+            Vector vector = parsed.orElseThrow();
+            if (vector.seriesCount() == 0) {
+                warn("Load source query for %s returned no series".formatted(metric));
+            }
+            else if (vector.values().isEmpty()) {
+                warn("Load source query for %s returned %s series and no usable value: %s without a backend label, the rest with an invalid or duplicate value"
+                        .formatted(metric, vector.seriesCount(), vector.seriesWithoutBackend()));
+            }
+            return vector.values();
         }
         catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -242,13 +265,17 @@ public class PrometheusClusterLoadSource
         }
     }
 
+    @VisibleForTesting
+    record Vector(Map<String, Double> values, int seriesCount, int seriesWithoutBackend) {}
+
     /**
-     * Parses an instant vector response into a value for each {@code backend} label. Returns empty when
+     * Parses an instant vector response into a value for each {@code backend} label, with the number of
+     * series and of series without that label. Returns empty when
      * the response is not a successful vector. A backend with more than one series, or with a value that
      * is not a finite number at least zero, is left out.
      */
     @VisibleForTesting
-    static Optional<Map<String, Double>> parse(String body)
+    static Optional<Vector> parse(String body)
     {
         JsonNode root;
         try {
@@ -265,9 +292,13 @@ public class PrometheusClusterLoadSource
         }
         Map<String, Double> values = new HashMap<>();
         Set<String> rejected = new HashSet<>();
+        int seriesCount = 0;
+        int seriesWithoutBackend = 0;
         for (JsonNode series : root.path("data").path("result")) {
+            seriesCount++;
             JsonNode backendNode = series.path("metric").path("backend");
             if (!backendNode.isTextual() || isNullOrEmpty(backendNode.asText())) {
+                seriesWithoutBackend++;
                 continue;
             }
             String backend = backendNode.asText();
@@ -279,7 +310,7 @@ public class PrometheusClusterLoadSource
             }
             values.put(backend, value.orElseThrow());
         }
-        return Optional.of(Map.copyOf(values));
+        return Optional.of(new Vector(Map.copyOf(values), seriesCount, seriesWithoutBackend));
     }
 
     private static OptionalDouble sampleValue(JsonNode value)
@@ -294,6 +325,12 @@ public class PrometheusClusterLoadSource
         catch (NumberFormatException e) {
             return OptionalDouble.empty();
         }
+    }
+
+    private static String sample(Collection<String> names)
+    {
+        List<String> sorted = names.stream().sorted().toList();
+        return sorted.size() <= 5 ? sorted.toString() : "%s (of %s)".formatted(sorted.subList(0, 5), sorted.size());
     }
 
     private void warn(String message)

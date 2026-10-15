@@ -201,10 +201,11 @@ monitor:
 
 Change the selectors and labels in the example to match your scrape setup.
 
-- Gateway sends `GET <loadPrometheusUrl>/api/v1/query` once for each query in
-  each refresh, independent of the number of members. The queries run at the
-  same time. After the health checks, a refresh waits at most
-  `loadQueryTimeout` for all of them.
+- Gateway sends `POST <loadPrometheusUrl>/api/v1/query`, with the query in a
+  form body, once for each query in each refresh, independent of the number of
+  members. The queries run at the same time. After the health checks, a refresh
+  waits at most `loadQueryTimeout` for all of them. A proxy in front of the
+  server must allow `POST` with a form body.
 - Each query must return an instant vector. Each series must have a `backend`
   label equal to the Gateway backend name. Use `label_replace` to make this label.
 - The configured `monitorType` still decides health. The load source never
