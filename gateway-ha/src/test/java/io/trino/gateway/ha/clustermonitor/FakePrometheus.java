@@ -21,11 +21,14 @@ import okhttp3.mockwebserver.RecordedRequest;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URLDecoder;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 /**
  * Fake Prometheus HTTP API. Each query name maps to a response. Unknown queries return an empty vector.
@@ -48,7 +51,11 @@ public final class FakePrometheus
                 if (!"/prometheus/api/v1/query".equals(request.getRequestUrl().encodedPath())) {
                     return new MockResponse().setResponseCode(404);
                 }
-                String query = request.getRequestUrl().queryParameter("query");
+                // Like Go servers, read a POST body only with the form content type.
+                if ("POST".equals(request.getMethod()) && !"application/x-www-form-urlencoded".equals(request.getHeader("Content-Type"))) {
+                    return new MockResponse().setResponseCode(400).setBody("{\"status\":\"error\",\"errorType\":\"bad_data\",\"error\":\"missing query\"}");
+                }
+                String query = decodedQuery(request);
                 Supplier<MockResponse> response = responses.get(query);
                 return response == null ? vectorResponse(Map.of()) : response.get();
             }
@@ -59,6 +66,27 @@ public final class FakePrometheus
         catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    /**
+     * Decodes the {@code query} parameter as Prometheus-compatible servers do: from the form body of a
+     * POST, or from the URL query string, where {@code +} means a space.
+     */
+    private static String decodedQuery(RecordedRequest request)
+    {
+        String encoded = "POST".equals(request.getMethod())
+                ? request.getUtf8Body()
+                : request.getRequestUrl().encodedQuery();
+        if (encoded == null) {
+            return null;
+        }
+        for (String pair : encoded.split("&")) {
+            int separator = pair.indexOf('=');
+            if (separator > 0 && "query".equals(URLDecoder.decode(pair.substring(0, separator), UTF_8))) {
+                return URLDecoder.decode(pair.substring(separator + 1), UTF_8);
+            }
+        }
+        return null;
     }
 
     public String baseUrl()

@@ -670,7 +670,7 @@ It is active only when `routing.loadAwarePooledRoutingEnabled` is `true`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `monitor.loadPrometheusUrl` | empty | Base URL. Gateway calls `<base>/api/v1/query`. |
+| `monitor.loadPrometheusUrl` | empty | Base URL. Gateway sends `POST <base>/api/v1/query` with a form body. |
 | `monitor.loadQueuedQueriesQuery` | empty | PromQL for queued queries. Required when the URL is set. |
 | `monitor.loadRunningQueriesQuery` | empty | PromQL for running queries. Required when the URL is set. |
 | `monitor.loadReservedMemoryQuery` | empty | PromQL for reserved query memory in bytes. Optional. |
