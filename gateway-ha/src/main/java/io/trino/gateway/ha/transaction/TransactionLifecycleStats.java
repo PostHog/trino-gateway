@@ -44,6 +44,7 @@ public final class TransactionLifecycleStats
     private final CounterStat markUncertainFailures = new CounterStat();
     private final CounterStat supersededAdmissions = new CounterStat();
     private final CounterStat sweptSupersededAdmissions = new CounterStat();
+    private final CounterStat supersededSweepFailures = new CounterStat();
     private final CounterStat blockedDrainObservations = new CounterStat();
     private final EnumMap<Event, AtomicLong> lastLogNanos = new EnumMap<>(Event.class);
     private final LongSupplier nanoTime;
@@ -193,6 +194,22 @@ public final class TransactionLifecycleStats
     public CounterStat getSweptSupersededAdmissions()
     {
         return sweptSupersededAdmissions;
+    }
+
+    /**
+     * Counts sweep runs that failed or left some admission unsettled, at most once per run.
+     * A failing sweep leaves superseded admissions blocking drain, so alert on a sustained rate.
+     */
+    void supersededSweepFailed()
+    {
+        supersededSweepFailures.update(1);
+    }
+
+    @Managed
+    @Nested
+    public CounterStat getSupersededSweepFailures()
+    {
+        return supersededSweepFailures;
     }
 
     @Managed

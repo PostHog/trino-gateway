@@ -257,6 +257,16 @@ class TestTransactionAwarenessService
         service.settleSupersededAdmissions();
         service.settleSupersededAdmissions();
         assertThat(lifecycleStats.getSweptSupersededAdmissions().getTotalCount()).isEqualTo(1);
+        assertThat(lifecycleStats.getSupersededSweepFailures().getTotalCount()).isEqualTo(1);
+    }
+
+    @Test
+    void sweepCountsBatchesWithUnsettledAdmissions()
+    {
+        service.shutdown();
+        when(store.settleSupersededAdmissions(anyInt())).thenReturn(new TransactionStore.SupersededSweep(List.of(), 1, Optional.of(new IllegalStateException("lock timeout"))));
+        service.settleSupersededAdmissions();
+        assertThat(lifecycleStats.getSupersededSweepFailures().getTotalCount()).isEqualTo(1);
     }
 
     @ParameterizedTest

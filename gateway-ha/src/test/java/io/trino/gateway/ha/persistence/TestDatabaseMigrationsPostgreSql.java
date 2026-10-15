@@ -117,6 +117,25 @@ final class TestDatabaseMigrationsPostgreSql
         dropAllTables();
     }
 
+    @Test
+    public void testAdmissionLedgerAutovacuumOptions()
+    {
+        // Every admission is inserted PENDING and updated once to COMPLETE, never as a HOT update, so each
+        // one leaves a dead entry in the partial index of not-yet-complete admissions. The live set of that
+        // index stays tiny while the table grows, so the default proportional trigger lets dead entries
+        // accumulate for days and every reader of pending admissions scans them.
+        FlywayMigration.migrate(dataStoreConfiguration());
+        try {
+            List<String> options = jdbi.withHandle(handle -> handle.createQuery(
+                            "SELECT unnest(reloptions) FROM pg_class WHERE oid = 'transaction_admission'::regclass")
+                    .mapTo(String.class).list());
+            assertThat(options).contains("autovacuum_vacuum_scale_factor=0", "autovacuum_vacuum_threshold=20000", "vacuum_index_cleanup=on");
+        }
+        finally {
+            dropAllTables();
+        }
+    }
+
     @Override
     protected void verifyGatewaySchema()
     {
