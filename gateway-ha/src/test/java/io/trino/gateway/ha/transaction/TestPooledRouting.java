@@ -14,11 +14,16 @@
 package io.trino.gateway.ha.transaction;
 
 import io.airlift.http.client.HttpClient;
+import io.airlift.http.client.HttpClientConfig;
 import io.airlift.http.client.StringResponseHandler.StringResponse;
+import io.airlift.http.client.jetty.JettyHttpClient;
 import io.trino.gateway.ha.clustermonitor.ClusterStats;
+import io.trino.gateway.ha.clustermonitor.FakePrometheus;
+import io.trino.gateway.ha.clustermonitor.PrometheusClusterLoadSource;
 import io.trino.gateway.ha.clustermonitor.TrinoStatus;
 import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
+import io.trino.gateway.ha.config.MonitorConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
@@ -27,6 +32,7 @@ import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.ws.rs.WebApplicationException;
+import okhttp3.mockwebserver.MockResponse;
 import org.jdbi.v3.core.Jdbi;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -47,6 +53,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -262,20 +269,119 @@ class TestPooledRouting
     }
 
     @Test
-    void loadAwareRoutingPicksTheLeastLoadedHealthyMember()
+    void loadAwareRoutingSendsMoreWorkToLessLoadedHealthyMembers()
     {
         enableLoadAwareRouting();
         member("i-1", true);
         member("i-2", true);
         member("i-3", true);
         probeSucceeds();
-        // i-2 runs many queries under low memory pressure, so it carries the lowest load.
+        // i-2 runs many queries under low memory pressure, so it carries the lowest load: 2.0, 5.0, 9.0.
         stats("i-1", 5, 0, 0, 100);
         stats("i-2", 0, 40, 5, 100);
         stats("i-3", 0, 10, 90, 100);
-        for (int attempt = 0; attempt < 20; attempt++) {
-            assertThat(resolve().routingDestination().clusterHost()).isEqualTo("http://i-2.example.test");
+        service.setRandom(new Random(7));
+        Map<String, Integer> selected = new HashMap<>();
+        for (int attempt = 0; attempt < 300; attempt++) {
+            selected.merge(resolve().routingDestination().clusterHost(), 1, Integer::sum);
         }
+        // Power of two choices with two independent draws: i-2 wins 5/9, i-1 wins 3/9, and i-3 wins 1/9.
+        int leastLoaded = selected.getOrDefault("http://i-2.example.test", 0);
+        int middle = selected.getOrDefault("http://i-1.example.test", 0);
+        int mostLoaded = selected.getOrDefault("http://i-3.example.test", 0);
+        assertThat(leastLoaded).isGreaterThan(middle);
+        assertThat(middle).isGreaterThan(mostLoaded);
+        assertThat(mostLoaded).isLessThan(60);
+    }
+
+    @Test
+    void loadAwareRoutingSpreadsNewWorkInsteadOfHerdingOnTheLeastLoadedMember()
+    {
+        enableLoadAwareRouting();
+        for (int member = 1; member <= 3; member++) {
+            member("i-" + member, true);
+        }
+        probeSucceeds();
+        stats("i-1", 0, 0, 0, 100);
+        stats("i-2", 1, 0, 0, 100);
+        stats("i-3", 2, 0, 0, 100);
+        service.setRandom(new Random(11));
+        Set<String> selected = new HashSet<>();
+        for (int attempt = 0; attempt < 60; attempt++) {
+            selected.add(resolve().routingDestination().clusterHost());
+        }
+        // Strict lowest-load order selects only i-1 until the stats refresh.
+        assertThat(selected).contains("http://i-1.example.test", "http://i-2.example.test");
+    }
+
+    @Test
+    void loadAwareRoutingSpreadsNewWorkInATwoMemberPool()
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        probeSucceeds();
+        stats("i-1", 0, 0, 0, 100);
+        stats("i-2", 5, 0, 0, 100);
+        service.setRandom(new Random(5));
+        Map<String, Integer> selected = new HashMap<>();
+        for (int attempt = 0; attempt < 200; attempt++) {
+            selected.merge(resolve().routingDestination().clusterHost(), 1, Integer::sum);
+        }
+        // The more loaded member is first only when both draws select it (1/4).
+        assertThat(selected.getOrDefault("http://i-2.example.test", 0)).isPositive();
+        assertThat(selected.getOrDefault("http://i-1.example.test", 0)).isGreaterThan(selected.getOrDefault("http://i-2.example.test", 0));
+    }
+
+    @Test
+    void loadAwareRoutingUsesThePrometheusLoadSourceAndUnknownLoadSortsLast()
+            throws Exception
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        member("i-3", true);
+        probeSucceeds();
+        try (FakePrometheus prometheus = new FakePrometheus();
+                JettyHttpClient client = new JettyHttpClient(new HttpClientConfig())) {
+            prometheus.vector("queued", Map.of("backend-i-1", "9", "backend-i-2", "0"));
+            prometheus.vector("running", Map.of("backend-i-1", "0", "backend-i-2", "2"));
+            MonitorConfiguration monitor = new MonitorConfiguration();
+            monitor.setLoadPrometheusUrl(prometheus.baseUrl());
+            monitor.setLoadQueuedQueriesQuery("queued");
+            monitor.setLoadRunningQueriesQuery("running");
+            // The health monitor (for example INFO_API) gives health only. i-3 has no series.
+            List<ClusterStats> enriched = new PrometheusClusterLoadSource(client, monitor, true).enrich(List.of(
+                    healthOnly("backend-i-1"), healthOnly("backend-i-2"), healthOnly("backend-i-3")));
+            for (ClusterStats stats : enriched) {
+                assertThat(stats.trinoStatus()).isEqualTo(TrinoStatus.HEALTHY);
+                when(routingManager.getClusterStats(stats.clusterId())).thenReturn(Optional.of(stats));
+            }
+            service.setRandom(new Random(3));
+            Map<String, Integer> counts = new HashMap<>();
+            for (int attempt = 0; attempt < 270; attempt++) {
+                counts.merge(resolve().routingDestination().clusterHost(), 1, Integer::sum);
+            }
+            // Loads: i-2 = 2, i-1 = 9, i-3 unknown (highest). Expected shares are 5/9, 3/9 and 1/9.
+            assertThat(counts.getOrDefault("http://i-2.example.test", 0)).isGreaterThan(counts.getOrDefault("http://i-1.example.test", 0));
+            assertThat(counts.getOrDefault("http://i-1.example.test", 0)).isGreaterThan(counts.getOrDefault("http://i-3.example.test", 0));
+            // The source fails: all loads are unknown, and routing still spreads over all members.
+            prometheus.respond("queued", () -> new MockResponse().setResponseCode(503));
+            for (ClusterStats stats : new PrometheusClusterLoadSource(client, monitor, true).enrich(enriched)) {
+                assertThat(stats.trinoStatus()).isEqualTo(TrinoStatus.HEALTHY);
+                when(routingManager.getClusterStats(stats.clusterId())).thenReturn(Optional.of(stats));
+            }
+            Set<String> selected = new HashSet<>();
+            for (int attempt = 0; attempt < 60; attempt++) {
+                selected.add(resolve().routingDestination().clusterHost());
+            }
+            assertThat(selected).hasSize(3);
+        }
+    }
+
+    private static ClusterStats healthOnly(String name)
+    {
+        return ClusterStats.builder(name).trinoStatus(TrinoStatus.HEALTHY).routingGroup(POOL).build();
     }
 
     @Test
@@ -305,9 +411,13 @@ class TestPooledRouting
         member("i-2", true);
         probeSucceeds();
         stats("i-2", 50, 50, 100, 100);
-        for (int attempt = 0; attempt < 10; attempt++) {
-            assertThat(resolve().routingDestination().clusterHost()).isEqualTo("http://i-2.example.test");
+        service.setRandom(new Random(13));
+        Map<String, Integer> counts = new HashMap<>();
+        for (int attempt = 0; attempt < 100; attempt++) {
+            counts.merge(resolve().routingDestination().clusterHost(), 1, Integer::sum);
         }
+        // Unknown load is the highest load: i-1 is first only when both draws select it (1/4).
+        assertThat(counts.getOrDefault("http://i-2.example.test", 0)).isGreaterThan(2 * counts.getOrDefault("http://i-1.example.test", 0));
         when(routingManager.getClusterStats(anyString())).thenReturn(Optional.empty());
         Set<String> selected = new HashSet<>();
         for (int attempt = 0; attempt < 30; attempt++) {

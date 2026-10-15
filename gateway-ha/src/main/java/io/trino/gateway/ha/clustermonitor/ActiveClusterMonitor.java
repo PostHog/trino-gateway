@@ -44,6 +44,7 @@ public class ActiveClusterMonitor
     private final Duration taskDelay;
     private final ClusterStatsMonitor clusterStatsMonitor;
     private final PoolMonitoringScope poolMonitoringScope;
+    private final PrometheusClusterLoadSource loadSource;
     private final ExecutorService executorService = Executors.newFixedThreadPool(DEFAULT_THREAD_POOL_SIZE);
     private final ScheduledExecutorService scheduledExecutor = Executors.newSingleThreadScheduledExecutor();
 
@@ -53,8 +54,10 @@ public class ActiveClusterMonitor
             GatewayBackendManager gatewayBackendManager,
             MonitorConfiguration monitorConfiguration,
             ClusterStatsMonitor clusterStatsMonitor,
-            PoolMonitoringScope poolMonitoringScope)
+            PoolMonitoringScope poolMonitoringScope,
+            PrometheusClusterLoadSource loadSource)
     {
+        this.loadSource = requireNonNull(loadSource, "loadSource is null");
         this.clusterStatsMonitor = requireNonNull(clusterStatsMonitor, "clusterStatsMonitor is null");
         this.poolMonitoringScope = requireNonNull(poolMonitoringScope, "poolMonitoringScope is null");
         this.clusterStatsObservers = requireNonNull(clusterStatsObservers, "clusterStatsObservers is null");
@@ -81,6 +84,8 @@ public class ActiveClusterMonitor
                     ClusterStats clusterStats = clusterStatsFuture.get();
                     stats.add(clusterStats);
                 }
+                // Health is decided above. The load source only adds load, and never throws.
+                stats = loadSource.enrich(stats);
 
                 if (clusterStatsObservers != null) {
                     for (TrinoClusterStatsObserver observer : clusterStatsObservers) {

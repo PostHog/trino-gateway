@@ -140,8 +140,17 @@ load = queued + running * memoryPressure
 memoryPressure = reservedQueryMemory / maxQueryMemory, clipped to [0, 1]
 ```
 
-Gateway keeps healthy members first. Then it sorts by load, lowest first. Equal
-loads keep the shuffled order, so ties spread across members.
+Gateway keeps healthy members first. Then it uses "power of two choices": it
+draws two random members of the best health tier, independently, and tries the
+member with the lower load first. Unknown load is the highest load. The fallback members for pre-dispatch
+reselection follow in health and load order.
+
+Gateway does not always select the member with the lowest load. Load data can be
+older than one refresh, and all Gateway replicas see the same data. With strict
+lowest-load order, all new statements go to one member until the next refresh.
+Two random draws spread new statements, also in a pool of two members. A member
+with more load gets fewer new statements. In a tier of N members, the member with
+the most load is tried first for about 1 in N² new statements.
 
 Load is advisory, as health is:
 
@@ -153,9 +162,7 @@ Load is advisory, as health is:
 - If reserved memory is `0`, running queries add no load. Queued queries still
   count.
 
-Statistics refresh at the interval `monitor.taskDelay`. Between refreshes, new
-statements go to the same least-loaded member. Use a short `taskDelay` with this
-feature.
+Statistics refresh at the interval `monitor.taskDelay`.
 
 The `JMX` monitor reads memory from the
 `trino.memory:type=ClusterMemoryPool,name=general` MBean when the flag is on. The
@@ -167,6 +174,61 @@ on `/metrics` only if `openmetrics.jmx-object-names` includes the MBean.
 Members that report memory statistics can have a lower load than members that
 do not, because unknown memory pressure counts as `1`. Configure all members of
 a pool the same way.
+
+#### Prometheus load source
+
+The `INFO_API` monitor gives health only. It gives no load, so all members have
+equal load. To get load without coordinator credentials, read it from a
+Prometheus-compatible HTTP API that already scrapes the coordinators:
+
+```yaml
+monitor:
+  loadPrometheusUrl: http://prometheus.example.com:9090
+  loadQueuedQueriesQuery: >-
+    max by (backend) (label_replace(trino_execution_querymanager_queuedqueries{pool="example"},
+    "backend", "example-$1", "instance_name", "(.+)"))
+  loadRunningQueriesQuery: >-
+    max by (backend) (label_replace(trino_execution_querymanager_runningqueries{pool="example"},
+    "backend", "example-$1", "instance_name", "(.+)"))
+  loadReservedMemoryQuery: >-
+    max by (backend) (label_replace(trino_memory_clustermemorypool_reserveddistributedbytes{pool="example",name="general"},
+    "backend", "example-$1", "instance_name", "(.+)"))
+  loadMaxMemoryQuery: >-
+    max by (backend) (label_replace(trino_memory_clustermemorypool_totaldistributedbytes{pool="example",name="general"},
+    "backend", "example-$1", "instance_name", "(.+)"))
+  loadQueryTimeout: 5s
+```
+
+Change the selectors and labels in the example to match your scrape setup.
+
+- Gateway sends `GET <loadPrometheusUrl>/api/v1/query` once for each query in
+  each refresh, independent of the number of members. The queries run at the
+  same time. After the health checks, a refresh waits at most
+  `loadQueryTimeout` for all of them.
+- Each query must return an instant vector. Each series must have a `backend`
+  label equal to the Gateway backend name. Use `label_replace` to make this label.
+- The configured `monitorType` still decides health. The load source never
+  changes health.
+- The queued and running queries are one pair. If a member has no value for one
+  of them, its load is unknown. It is the highest load, and it sorts last in the
+  fallback order. If no backend has a value,
+  Gateway logs a warning. The memory queries are
+  optional. Set both or neither. If a member has no value for one of them, its
+  memory pressure is unknown.
+- A failed request, a timeout, an unexpected response, a value that is not a
+  finite number at least `0`, or two series for one member makes the value
+  unknown. Gateway does not keep values from an earlier refresh.
+- When the source is set, load-aware routing uses only its values, not the load
+  or memory from the monitor. Other features, such as the query count router
+  and the UI, still use the values from the monitor.
+- The source is active only when `routing.loadAwarePooledRoutingEnabled` is
+  `true`. Gateway validates the queries when the URL is set. `loadQueryTimeout` must be shorter than `taskDelay`.
+- The source has no authentication. Use it on a trusted network.
+- For a coordinator that reports, data is up to the scrape interval plus
+  `taskDelay` old. An instant query returns the last sample within the lookback
+  window of the server (5 minutes by default in Prometheus). Gateway does not
+  check the sample age. If a coordinator stops reporting, its last value can
+  stay for that window.
 
 ### Durable transaction and query ownership
 

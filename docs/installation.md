@@ -662,6 +662,24 @@ monitor:
 
 Other timeout parameters are not applicable to the JDBC connection.
 
+#### Prometheus load source
+
+Load-aware pooled routing can read load from a Prometheus-compatible HTTP API.
+The monitor type still decides health. An empty `loadPrometheusUrl` disables it.
+It is active only when `routing.loadAwarePooledRoutingEnabled` is `true`.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `monitor.loadPrometheusUrl` | empty | Base URL. Gateway calls `<base>/api/v1/query`. |
+| `monitor.loadQueuedQueriesQuery` | empty | PromQL for queued queries. Required when the URL is set. |
+| `monitor.loadRunningQueriesQuery` | empty | PromQL for running queries. Required when the URL is set. |
+| `monitor.loadReservedMemoryQuery` | empty | PromQL for reserved query memory in bytes. Optional. |
+| `monitor.loadMaxMemoryQuery` | empty | PromQL for maximum query memory in bytes. Optional. |
+| `monitor.loadQueryTimeout` | `5s` | Maximum wait for all queries in one refresh. Must be shorter than `taskDelay`. |
+
+Each query must return series with a `backend` label equal to the backend name.
+Refer to [Pooled routing](pooled-routing.md#prometheus-load-source).
+
 #### JMX
 
 The monitor type `JMX` can be used as an alternative to collect cluster information,
