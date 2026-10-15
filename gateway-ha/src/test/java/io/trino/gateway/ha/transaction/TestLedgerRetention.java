@@ -88,7 +88,7 @@ class TestLedgerRetention
             database.useHandle(handle -> handle.createScript(sql).execute());
         }
         // Concurrent index builds cannot run inside a transaction block, so run them one statement at a time.
-        for (String version : new String[] {"V14__drain_reconciliation_index.sql", "V15__ledger_retention_indexes.sql"}) {
+        for (String version : new String[] {"V14__drain_reconciliation_index.sql", "V16__ledger_retention_indexes.sql"}) {
             for (String statement : resource(version).replaceAll("(?m)^--.*$", "").split(";")) {
                 if (!statement.isBlank()) {
                     database.useHandle(handle -> handle.execute(statement));

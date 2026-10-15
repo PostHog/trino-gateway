@@ -310,7 +310,7 @@ first if you keep that history for audit. A CLOSED
 transaction binding is considered only when a batch deletes the last query or
 rejection that references it.
 
-Upgrading builds four indexes concurrently (migration V15). The migration connection
+Upgrading builds four indexes concurrently (migration V16). The migration connection
 has no statement timeout; on a large ledger the build takes a while and waits for
 older open transactions, but does not block writes. If a build is interrupted, the
 next startup repairs the failed migration record and the script rebuilds all four
