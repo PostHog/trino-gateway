@@ -269,6 +269,48 @@ class TestTransactionAwarenessService
         assertThat(lifecycleStats.getSupersededSweepFailures().getTotalCount()).isEqualTo(1);
     }
 
+    @Test
+    void disabledLedgerRetentionDeletesNothing()
+    {
+        service.shutdown();
+        configuration.getTransactionAwareness().setLedgerRetentionDays(0);
+        service.purgeSettledLedger();
+        verify(store, never()).purgeSettledQueries(anyInt(), anyInt(), any());
+        verify(store, never()).purgeRejectedAdmissions(anyInt(), anyInt(), any());
+    }
+
+    @Test
+    void ledgerRetentionRunsBatchesUntilExhaustedAndCountsRows()
+    {
+        service.shutdown();
+        configuration.getTransactionAwareness().setLedgerRetentionBatchSize(2);
+        configuration.getTransactionAwareness().setLedgerRetentionBatchPauseMillis(0);
+        TransactionStore.RetentionCursor next = new TransactionStore.RetentionCursor("2026-01-01 00:00:00+00", "q");
+        when(store.purgeSettledQueries(7, 2, TransactionStore.RetentionCursor.START)).thenReturn(new TransactionStore.RetentionBatch(2, 2, 5, 1, 1, next));
+        when(store.purgeSettledQueries(7, 2, next)).thenReturn(new TransactionStore.RetentionBatch(1, 1, 2, 0, 0, next));
+        when(store.purgeRejectedAdmissions(anyInt(), anyInt(), any())).thenReturn(new TransactionStore.RetentionBatch(0, 0, 0, 0, 0, TransactionStore.RetentionCursor.START));
+        service.purgeSettledLedger();
+        verify(store).purgeSettledQueries(7, 2, TransactionStore.RetentionCursor.START);
+        verify(store).purgeSettledQueries(7, 2, next);
+        verify(store).purgeRejectedAdmissions(7, 2, TransactionStore.RetentionCursor.START);
+        assertThat(lifecycleStats.getLedgerRowsDeleted().getTotalCount()).isEqualTo(12);
+    }
+
+    @Test
+    void ledgerRetentionFailureIsCountedAndDoesNotEscape()
+    {
+        service.shutdown();
+        when(store.purgeSettledQueries(anyInt(), anyInt(), any())).thenThrow(new IllegalStateException("database unavailable"));
+        when(store.purgeRejectedAdmissions(anyInt(), anyInt(), any())).thenReturn(new TransactionStore.RetentionBatch(0, 0, 1, 0, 0, TransactionStore.RetentionCursor.START));
+        service.purgeSettledLedger();
+        assertThat(lifecycleStats.getLedgerRetentionFailures().getTotalCount()).isEqualTo(1);
+        // A failing phase does not starve the other one.
+        assertThat(lifecycleStats.getLedgerRowsDeleted().getTotalCount()).isEqualTo(1);
+        // The next run retries the same position with a smaller batch.
+        service.purgeSettledLedger();
+        verify(store).purgeSettledQueries(7, 50, TransactionStore.RetentionCursor.START);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {CONTINUATION, "/v1/query/" + QUERY, "/v1/query/" + QUERY + "/unknown"})
     void goneResponsesCannotCompleteQuery(String path)

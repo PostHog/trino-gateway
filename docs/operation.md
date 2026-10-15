@@ -203,6 +203,8 @@ counters under `io_trino_gateway_ha_transaction_name_TransactionLifecycleStats_`
 | `SupersededAdmissions` | Failed requests whose admission this process settled as superseded instead of uncertain, because a sibling admission already recorded a terminal observation for the query. |
 | `SweptSupersededAdmissions` | Uncertain admissions the periodic sweep settled as superseded. |
 | `BlockedDrainObservations` | Draining members with nonzero obligations observed in member-list or obligation reads. |
+| `LedgerRowsDeleted` | Settled ledger rows deleted by ledger retention on this process. |
+| `LedgerRetentionFailures` | Ledger retention runs that stopped on a failure; the next run retries. |
 
 These counters describe observations on each Gateway process, not distinct queries,
 current obligations, or completed state transitions. Retries and repeated polls can
@@ -213,7 +215,7 @@ current authoritative counts; never use these counters to authorize retirement.
 
 Diagnostic logs use the fixed reasons `EXECUTING_RESULT_NOT_FOUND`,
 `MARK_UNCERTAIN_SUCCEEDED`, `MARK_UNCERTAIN_FAILED`, `ADMISSION_SUPERSEDED`, and
-`POOL_DRAIN_BLOCKED`. `ADMISSION_SUPERSEDED` carries `source=request` or `source=sweep`.
+`POOL_DRAIN_BLOCKED`, plus `LEDGER_RETENTION` and `LEDGER_RETENTION_FAILED` for ledger retention. `ADMISSION_SUPERSEDED` carries `source=request` or `source=sweep`.
 Each reason has an independent limit of one log per 30 seconds per process; counters
 remain unsampled. Logs include admission/query/incarnation identifiers or member
 obligation counts, but not SQL, credentials, transaction identifiers, result
@@ -247,6 +249,72 @@ A failed request applies the rule when it is marked. With transaction-aware rout
 every Gateway replica also sweeps independently, 10 seconds after startup and then
 60 seconds after each sweep finishes. The sweep is the only path that settles a request that failed before its
 sibling recorded the terminal observation; sweep failures are logged as warnings.
+
+## Ledger retention
+
+The transaction ledger keeps a row for every forwarded request, every query and
+every transaction. Settled history is deleted after a retention period so the
+ledger does not grow without bound:
+
+```yaml
+transactionAwareness:
+  ledgerRetentionDays: 7              # 0 disables retention
+  ledgerRetentionBatchSize: 100       # index entries examined per batch, at most 500
+  ledgerRetentionBatchPauseMillis: 500
+```
+
+Retention deletes only rows that no drain decision, continuation or superseded
+settlement can still read:
+
+* a terminal query whose retry window (`retain_until`) ended at least
+  `ledgerRetentionDays` ago, whose admissions are all `COMPLETE`, and whose
+  transaction, if any, is `CLOSED`, together with its admissions and result
+  capabilities;
+* a rejected admission (`COMPLETE` without a query) created at least
+  `ledgerRetentionDays` ago;
+* a `CLOSED` transaction binding once the last query or admission referencing it
+  is deleted.
+
+Pending and uncertain admissions, running queries, queries still inside their retry
+window, and open transactions are never deleted, however old they are, and neither
+are backend incarnations or any pool table: incarnation and member identities are
+never reused, and that guarantee depends on their rows. Retention therefore never
+changes drain status or pool obligations. A continuation for a deleted query is
+refused as an unknown query; it is never routed to another backend.
+
+Every replica runs retention 60 seconds after startup and then 5 minutes after each
+run finishes, on a thread separate from the superseded sweep. Each phase (queries and
+rejections) walks the expired range in index order with a cursor that survives runs
+and wraps to the start only at the end of the range, so rows that must be kept cost
+one pass per cycle and never starve the rows behind them. A run pauses
+`ledgerRetentionBatchPauseMillis` between full batches and stops after 1000 batches;
+the next run continues from the cursor. A failure in one phase does not stop the other.
+
+Each batch is one short transaction. It only tries the identity locks that admissions,
+continuations and completions hold, and locks rows with `SKIP LOCKED`, so it does not
+queue behind a request that already holds a query or transaction, and replicas share
+the backlog. A late continuation for an expired query that arrives while a batch holds
+that query waits for the batch, bounded by the data store `lockTimeoutMillis`, and
+then either finds the query unknown or fails with a retryable database error. A batch
+holds up to two advisory locks per examined row, so keep `ledgerRetentionBatchSize`
+well below PostgreSQL's lock table capacity (`max_locks_per_transaction` times
+connections). The data store statement and lock timeouts apply to every retention
+statement. After a failed batch the next run retries from the same position with half
+the batch size, down to one row; a row that still fails keeps `LEDGER_RETENTION_FAILED`
+logged and `LedgerRetentionFailures` increasing, and stops that phase until it is fixed.
+
+Retention is enabled by default because the deleted rows can no longer affect
+correctness, while unbounded growth slows every drain-status read. Upgrading therefore
+starts deleting settled history older than seven days; set `ledgerRetentionDays: 0`
+first if you keep that history for audit. A CLOSED
+transaction binding is considered only when a batch deletes the last query or
+rejection that references it.
+
+Upgrading builds four indexes concurrently (migration V15). The migration connection
+has no statement timeout; on a large ledger the build takes a while and waits for
+older open transactions, but does not block writes. If a build is interrupted, the
+next startup repairs the failed migration record and the script rebuilds all four
+indexes, replacing an invalid one. The indexes add a small write cost to queries and transaction statements.
 
 ## Trino Gateway health endpoints
 
