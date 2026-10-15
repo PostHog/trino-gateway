@@ -34,6 +34,14 @@ barrier where their decisions require admission exclusion. Cordon and suspicion
 use a shared route lock; the pool row still serializes authority and membership
 changes.
 
+Candidate enumeration and absence reconciliation are per query. A query with a
+pending or uncertain admission is neither a candidate nor reconciled, but such a
+request on another query of the member does not hide this one: otherwise one
+client that keeps polling a long query would keep every abandoned query on the
+member unreconciled until all live work ends. Under the exclusive barrier, a
+request that starts after enumeration changes the query's admission count, so
+its receipt no longer matches, and one still in flight fails the per-query check.
+
 The first statement sets transaction-local isolation. It does not read, change,
 or restore the connection's session isolation setting on every request.
 
