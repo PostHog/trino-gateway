@@ -435,6 +435,67 @@ class TestPoolStore
     }
 
     @Test
+    void finishedRepairsReleaseTheRepairBudget()
+    {
+        // A budget of one: every repair after the first is accepted only if the previous one was released.
+        configure(3, 3, 1, 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        for (int index = 1; index <= 3; index++) {
+            String target = "i-" + index;
+            String repair = "repair-" + index;
+            suspect(target);
+            register(repair, "r-1", target);
+            admit(repair);
+            // Serving, but its target still holds a live slot: the repair is in flight.
+            assertThat(first.poolState(POOL).orElseThrow().repairInUse()).isEqualTo(1);
+            drainAndRetire(target);
+            // The target retired: the repair is an ordinary member now.
+            assertThat(first.poolState(POOL).orElseThrow().repairInUse()).isZero();
+        }
+        assertThat(first.member(POOL, "repair-1").orElseThrow().repair()).isTrue();
+
+        suspect("repair-1");
+        Member next = register("repair-4", "r-1", "repair-1");
+        assertThat(next.repair()).isTrue();
+        assertThat(first.poolState(POOL).orElseThrow().repairInUse()).isEqualTo(1);
+    }
+
+    @Test
+    void finishedRepairsCountTowardTheSurgeBudget()
+    {
+        configure(3, 3, 1, 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        suspect("i-1");
+        register("repair-1", "r-1", "i-1");
+        admit("repair-1");
+        drainAndRetire("i-1");
+        // Three live members, all ordinary now: one surge registration fits, a second does not.
+        assertThat(register("i-4").phase()).isEqualTo("PREPARING");
+        assertThatThrownBy(() -> register("i-5"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+    }
+
+    @Test
+    void aPreparingRepairStillChargesTheBudgetAfterItsTargetRetires()
+    {
+        configure(3, 3, 1, 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        suspect("i-1");
+        register("repair-1", "r-1", "i-1");
+        drainAndRetire("i-1");
+        assertThat(first.poolState(POOL).orElseThrow().repairInUse()).isEqualTo(1);
+        suspect("i-2");
+        assertThatThrownBy(() -> register("repair-2", "r-1", "i-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET));
+    }
+
+    @Test
     void aSuspectedMemberStillConsumesItsLiveComputeSlot()
     {
         serving("i-1");

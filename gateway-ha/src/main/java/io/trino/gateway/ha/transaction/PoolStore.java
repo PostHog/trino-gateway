@@ -1398,9 +1398,30 @@ public final class PoolStore
                 .bind("pool", poolId).bindArray("phases", String.class, phases.toArray(String[]::new)).mapTo(Long.class).one();
     }
 
+    /**
+     * Counts the repairs still in progress, which is what the repair budget charges.
+     * <p>
+     * {@code repair} records that a member was registered as a repair and is never cleared. A live
+     * repair is in progress while it is still PREPARING, or while the member it replaces still
+     * occupies a live slot. Once the repair serves and its target has left the live phases, the slot
+     * the repair borrowed has been handed back and the repair is an ordinary member: it counts toward
+     * the surge budget like any other. A repair whose target is unnamed or unknown stays charged, so
+     * a record that cannot prove its repair finished keeps blocking. The controller applies the same
+     * rule, and it may only ever be stricter than this one: the Gateway never charges a repair the
+     * controller considers finished.
+     */
     private static long countRepair(Handle handle, String poolId)
     {
-        return handle.createQuery("SELECT count(*) FROM transaction_backend WHERE pool_id = :pool AND repair AND state = ANY(:phases)")
+        return handle.createQuery(
+                        """
+                        SELECT count(*) FROM transaction_backend repair
+                        WHERE repair.pool_id = :pool AND repair.repair AND repair.state = ANY(:phases)
+                          AND (repair.state = 'PREPARING'
+                            OR repair.repair_for IS NULL
+                            OR NOT EXISTS (SELECT 1 FROM transaction_backend target
+                                WHERE target.pool_id = repair.pool_id AND target.instance_id = repair.repair_for
+                                  AND NOT target.state = ANY(:phases)))
+                        """)
                 .bind("pool", poolId).bindArray("phases", String.class, LIVE_PHASES.toArray(String[]::new)).mapTo(Long.class).one();
     }
 
