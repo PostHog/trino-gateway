@@ -156,21 +156,29 @@ public class TransactionAwarenessService
     void settleSupersededAdmissions()
     {
         // scheduleWithFixedDelay stops future runs once a task throws.
+        boolean failed = false;
         try {
             TransactionStore.SupersededSweep sweep;
             do {
                 sweep = store.settleSupersededAdmissions(SUPERSEDED_SWEEP_BATCH);
                 if (sweep == null) {
-                    return;
+                    break;
                 }
                 sweep.settled().forEach(admission -> lifecycleStats.superseded(admission, true));
-                sweep.failure().ifPresent(failure -> log.warn(failure, "Superseded admission sweep could not settle some admissions; will retry on next run"));
+                if (sweep.failure().isPresent()) {
+                    failed = true;
+                    log.warn(sweep.failure().get(), "Superseded admission sweep could not settle some admissions; will retry on next run");
+                }
             }
                 // Continue only after a fully settled batch: failed candidates stay selectable, so looping on them would never end.
             while (sweep.settled().size() == SUPERSEDED_SWEEP_BATCH);
         }
         catch (RuntimeException failure) {
+            failed = true;
             log.warn(failure, "Superseded admission sweep failed; will retry on next run");
+        }
+        if (failed) {
+            lifecycleStats.supersededSweepFailed();
         }
     }
 

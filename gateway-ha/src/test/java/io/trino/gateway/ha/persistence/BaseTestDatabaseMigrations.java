@@ -126,7 +126,7 @@ public abstract class BaseTestDatabaseMigrations
         jdbiHandle.close();
     }
 
-    private DataStoreConfiguration dataStoreConfiguration()
+    protected DataStoreConfiguration dataStoreConfiguration()
     {
         return new DataStoreConfiguration(
                 container.getJdbcUrl(),
