@@ -56,7 +56,7 @@ public class RoutingConfiguration
     private boolean oauth2RoutingEnabled;
 
     // Default false. If true, pooled routing orders eligible members by load (queued queries plus
-    // running queries weighted by memory pressure), after health. See BackendLoad.
+    // running queries, plus extra weight for memory pressure), after health. See BackendLoad.
     private boolean loadAwarePooledRoutingEnabled;
 
     public Duration getAsyncTimeout()

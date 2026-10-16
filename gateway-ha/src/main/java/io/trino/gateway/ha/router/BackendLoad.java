@@ -21,11 +21,12 @@ import java.util.OptionalDouble;
 import java.util.OptionalLong;
 
 /**
- * Load of one coordinator: {@code queued + running * memoryPressure}.
+ * Load of one coordinator: {@code queued + running * (1 + memoryPressure)}.
  * <p>
- * {@code memoryPressure} is {@code reserved / max} query memory, clipped to {@code [0, 1]}. When the
- * memory statistics are not known, running queries count at full weight, so the load is
- * {@code queued + running}. When {@link ClusterStats#externalLoad()} is present, only its values are
+ * {@code memoryPressure} is {@code reserved / max} query memory, clipped to {@code [0, 1]}. Running
+ * queries always count at full weight, because CPU-bound queries reserve little memory. Memory pressure
+ * adds up to one more unit per running query. When the memory statistics are not known, the pressure
+ * is {@code 0}, so the load is {@code queued + running}. When {@link ClusterStats#externalLoad()} is present, only its values are
  * used, and unknown query counts give {@link Double#POSITIVE_INFINITY}.
  */
 public final class BackendLoad
@@ -66,7 +67,7 @@ public final class BackendLoad
             queued = external.queuedQueryCount().orElseThrow();
             running = external.runningQueryCount().orElseThrow();
         }
-        return Math.max(0, queued) + Math.max(0, running) * memoryPressure(stats).orElse(1);
+        return Math.max(0, queued) + Math.max(0, running) * (1 + memoryPressure(stats).orElse(0));
     }
 
     /**

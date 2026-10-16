@@ -276,9 +276,9 @@ class TestPooledRouting
         member("i-2", true);
         member("i-3", true);
         probeSucceeds();
-        // i-2 runs many queries under low memory pressure, so it carries the lowest load: 2.0, 5.0, 9.0.
+        // Loads: i-2 = 2 * 1.05 = 2.1, i-1 = 5, i-3 = 10 * 1.9 = 19.
         stats("i-1", 5, 0, 0, 100);
-        stats("i-2", 0, 40, 5, 100);
+        stats("i-2", 0, 2, 5, 100);
         stats("i-3", 0, 10, 90, 100);
         service.setRandom(new Random(7));
         Map<String, Integer> selected = new HashMap<>();
@@ -292,6 +292,32 @@ class TestPooledRouting
         assertThat(leastLoaded).isGreaterThan(middle);
         assertThat(middle).isGreaterThan(mostLoaded);
         assertThat(mostLoaded).isLessThan(60);
+    }
+
+    @Test
+    void loadAwareRoutingCountsRunningQueriesThatReserveLittleMemory()
+    {
+        enableLoadAwareRouting();
+        member("i-1", true);
+        member("i-2", true);
+        member("i-3", true);
+        probeSucceeds();
+        // CPU-bound queries reserve almost no memory. Loads: i-3 = 0, i-2 = 1, i-1 = 6 * 1.0009.
+        stats("i-1", 0, 6, 9, 10_000);
+        stats("i-2", 0, 1, 0, 10_000);
+        stats("i-3", 0, 0, 0, 10_000);
+        service.setRandom(new Random(7));
+        Map<String, Integer> selected = new HashMap<>();
+        for (int attempt = 0; attempt < 300; attempt++) {
+            selected.merge(resolve().routingDestination().clusterHost(), 1, Integer::sum);
+        }
+        // Expected shares are 5/9, 3/9 and 1/9.
+        int idle = selected.getOrDefault("http://i-3.example.test", 0);
+        int single = selected.getOrDefault("http://i-2.example.test", 0);
+        int busy = selected.getOrDefault("http://i-1.example.test", 0);
+        assertThat(idle).isGreaterThan(single);
+        assertThat(single).isGreaterThan(busy);
+        assertThat(busy).isLessThan(60);
     }
 
     @Test
