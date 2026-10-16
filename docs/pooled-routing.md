@@ -136,7 +136,7 @@ routing:
 Gateway calculates the load of each member from its last cluster statistics:
 
 ```text
-load = queued + running * memoryPressure
+load = queued + running * (1 + memoryPressure)
 memoryPressure = reservedQueryMemory / maxQueryMemory, clipped to [0, 1]
 ```
 
@@ -154,13 +154,14 @@ the most load is tried first for about 1 in N² new statements.
 
 Load is advisory, as health is:
 
-- If memory statistics are not known, running queries count at full weight, and
-  the load is `queued + running`.
+- Running queries always count at full weight. CPU-bound queries can reserve
+  almost no memory, but they still use the coordinator. Memory pressure adds up
+  to one more unit per running query.
+- If memory statistics are not known, the memory pressure is `0`, and the load
+  is `queued + running`.
 - A member without statistics sorts after members with statistics. It stays
   eligible.
 - Missing statistics never cause a routing failure.
-- If reserved memory is `0`, running queries add no load. Queued queries still
-  count.
 
 Statistics refresh at the interval `monitor.taskDelay`.
 
@@ -171,9 +172,10 @@ The `JMX` monitor reads memory from the
 Other monitors do not supply memory statistics. Trino exports the memory pool
 on `/metrics` only if `openmetrics.jmx-object-names` includes the MBean.
 
-Members that report memory statistics can have a lower load than members that
-do not, because unknown memory pressure counts as `1`. Configure all members of
-a pool the same way.
+Members that report memory statistics never have a lower load than identical
+members that do not. Members without memory statistics can have a lower load,
+because their memory pressure counts as `0`. Configure all members of a pool the
+same way.
 
 #### Prometheus load source
 

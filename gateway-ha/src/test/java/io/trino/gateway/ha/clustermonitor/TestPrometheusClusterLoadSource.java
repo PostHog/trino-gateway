@@ -76,10 +76,10 @@ final class TestPrometheusClusterLoadSource
         assertThat(b1.runningQueryCount()).isZero();
         assertThat(b1.reservedQueryMemoryBytes()).isEmpty();
         assertThat(b1.proxyTo()).isEqualTo("http://b1.example.test");
-        assertThat(BackendLoad.load(b1)).isEqualTo(3 + 10 * 0.25);
+        assertThat(BackendLoad.load(b1)).isEqualTo(3 + 10 * 1.25);
         ClusterStats b2 = stats.get(1);
         assertThat(b2.trinoStatus()).isEqualTo(TrinoStatus.UNHEALTHY);
-        assertThat(BackendLoad.load(b2)).isEqualTo(0 + 4 * 0.9);
+        assertThat(BackendLoad.load(b2)).isEqualTo(0 + 4 * 1.9);
     }
 
     @Test

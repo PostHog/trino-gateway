@@ -277,8 +277,8 @@ dataStore:
   oauth2RoutingRetention: "1h"    # e.g. "90s", "10m", "2h"
 ```
 
-Order pooled members by load (queued queries plus running queries weighted by
-memory pressure) with the setting below. Refer to
+Order pooled members by load (queued queries plus running queries, with extra
+weight for memory pressure) with the setting below. Refer to
 [pooled routing](pooled-routing.md#load-aware-ordering).
 
 ```yaml
