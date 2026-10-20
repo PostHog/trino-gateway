@@ -104,6 +104,9 @@ import java.util.stream.Collectors;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.io.BaseEncoding.base64Url;
 import static io.airlift.json.JsonCodec.jsonCodec;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.REDACTED_STATEMENT;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.mayDefineCatalogProperties;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.recordedText;
 import static java.lang.Math.toIntExact;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Objects.requireNonNull;
@@ -238,7 +241,7 @@ public class TrinoQueryProperties
             if (statement.getClass() == Execute.class) {
                 String statementName = ((Execute) statement).getName().getValue();
                 if (!preparedStatements.containsKey(statementName)) {
-                    log.error("No prepared statement matching execute: %s", body);
+                    log.error("No prepared statement matching execute: %s", recordedText(body));
                     queryType = "Execute";
                     return;
                 }
@@ -273,8 +276,10 @@ public class TrinoQueryProperties
             errorMessage = Optional.of(e.getMessage());
         }
         catch (ParsingException e) {
-            log.info("Could not parse request body as SQL: %s; Message: %s", body, e.getMessage());
-            errorMessage = Optional.of(e.getMessage());
+            // The parser's message quotes the offending token, which can be a catalog's credential
+            String message = mayDefineCatalogProperties(body) ? REDACTED_STATEMENT : e.getMessage();
+            log.info("Could not parse request body as SQL: %s; Message: %s", recordedText(body), message);
+            errorMessage = Optional.of(message);
         }
         catch (RequestParsingException e) {
             log.warn(e, "Error parsing request for rules");
@@ -311,8 +316,10 @@ public class TrinoQueryProperties
             errorMessage = Optional.of(e.getMessage());
         }
         catch (ParsingException e) {
-            log.info("Could not parse request body as SQL: %s; Message: %s", body, e.getMessage());
-            errorMessage = Optional.of(e.getMessage());
+            // The parser's message quotes the offending token, which can be a catalog's credential
+            String message = mayDefineCatalogProperties(body) ? REDACTED_STATEMENT : e.getMessage();
+            log.info("Could not parse request body as SQL: %s; Message: %s", recordedText(body), message);
+            errorMessage = Optional.of(message);
         }
         catch (RequestParsingException e) {
             log.warn(e, "Error parsing request for rules");
