@@ -29,6 +29,8 @@ import org.glassfish.jersey.server.ContainerRequest;
 import java.io.IOException;
 
 import static io.trino.gateway.ha.handler.HttpUtils.TRINO_QUERY_PROPERTIES;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.REDACTED_STATEMENT;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.mayDefineCatalogProperties;
 
 /**
  *
@@ -76,10 +78,17 @@ public class QueryMetadataParser
             queryProps = new TrinoQueryProperties(requestContext, isClientsUseV2Format, maxBodySize);
         }
         catch (Exception ex) {
-            log.warn(ex,
-                    "Failed to parse query properties for query text: [%s]. Error: %s. Using empty properties.",
-                    getQueryTextForLogging(requestContext),
-                    ex.getMessage());
+            String queryText = getQueryTextForLogging(requestContext);
+            if (mayDefineCatalogProperties(queryText)) {
+                // The text, and the parser's message quoting it, can hold a catalog's credentials
+                log.warn("Failed to parse query properties for query text: [%s]. Using empty properties.", REDACTED_STATEMENT);
+            }
+            else {
+                log.warn(ex,
+                        "Failed to parse query properties for query text: [%s]. Error: %s. Using empty properties.",
+                        queryText,
+                        ex.getMessage());
+            }
             queryProps = new TrinoQueryProperties();
         }
 

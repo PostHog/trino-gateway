@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.reflect.ClassPath;
 import io.airlift.json.JsonCodec;
+import io.trino.gateway.ha.handler.QueryTextRedaction;
 import io.trino.sql.parser.SqlParser;
 import io.trino.sql.tree.Call;
 import io.trino.sql.tree.DropFunction;
@@ -122,6 +123,17 @@ final class TestTrinoQueryProperties
         assertThat(deserializedTrinoQueryProperties.isNewQuerySubmission()).isEqualTo(trinoQueryProperties.isNewQuerySubmission());
         assertThat(deserializedTrinoQueryProperties.isQueryParsingSuccessful()).isEqualTo(trinoQueryProperties.isQueryParsingSuccessful());
         assertThat(deserializedTrinoQueryProperties.getErrorMessage()).isEqualTo(trinoQueryProperties.getErrorMessage());
+    }
+
+    @Test
+    void testUnparseableCreateCatalogErrorDoesNotQuoteTheText()
+    {
+        // A malformed CREATE CATALOG: the parser's message would quote the token after the value
+        String query = "CREATE CATALOG c USING postgresql WITH (\"connection-password\" = 'redaction-test-secret' oops)";
+        TrinoQueryProperties trinoQueryProperties = new TrinoQueryProperties(prepareMockRequest(query), false, 1024 * 1024);
+
+        assertThat(trinoQueryProperties.isQueryParsingSuccessful()).isFalse();
+        assertThat(trinoQueryProperties.getErrorMessage()).contains(QueryTextRedaction.REDACTED_STATEMENT);
     }
 
     @Test

@@ -79,6 +79,7 @@ import static io.airlift.http.client.StaticBodyGenerator.createStaticBodyGenerat
 import static io.airlift.jaxrs.AsyncResponseHandler.bindAsyncResponse;
 import static io.trino.gateway.ha.handler.HttpUtils.TRINO_REQUEST_USER;
 import static io.trino.gateway.ha.handler.ProxyUtils.SOURCE_HEADER;
+import static io.trino.gateway.ha.handler.QueryTextRedaction.recordedText;
 import static jakarta.ws.rs.core.MediaType.TEXT_PLAIN_TYPE;
 import static jakarta.ws.rs.core.Response.Status.BAD_GATEWAY;
 import static jakarta.ws.rs.core.Response.Status.OK;
@@ -497,7 +498,8 @@ public class ProxyRequestHandler
         queryDetail.setSource(request.getHeader(SOURCE_HEADER));
 
         String queryText = new String(((StaticBodyGenerator) request.getBodyGenerator()).getBody(), UTF_8);
-        queryDetail.setQueryText(queryText);
+        // The history is shown in the UI and kept in the database: never a catalog's properties
+        queryDetail.setQueryText(recordedText(queryText));
         return queryDetail;
     }
 
