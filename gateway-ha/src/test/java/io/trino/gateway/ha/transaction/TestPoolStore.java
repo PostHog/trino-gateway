@@ -78,6 +78,7 @@ import static java.util.Objects.requireNonNull;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 import static org.junit.jupiter.api.parallel.ExecutionMode.SAME_THREAD;
 import static org.mockito.Mockito.mock;
@@ -140,7 +141,7 @@ class TestPoolStore
         for (String version : new String[] {
                 "V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql",
                 "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql",
-                "V13__pool_tenant_principals.sql",
+                "V13__pool_tenant_principals.sql", "V17__pool_canary_lead.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -629,6 +630,432 @@ class TestPoolStore
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
         lost("i-1");
         assertThat(register("i-2").phase()).isEqualTo("PREPARING");
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Canary lane
+    // --------------------------------------------------------------------------------------------
+
+    @Test
+    void leadSurgeAndCanaryRevisionRoundTripAndDefaultToNothing()
+    {
+        PoolStore.PoolState defaults = first.poolState(POOL).orElseThrow();
+        assertThat(defaults.leadSurge()).isZero();
+        assertThat(defaults.canaryRevision()).isEmpty();
+
+        PoolSpec spec = new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false, 2, "r-2");
+        PoolStore.PoolState configured = first.configurePool(POOL, guard("op-canary", "configure"), spec, false);
+        assertThat(configured.leadSurge()).isEqualTo(2);
+        assertThat(configured.canaryRevision()).isEqualTo("r-2");
+        PoolStore.PoolState read = second.poolState(POOL).orElseThrow();
+        assertThat(read.leadSurge()).isEqualTo(2);
+        assertThat(read.canaryRevision()).isEqualTo("r-2");
+        assertThat(second.routing(POOL).canaryRevision()).isEqualTo("r-2");
+
+        PoolStore.PoolState replay = second.configurePool(POOL, guard("op-canary", "configure"), spec, false);
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.leadSurge()).isEqualTo(2);
+        assertThat(replay.canaryRevision()).isEqualTo("r-2");
+
+        // A spec that omits both fields clears them.
+        PoolStore.PoolState cleared = first.configurePool(POOL, guard("op-cleared", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false), false);
+        assertThat(cleared.leadSurge()).isZero();
+        assertThat(cleared.canaryRevision()).isEmpty();
+        assertThat(second.routing(POOL).canaryRevision()).isEmpty();
+    }
+
+    @Test
+    void anInvalidLeadSurgeOrCanaryRevisionIsRefusedAndAppliesNothing()
+    {
+        List<PoolSpec> invalid = List.of(
+                new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false, -1, "r-2"),
+                new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false, 101, "r-2"),
+                new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false, 1, "r".repeat(129)),
+                new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false, 1, "r\n2"));
+        for (PoolSpec spec : invalid) {
+            assertThatThrownBy(() -> first.configurePool(POOL, guard("op-invalid-" + invalid.indexOf(spec), "configure"), spec, false))
+                    .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
+        }
+        PoolStore.PoolState state = first.poolState(POOL).orElseThrow();
+        assertThat(state.leadSurge()).isZero();
+        assertThat(state.canaryRevision()).isEmpty();
+    }
+
+    @Test
+    void aLeadIsAcceptedWhenTheMainSurgeCapIsFull()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        register("i-4");
+        assertThatThrownBy(() -> register("i-5"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+
+        Member lead = registerLead("lead-1", "r-2");
+        assertThat(lead.phase()).isEqualTo("PREPARING");
+        // The lead takes no main-pool slot: the main cap is as full as before.
+        PoolStore.PoolState state = first.poolState(POOL).orElseThrow();
+        assertThat(state.liveMembers()).isEqualTo(4);
+        assertThat(state.surgeInUse()).isEqualTo(1);
+        assertThat(state.leadInUse()).isEqualTo(1);
+        assertThatThrownBy(() -> register("i-5"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+    }
+
+    @Test
+    void leadsDoNotSpendTheMainSurgeBudget()
+    {
+        configureCanary("r-2", 2);
+        registerLead("lead-1", "r-2");
+        registerLead("lead-2", "r-2");
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        register("i-4");
+        assertThatThrownBy(() -> register("i-5"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+    }
+
+    @Test
+    void leadsAreLimitedToTheLeadSurgeAndTheirSlotsFreeWhenTheyLeave()
+    {
+        configureCanary("r-2", 1);
+        lead("lead-1", "r-2");
+        assertThatThrownBy(() -> registerLead("lead-2", "r-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+        // A suspected lead still occupies its slot, as a suspected member does.
+        suspect("lead-1");
+        assertThatThrownBy(() -> registerLead("lead-2", "r-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+        lost("lead-1");
+        assertThat(registerLead("lead-2", "r-2").phase()).isEqualTo("PREPARING");
+    }
+
+    @Test
+    void aLeadMustCarryTheCanaryRevisionAndHaveALeadSlot()
+    {
+        configureCanary("r-2", 1);
+        assertThatThrownBy(() -> registerLead("lead-old", "r-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION))
+                .hasMessageContaining("canary revision");
+        // Only a full set of slots is a budget error.
+        registerLead("lead-1", "r-2");
+        assertThatThrownBy(() -> registerLead("lead-2", "r-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET));
+        // A pool without a canary takes no lead, not even one with an empty revision.
+        configureCanary("", 1);
+        assertThatThrownBy(() -> registerLead("lead-none", ""))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION))
+                .hasMessageContaining("canaryRevision is empty");
+        configureCanary("r-2", 0);
+        assertThatThrownBy(() -> registerLead("lead-zero", "r-2"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION))
+                .hasMessageContaining("no lead slots");
+    }
+
+    @Test
+    void concurrentLeadRegistrationsCannotExceedTheLeadSurge()
+            throws Exception
+    {
+        configureCanary("r-2", 1);
+        CountDownLatch start = new CountDownLatch(1);
+        try (var executor = Executors.newFixedThreadPool(2)) {
+            var attempts = List.of(first, second).stream().map(store -> executor.submit(() -> {
+                start.await();
+                String id = store == first ? "lead-a" : "lead-b";
+                try {
+                    store.registerMember(POOL, guard("register-" + id, "register"), registration(id, "r-2", null, true));
+                    return true;
+                }
+                catch (PoolException failure) {
+                    assertThat(failure.code()).isEqualTo(POOL_SURGE_BUDGET);
+                    return false;
+                }
+            })).toList();
+            start.countDown();
+            int accepted = 0;
+            for (var attempt : attempts) {
+                if (attempt.get(30, TimeUnit.SECONDS)) {
+                    accepted++;
+                }
+            }
+            assertThat(accepted).isEqualTo(1);
+        }
+        assertThat(first.poolState(POOL).orElseThrow().leadInUse()).isEqualTo(1);
+    }
+
+    @Test
+    void aMainMemberCannotRunTheCanaryRevision()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        assertThatThrownBy(() -> register("main", "r-2", null))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION))
+                .hasMessageContaining("lead:true");
+        // The repair path is covered too.
+        suspect("i-1");
+        assertThatThrownBy(() -> register("repair", "r-2", "i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION))
+                .hasMessageContaining("lead:true");
+        assertThat(register("repair", "r-1", "i-1").repair()).isTrue();
+        assertThat(registerLead("lead-1", "r-2").lead()).isTrue();
+
+        // Once the canary build is the desired revision, it is a normal revision again.
+        first.configurePool(POOL, guard("op-promoted", "configure"), new PoolSpec("POOLED", 1, 3, 1, 1, "r-2", false, 1, "r-2"), false);
+        assertThat(register("main", "r-2", null).lead()).isFalse();
+    }
+
+    @Test
+    void aLeadCannotBeARepairAndNoRepairTargetsALead()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        assertThatThrownBy(() -> first.registerMember(POOL, guard("op-lead-repair", "register"), registration("lead-repair", "r-2", "i-1", true)))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
+        lead("lead-1", "r-2");
+        suspect("lead-1");
+        // A repair is exempt from the surge budget, so repairing a lead would add a free main member.
+        assertThatThrownBy(() -> register("repair", "r-1", "lead-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_REPAIR_BUDGET));
+    }
+
+    @Test
+    void anActiveLeadNeverMasksARepairCapacityDeficit()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        lead("lead-1", "r-2");
+        suspect("i-1");
+        drain(first, "i-1", "drain-i-1");
+        // Two main members serve and one is missing. The active lead must not make up the third.
+        assertThat(register("repair", "r-1", "i-1").repair()).isTrue();
+    }
+
+    @Test
+    void aLeadNeitherSatisfiesNorIsBlockedByTheServingFloor()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        lead("lead-1", "r-2");
+        // The pool is at its floor of one main member, and the lead does not add to it.
+        assertThatThrownBy(() -> drain(first, "i-1", "drain-main"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SERVING_FLOOR));
+        // The floor does not gate the lead either, so a superseded lead can leave at once.
+        assertThat(drain(first, "lead-1", "drain-lead").phase()).isEqualTo("DRAINING");
+        assertThat(first.poolState(POOL).orElseThrow().servingMembers()).isEqualTo(1);
+    }
+
+    @Test
+    void aLeadDoesNotSatisfyThePublicationFloor()
+    {
+        configureCanary("r-2", 1);
+        lead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        assertThatThrownBy(() -> first.openPublication(POOL, guard("op-lead-publication", "open"), "pub-lead", "org-1", "r-2", membership, PLAN_HASH))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_SERVING_FLOOR));
+    }
+
+    @Test
+    void canaryServingCountsActiveMembersOnTheCanaryRevision()
+    {
+        serving("i-1");
+        // A pool without a canary reports none, whatever its members run.
+        assertThat(first.poolState(POOL).orElseThrow().canaryServing()).isZero();
+        configureCanary("r-2", 1);
+        registerLead("lead-1", "r-2");
+        assertThat(first.poolState(POOL).orElseThrow().canaryServing()).isZero();
+        admit("lead-1", "r-2");
+        PoolStore.PoolState state = first.poolState(POOL).orElseThrow();
+        assertThat(state.canaryServing()).isEqualTo(1);
+        // It is information only: a healthy pool with a canary has no blocked reason.
+        assertThat(state.blocked()).isEmpty();
+        suspect("lead-1");
+        assertThat(first.poolState(POOL).orElseThrow().canaryServing()).isZero();
+    }
+
+    @Test
+    void leadsStayOutOfThePoolStateCounts()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        lead("lead-1", "r-2");
+        suspect("lead-1");
+        PoolStore.PoolState state = first.poolState(POOL).orElseThrow();
+        assertThat(state.servingMembers()).isEqualTo(1);
+        assertThat(state.liveMembers()).isEqualTo(1);
+        assertThat(state.counts().get("SUSPECT")).isZero();
+        assertThat(state.blocked()).doesNotContain("SUSPECT_MEMBER");
+        assertThat(state.leadInUse()).isEqualTo(1);
+    }
+
+    @Test
+    void theLeadFlagRoundTripsOnMemberState()
+    {
+        configureCanary("r-2", 1);
+        Member lead = registerLead("lead-1", "r-2");
+        Member ordinary = register("i-1");
+        assertThat(lead.lead()).isTrue();
+        assertThat(ordinary.lead()).isFalse();
+        assertThat(second.member(POOL, "lead-1").orElseThrow().lead()).isTrue();
+        assertThat(second.members(POOL)).extracting(Member::instanceId, Member::lead)
+                .containsExactlyInAnyOrder(tuple("lead-1", true), tuple("i-1", false));
+
+        Member replay = second.registerMember(POOL, guard("op-lead-1-register", "register"), registration("lead-1", "r-2", null, true));
+        assertThat(replay.replayed()).isTrue();
+        assertThat(replay.lead()).isTrue();
+        Member admitted = admit("lead-1", "r-2");
+        assertThat(admitted.lead()).isTrue();
+        assertThat(admitted.eligible()).isTrue();
+    }
+
+    @Test
+    void anActiveLeadMustAcknowledgeBeforeAPublicationCommits()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        // The lead runs the canary build, which is neither the main revision nor the publication target.
+        lead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        PoolStore.Publication opened = first.openPublication(POOL, guard("op-lead-pub", "open"), "pub-lead", "org-1", "rev-2", membership, PLAN_HASH);
+        assertThat(opened.requiredMembers()).containsExactly("i-1", "i-2", "i-3", "lead-1");
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-lead", instance, "rev-2");
+        }
+        assertThat(first.publication(POOL, "pub-lead").orElseThrow().missingMembers()).containsExactly("lead-1");
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-lead", guard("op-lead-pub", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_RECEIPTS_INCOMPLETE));
+        // A receipt depends on the process and the target, not on the member's configuration revision.
+        receiptFor("pub-lead", "lead-1", "rev-2");
+        assertThat(first.commitPublication(POOL, "pub-lead", guard("op-lead-pub", "commit"), membership).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    void aCanaryLeadCanJoinWhileAPublicationIsOpenAndIsAcknowledgedExplicitly()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        registerLead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-lead-pub", "open"), "pub-1", "org-1", "rev-2", membership, PLAN_HASH);
+
+        // The lead cannot carry the target revision, so the barrier lets it join without a receipt.
+        assertThat(admit("lead-1", "r-2").phase()).isEqualTo("ACTIVE");
+        assertThat(first.publication(POOL, "pub-1").orElseThrow().receipts()).extracting(PoolStore.PublicationReceipt::instanceId).doesNotContain("lead-1");
+        // The join changed the membership, so the open publication must be opened again, and the lead is listed as missing.
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-1", guard("op-lead-pub", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_MEMBERSHIP_CHANGED));
+        assertThat(first.publication(POOL, "pub-1").orElseThrow().missingMembers()).contains("lead-1");
+        first.abandonPublication(POOL, "pub-1", guard("op-lead-pub", "abandon"));
+
+        long reopened = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-lead-pub-2", "open"), "pub-2", "org-1", "rev-2", reopened, PLAN_HASH);
+        for (String instance : List.of("i-1", "i-2", "i-3", "lead-1")) {
+            receiptFor("pub-2", instance, "rev-2");
+        }
+        assertThat(first.commitPublication(POOL, "pub-2", guard("op-lead-pub-2", "commit"), reopened).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    void drainingALeadThatCannotAcknowledgeLetsTheReopenedPublicationCommitWithoutIt()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        lead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-recover-1", "open"), "pub-1", "org-1", "rev-2", membership, PLAN_HASH);
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-1", instance, "rev-2");
+        }
+        // The lead never acknowledges, so the publication waits.
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-1", guard("op-recover-1", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_RECEIPTS_INCOMPLETE));
+        assertThat(first.publication(POOL, "pub-1").orElseThrow().missingMembers()).containsExactly("lead-1");
+
+        // The operator drains the lead. The floor does not apply to a lead, and the membership change ends the attempt.
+        assertThat(drain(first, "lead-1", "drain-lead").phase()).isEqualTo("DRAINING");
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-1", guard("op-recover-1", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_MEMBERSHIP_CHANGED));
+        first.abandonPublication(POOL, "pub-1", guard("op-recover-1", "abandon"));
+
+        long reopened = first.poolState(POOL).orElseThrow().membershipGeneration();
+        PoolStore.Publication second = first.openPublication(POOL, guard("op-recover-2", "open"), "pub-2", "org-1", "rev-2", reopened, PLAN_HASH);
+        assertThat(second.requiredMembers()).containsExactly("i-1", "i-2", "i-3");
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-2", instance, "rev-2");
+        }
+        assertThat(first.commitPublication(POOL, "pub-2", guard("op-recover-2", "commit"), reopened).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    void aSuspectLeadDropsOutOfTheRequiredMembers()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        lead("lead-1", "r-2");
+        suspect("lead-1");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        PoolStore.Publication opened = first.openPublication(POOL, guard("op-suspect-pub", "open"), "pub-1", "org-1", "rev-2", membership, PLAN_HASH);
+        assertThat(opened.requiredMembers()).containsExactly("i-1", "i-2", "i-3");
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-1", instance, "rev-2");
+        }
+        assertThat(first.commitPublication(POOL, "pub-1", guard("op-suspect-pub", "commit"), membership).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    void drainingALeadWhileAPublicationIsOpenFailsTheCommit()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        lead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-lead-pub", "open"), "pub-lead", "org-1", "rev-1", membership, PLAN_HASH);
+        receiptFor("pub-lead", "i-1", "rev-1");
+        receiptFor("pub-lead", "lead-1", "rev-1");
+        drain(first, "lead-1", "drain-lead");
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-lead", guard("op-lead-pub", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_MEMBERSHIP_CHANGED));
+    }
+
+    @Test
+    void aStepResultRecordedBeforeLeadsExistedDecodesWithDefaults()
+    {
+        first.configurePool(POOL, guard("op-old-configure", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false), false);
+        first.registerMember(POOL, guard("op-old-register", "register"), registration("i-1"));
+        // The fields a replica from before the lead model did not record.
+        boolean stateHasFields = database.withHandle(handle -> handle.createQuery(
+                        "SELECT jsonb_exists(result, 'leadSurge') AND jsonb_exists(result, 'leadInUse') AND jsonb_exists(result, 'canaryServing') AND jsonb_exists(result, 'canaryRevision') FROM pool_operation WHERE operation_id = 'op-old-configure'")
+                .mapTo(Boolean.class).one());
+        boolean memberHasField = database.withHandle(handle -> handle.createQuery(
+                        "SELECT jsonb_exists(result, 'lead') FROM pool_operation WHERE operation_id = 'op-old-register'")
+                .mapTo(Boolean.class).one());
+        assertThat(stateHasFields).isTrue();
+        assertThat(memberHasField).isTrue();
+        database.useHandle(handle -> {
+            handle.execute("UPDATE pool_operation SET result = result - 'leadSurge' - 'leadInUse' - 'canaryServing' - 'canaryRevision' WHERE operation_id = 'op-old-configure'");
+            handle.execute("UPDATE pool_operation SET result = result - 'lead' WHERE operation_id = 'op-old-register'");
+        });
+
+        PoolStore.PoolState state = second.configurePool(POOL, guard("op-old-configure", "configure"), new PoolSpec("POOLED", 3, 3, 1, 1, "r-1", false), false);
+        assertThat(state.replayed()).isTrue();
+        assertThat(state.leadSurge()).isZero();
+        assertThat(state.leadInUse()).isZero();
+        assertThat(state.canaryServing()).isZero();
+        assertThat(state.canaryRevision()).isEmpty();
+        Member member = second.registerMember(POOL, guard("op-old-register", "register"), registration("i-1"));
+        assertThat(member.replayed()).isTrue();
+        assertThat(member.lead()).isFalse();
     }
 
     @Test
@@ -2056,7 +2483,7 @@ class TestPoolStore
         first.recordPublicationReceipt(
                 POOL,
                 publicationId,
-                guard("op-pub", "receipt-" + instanceId),
+                guard("op-" + publicationId, "receipt-" + instanceId),
                 instanceId,
                 "pod-" + instanceId,
                 "boot-" + instanceId,
@@ -2073,6 +2500,15 @@ class TestPoolStore
                 false);
     }
 
+    private void configureCanary(String canaryRevision, int leadSurge)
+    {
+        first.configurePool(
+                POOL,
+                guard("op-configure-canary-" + epoch + "-" + canaryRevision + "-" + leadSurge, "configure"),
+                new PoolSpec("POOLED", 1, 3, 1, 1, "r-1", false, leadSurge, canaryRevision),
+                false);
+    }
+
     private Guard guard(String operationId, String stepId)
     {
         return new Guard(operationId, stepId, epoch, PLAN_HASH);
@@ -2085,6 +2521,11 @@ class TestPoolStore
 
     private PoolStore.MemberRegistration registration(String instanceId, String configRevision, String repairFor)
     {
+        return registration(instanceId, configRevision, repairFor, false);
+    }
+
+    private PoolStore.MemberRegistration registration(String instanceId, String configRevision, String repairFor, boolean lead)
+    {
         return new PoolStore.MemberRegistration(
                 instanceId,
                 "backend-" + instanceId,
@@ -2095,7 +2536,8 @@ class TestPoolStore
                 configRevision,
                 repairFor,
                 "node-" + instanceId,
-                "coord-" + instanceId);
+                "coord-" + instanceId,
+                lead);
     }
 
     private ValidationReceipt receipt(String configRevision, String instanceId)
@@ -2120,6 +2562,20 @@ class TestPoolStore
     private Member register(String instanceId, String configRevision, String repairFor)
     {
         return first.registerMember(POOL, guard("op-" + instanceId + "-register", "register"), registration(instanceId, configRevision, repairFor));
+    }
+
+    private Member registerLead(String instanceId, String configRevision)
+    {
+        return first.registerMember(POOL, guard("op-" + instanceId + "-register", "register"), registration(instanceId, configRevision, null, true));
+    }
+
+    /**
+     * An active lead.
+     */
+    private Member lead(String instanceId, String configRevision)
+    {
+        registerLead(instanceId, configRevision);
+        return admit(instanceId, configRevision);
     }
 
     private Member admit(String instanceId)

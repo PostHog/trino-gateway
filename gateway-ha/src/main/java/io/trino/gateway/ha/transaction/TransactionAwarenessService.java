@@ -361,7 +361,10 @@ public class TransactionAwarenessService
             if (!pooled.pooled()) {
                 throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "The hostname's pool is not active");
             }
-            List<PoolStore.Candidate> candidates = candidates(group, pooled);
+            // A request pinned to a backend continues that backend's own work, a lead included. Any other
+            // auxiliary request follows the same lane as new statements.
+            boolean canary = pinnedBackend.isEmpty() && isCanaryRequest(pooled, request);
+            List<PoolStore.Candidate> candidates = candidates(group, pinnedBackend.isPresent() ? pooled : laneOf(pooled, canary));
             if (pinnedBackend.isPresent()) {
                 candidates.removeIf(candidate -> !sameAuthority(candidate.url(), pinnedBackend.orElseThrow()));
             }
@@ -374,6 +377,9 @@ public class TransactionAwarenessService
                 }
                 verifyProcess(backend, new Duration(config.getProcessInfoTimeoutMillis(), MILLISECONDS));
                 return destination(backend, withoutClientForwardedHeaders(request));
+            }
+            if (canary) {
+                throw canaryNotServing();
             }
             throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "No pool member is currently eligible");
         });
@@ -406,6 +412,28 @@ public class TransactionAwarenessService
     private static RoutingTargetResponse destination(BackendRef backend, HttpServletRequest request)
     {
         return new RoutingTargetResponse(new RoutingDestination(backend.routingGroup(), backend.url(), buildUriWithNewCluster(backend.url(), request), backend.externalUrl()), request);
+    }
+
+    /**
+     * Whether the request names a canary host while the pool has a canary build. Only the Host header
+     * counts: forwarded headers never do.
+     */
+    private boolean isCanaryRequest(PoolStore.PoolRouting pooled, HttpServletRequest request)
+    {
+        return !pooled.canaryRevision().isEmpty() && TenantPrincipals.isSingleLabelUnder(request, poolConfig.getCanaryHostDomains());
+    }
+
+    /**
+     * The members a request may use: the canary build for a canary request, otherwise the main pool.
+     */
+    private static PoolStore.PoolRouting laneOf(PoolStore.PoolRouting pooled, boolean canary)
+    {
+        return canary ? pooled.onRevision(pooled.canaryRevision()) : pooled.withoutLeads();
+    }
+
+    private static WebApplicationException canaryNotServing()
+    {
+        return classifiedRoutingError(503, "REVISION_NOT_SERVING", "No member runs the pool's canary build yet; the request was not dispatched");
     }
 
     private List<PoolStore.Candidate> candidates(String group, PoolStore.PoolRouting pooled)
@@ -473,8 +501,17 @@ public class TransactionAwarenessService
                 poolConfig.getHostQualificationDomains(),
                 Set.copyOf(poolConfig.getExcludedHostLabels())).orElse(null))
                 : null;
-        List<PoolStore.Candidate> eligible = candidates(group, pooled);
+        // A canary request names a host one label under a canary domain, and then runs only on the
+        // pool's canary build, leads included. It fails instead of falling back to another build: it
+        // must know its query ran on the canary. Every other request skips leads, which serve only
+        // canary requests. A pool without a canary treats a canary request like any other. Narrowing
+        // before candidates() orders only the members in scope.
+        boolean canary = isCanaryRequest(pooled, request);
+        List<PoolStore.Candidate> eligible = candidates(group, laneOf(pooled, canary));
         if (eligible.isEmpty()) {
+            if (canary) {
+                throw canaryNotServing();
+            }
             throw classifiedRoutingError(503, "ROUTING_STATE_NOT_ACTIVE", "No pool member is currently eligible to admit new work");
         }
         StoreException lastRejection = null;

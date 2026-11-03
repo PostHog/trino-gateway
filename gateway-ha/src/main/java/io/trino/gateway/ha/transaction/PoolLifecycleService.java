@@ -99,7 +99,9 @@ public class PoolLifecycleService
                         integer(body, "maxSurge"),
                         integer(body, "maxRepair"),
                         optionalText(body, "desiredRevision").orElse(""),
-                        body.path("tenantAdmissionEnabled").asBoolean(false)),
+                        body.path("tenantAdmissionEnabled").asBoolean(false),
+                        body.hasNonNull("leadSurge") ? integer(body, "leadSurge") : 0,
+                        optionalText(body, "canaryRevision").orElse("")),
                 config.hasVerifiedTenantIdentity()));
     }
 
@@ -182,7 +184,8 @@ public class PoolLifecycleService
                 text(body, "configRevision"),
                 optionalText(body, "repairFor").orElse(null),
                 info.path("nodeId").asText(),
-                info.path("coordinatorId").asText())));
+                info.path("coordinatorId").asText(),
+                optionalBoolean(body, "lead"))));
     }
 
     /**
@@ -483,6 +486,18 @@ public class PoolLifecycleService
     {
         JsonNode value = body.path(field);
         return value.isTextual() && !value.asText().isEmpty() ? Optional.of(value.asText()) : Optional.empty();
+    }
+
+    private static boolean optionalBoolean(JsonNode body, String field)
+    {
+        JsonNode value = body.path(field);
+        if (value.isMissingNode() || value.isNull()) {
+            return false;
+        }
+        if (!value.isBoolean()) {
+            throw poolError(400, "POOL_VALIDATION", "Field '" + field + "' must be a boolean");
+        }
+        return value.asBoolean();
     }
 
     private static int integer(JsonNode body, String field)

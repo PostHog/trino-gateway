@@ -13,7 +13,10 @@
  */
 package io.trino.gateway.ha.config;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
+import java.util.regex.Pattern;
 
 /**
  * Configuration for the required pooled member lifecycle.
@@ -34,10 +37,13 @@ public class PoolLifecycleConfiguration
 
     public static final List<String> TENANT_IDENTITY_SOURCES = List.of(TENANT_IDENTITY_NONE, TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
 
+    private static final Pattern CANARY_DOMAIN = Pattern.compile("[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*");
+
     private boolean enabled;
     private String tenantIdentitySource = TENANT_IDENTITY_NONE;
     private List<String> hostQualificationDomains = List.of();
     private List<String> excludedHostLabels = List.of();
+    private List<String> canaryHostDomains = List.of();
     private int maxPreDispatchCandidates = 3;
     private int certificateFreshnessSeconds = 300;
     private int operationRetentionDays = 30;
@@ -101,6 +107,22 @@ public class PoolLifecycleConfiguration
         this.excludedHostLabels = excludedHostLabels == null ? List.of() : List.copyOf(excludedHostLabels);
     }
 
+    /**
+     * Domains of the canary lane. A request whose Host is exactly one DNS label under one of them is a
+     * canary request, and runs on the pool's canary build when the pool has one. The label only marks
+     * the request: a pool is still chosen by an exact {@code hostnameToPool} entry, so those entries are
+     * the allowlist, and {@code hostnameSuffixToPool} must not cover a canary domain.
+     */
+    public List<String> getCanaryHostDomains()
+    {
+        return canaryHostDomains;
+    }
+
+    public void setCanaryHostDomains(List<String> canaryHostDomains)
+    {
+        this.canaryHostDomains = canaryHostDomains == null ? List.of() : List.copyOf(canaryHostDomains);
+    }
+
     public int getMaxPreDispatchCandidates()
     {
         return maxPreDispatchCandidates;
@@ -150,6 +172,28 @@ public class PoolLifecycleConfiguration
         this.forwardedProtoHttps = forwardedProtoHttps;
     }
 
+    /**
+     * A suffix mapping for a canary domain would send every host under it to the pool, so any client
+     * could reach the canary build by naming such a host. Only exact host entries are an allowlist.
+     */
+    public void validateHostnameSuffixes(Collection<String> hostnameSuffixes)
+    {
+        if (!enabled) {
+            return;
+        }
+        for (String suffix : hostnameSuffixes) {
+            if (canaryHostDomains.contains(normalizedDomain(suffix))) {
+                throw new IllegalArgumentException("hostnameSuffixToPool must not map a canary host domain; list each canary host in hostnameToPool instead");
+            }
+        }
+    }
+
+    private static String normalizedDomain(String domain)
+    {
+        String normalized = domain.trim().toLowerCase(Locale.ENGLISH);
+        return normalized.endsWith(".") ? normalized.substring(0, normalized.length() - 1) : normalized;
+    }
+
     public void validate(boolean transactionAwarenessEnabled, boolean forwardedHeadersEnabled)
     {
         if (!enabled) {
@@ -179,6 +223,17 @@ public class PoolLifecycleConfiguration
                     throw new IllegalArgumentException("hostQualificationDomains must contain absolute domains, "
                             + "so the restriction keys on the same principal the coordinator authenticates");
                 }
+            }
+        }
+        for (String domain : canaryHostDomains) {
+            if (domain == null || !CANARY_DOMAIN.matcher(domain).matches() || domain.length() > 253) {
+                throw new IllegalArgumentException("canaryHostDomains must contain lowercase DNS names without a port, a wildcard or a trailing dot");
+            }
+            // The coordinator and the Gateway qualify a user by the host label under these domains. A canary
+            // host outside them would qualify the same user differently than the principal that is checked.
+            if (hasVerifiedTenantIdentity() && hostQualificationDomains.stream().map(PoolLifecycleConfiguration::normalizedDomain).noneMatch(domain::equals)) {
+                throw new IllegalArgumentException("Every canaryHostDomains entry must also be in hostQualificationDomains when a tenant identity source is set, "
+                        + "so a canary host qualifies a user as the coordinator does");
             }
         }
         if (maxPreDispatchCandidates < 1 || maxPreDispatchCandidates > 10) {

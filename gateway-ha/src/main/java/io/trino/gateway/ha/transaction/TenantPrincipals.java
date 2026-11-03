@@ -89,6 +89,16 @@ public final class TenantPrincipals
                 .map(label -> label + "." + user);
     }
 
+    /**
+     * Whether the routed host is exactly one DNS label under one of the domains. {@code acme.canary.example.test}
+     * is under {@code canary.example.test}; the domain itself and a name with more labels are not. Port, case
+     * and a root-zone trailing dot are normalized as for host qualification.
+     */
+    public static boolean isSingleLabelUnder(HttpServletRequest request, List<String> domains)
+    {
+        return requestHost(request).flatMap(host -> tenantLabel(host, domains, Set.of())).isPresent();
+    }
+
     private static Optional<String> tenantLabel(String host, List<String> domains, Set<String> excludedHostLabels)
     {
         Set<String> excluded = excludedHostLabels == null

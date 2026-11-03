@@ -88,6 +88,7 @@ class TestPoolResourceHttp
     private JdbcDatabaseContainer<?> container;
     private HttpServer coordinator;
     private HttpServer secondCoordinator;
+    private HttpServer leadCoordinator;
     private Injector injector;
     private URI gateway;
     private HttpClient client;
@@ -135,6 +136,16 @@ class TestPoolResourceHttp
             exchange.close();
         });
         secondCoordinator.start();
+        leadCoordinator = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        leadCoordinator.createContext("/v1/info", exchange -> {
+            byte[] body = "{\"coordinator\":true,\"starting\":false,\"nodeId\":\"pool-http-node-3\",\"coordinatorId\":\"klmno\"}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_OK, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        leadCoordinator.start();
 
         HaGatewayConfiguration configuration = new HaGatewayConfiguration();
         DataStoreConfiguration database = new DataStoreConfiguration();
@@ -200,6 +211,9 @@ class TestPoolResourceHttp
         if (secondCoordinator != null) {
             secondCoordinator.stop(0);
         }
+        if (leadCoordinator != null) {
+            leadCoordinator.stop(0);
+        }
         try {
             if (schemaCreated) {
                 admin.useHandle(handle -> handle.execute("DROP SCHEMA " + schema + " CASCADE"));
@@ -230,6 +244,126 @@ class TestPoolResourceHttp
         HttpResponse<String> response = get("/gateway/v1/pools/no-such-pool");
         assertThat(response.statusCode()).isEqualTo(404);
         assertThat(response.headers().firstValue("X-Trino-Gateway-Error")).contains("POOL_NOT_FOUND");
+    }
+
+    @Test
+    void leadSurgeAndCanaryRevisionRoundTripOverHttpAndDefaultWhenOmitted()
+            throws Exception
+    {
+        JsonNode configured = body(put(BASE,
+                """
+                {"operationId":"op-pin-1","stepId":"configure","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "apiMode":"POOLED","minServing":1,"desiredMembers":3,"maxSurge":1,"maxRepair":1,
+                 "desiredRevision":"r-1","leadSurge":2,"canaryRevision":"r-2"}
+                """));
+        assertThat(configured.path("leadSurge").asInt()).isEqualTo(2);
+        assertThat(configured.path("canaryRevision").asText()).isEqualTo("r-2");
+        JsonNode read = body(get(BASE));
+        assertThat(read.path("leadSurge").asInt()).isEqualTo(2);
+        assertThat(read.path("canaryRevision").asText()).isEqualTo("r-2");
+
+        // The pool state always carries both fields, and omitting them in the request means none.
+        JsonNode omitted = body(put(BASE,
+                """
+                {"operationId":"op-pin-2","stepId":"configure","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "apiMode":"POOLED","minServing":1,"desiredMembers":3,"maxSurge":1,"maxRepair":1,"desiredRevision":"r-1"}
+                """));
+        assertThat(fieldNames(omitted)).contains("leadSurge", "canaryRevision", "leadInUse", "canaryServing");
+        assertThat(omitted.path("leadSurge").asInt()).isZero();
+        assertThat(omitted.path("canaryRevision").isTextual()).isTrue();
+        assertThat(omitted.path("canaryRevision").asText()).isEmpty();
+
+        List<String> invalid = List.of(
+                "\"leadSurge\":-1",
+                "\"leadSurge\":\"1\"",
+                "\"canaryRevision\":\"" + "r".repeat(129) + "\"");
+        for (int index = 0; index < invalid.size(); index++) {
+            HttpResponse<String> rejected = put(BASE,
+                    """
+                    {"operationId":"op-pin-invalid-%d","stepId":"configure","controllerEpoch":1,"ownerIdentity":"controller-a",
+                     "apiMode":"POOLED","minServing":1,"desiredMembers":3,"maxSurge":1,"maxRepair":1,"desiredRevision":"r-1",%s}
+                    """.formatted(index, invalid.get(index)));
+            assertThat(rejected.statusCode()).describedAs(invalid.get(index)).isEqualTo(400);
+            assertThat(rejected.headers().firstValue("X-Trino-Gateway-Error")).describedAs(invalid.get(index)).contains("POOL_VALIDATION");
+        }
+    }
+
+    @Test
+    void aLeadMemberRoundTripsOverHttp()
+            throws Exception
+    {
+        put(BASE,
+                """
+                {"operationId":"op-lead-0","stepId":"configure","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "apiMode":"POOLED","minServing":1,"desiredMembers":3,"maxSurge":1,"maxRepair":1,
+                 "desiredRevision":"r-1","leadSurge":1,"canaryRevision":"r-2"}
+                """);
+        ProxyBackendConfiguration backend = new ProxyBackendConfiguration();
+        backend.setName("pool-http-i-lead");
+        backend.setProxyTo("http://127.0.0.1:" + leadCoordinator.getAddress().getPort());
+        backend.setRoutingGroup(POOL);
+        backend.setActive(false);
+        injector.getInstance(GatewayBackendManager.class).addBackend(backend);
+
+        JsonNode lead = body(post(BASE + "/members",
+                """
+                {"operationId":"op-lead-1","stepId":"register","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "instanceId":"i-lead","backendName":"pool-http-i-lead","podUid":"pod-lead","bootId":"boot-lead",
+                 "configRevision":"r-2","lead":true}
+                """));
+        assertThat(lead.path("lead").asBoolean()).isTrue();
+        assertThat(lead.path("phase").asText()).isEqualTo("PREPARING");
+        assertThat(body(get(BASE + "/members/i-lead")).path("lead").asBoolean()).isTrue();
+        assertThat(body(get(BASE)).path("leadInUse").asInt()).isEqualTo(1);
+
+        // A member registered without the field is not a lead.
+        JsonNode members = body(get(BASE + "/members"));
+        assertThat(members).filteredOn(entry -> !entry.path("instanceId").asText().equals("i-lead"))
+                .allSatisfy(entry -> assertThat(entry.path("lead").asBoolean(true)).isFalse());
+
+        // The only lead slot is taken, so the budget error carries the code the controller maps.
+        HttpResponse<String> second = post(BASE + "/members",
+                """
+                {"operationId":"op-lead-2","stepId":"register","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "instanceId":"i-lead-2","backendName":"pool-http-i-lead","podUid":"pod-lead-2","bootId":"boot-lead-2",
+                 "configRevision":"r-2","lead":true}
+                """);
+        assertThat(second.statusCode()).isEqualTo(409);
+        assertThat(second.headers().firstValue("X-Trino-Gateway-Error")).contains("POOL_SURGE_BUDGET");
+
+        HttpResponse<String> repair = post(BASE + "/members",
+                """
+                {"operationId":"op-lead-3","stepId":"register","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "instanceId":"i-lead-3","backendName":"pool-http-i-lead","podUid":"pod-lead-3","bootId":"boot-lead-3",
+                 "configRevision":"r-2","lead":true,"repairFor":"i-lead"}
+                """);
+        assertThat(repair.statusCode()).isEqualTo(400);
+        assertThat(repair.headers().firstValue("X-Trino-Gateway-Error")).contains("POOL_VALIDATION");
+
+        HttpResponse<String> wrongBuild = post(BASE + "/members",
+                """
+                {"operationId":"op-lead-6","stepId":"register","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "instanceId":"i-lead-6","backendName":"pool-http-i-lead","podUid":"pod-lead-6","bootId":"boot-lead-6",
+                 "configRevision":"r-1","lead":true}
+                """);
+        assertThat(wrongBuild.statusCode()).isEqualTo(400);
+        assertThat(wrongBuild.headers().firstValue("X-Trino-Gateway-Error")).contains("POOL_VALIDATION");
+
+        HttpResponse<String> notBoolean = post(BASE + "/members",
+                """
+                {"operationId":"op-lead-4","stepId":"register","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "instanceId":"i-lead-4","backendName":"pool-http-i-lead","podUid":"pod-lead-4","bootId":"boot-lead-4",
+                 "configRevision":"r-1","lead":"yes"}
+                """);
+        assertThat(notBoolean.statusCode()).isEqualTo(400);
+        assertThat(notBoolean.headers().firstValue("X-Trino-Gateway-Error")).contains("POOL_VALIDATION");
+
+        // Later tests configure their own pool, so close the lead slots again.
+        body(put(BASE,
+                """
+                {"operationId":"op-lead-5","stepId":"configure","controllerEpoch":1,"ownerIdentity":"controller-a",
+                 "apiMode":"POOLED","minServing":1,"desiredMembers":3,"maxSurge":1,"maxRepair":1,"desiredRevision":"r-1"}
+                """));
     }
 
     @Test

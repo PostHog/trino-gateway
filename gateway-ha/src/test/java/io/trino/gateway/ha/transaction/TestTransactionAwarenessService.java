@@ -112,7 +112,7 @@ class TestTransactionAwarenessService
         store = construction.constructed().getFirst();
         pools = poolConstruction.constructed().getFirst();
         when(selector.findRoutingDestination(any())).thenReturn(new RoutingSelectorResponse("group"));
-        when(pools.routing("group")).thenReturn(new PoolStore.PoolRouting(true, List.of(new PoolStore.Candidate("blue", BACKEND.incarnation(), "blue", BACKEND.url()))));
+        when(pools.routing("group")).thenReturn(new PoolStore.PoolRouting(true, List.of(new PoolStore.Candidate("blue", BACKEND.incarnation(), "blue", BACKEND.url(), "r-1", false)), ""));
         io.trino.gateway.ha.config.ProxyBackendConfiguration backend = new io.trino.gateway.ha.config.ProxyBackendConfiguration();
         backend.setName("blue");
         backend.setRoutingGroup("group");

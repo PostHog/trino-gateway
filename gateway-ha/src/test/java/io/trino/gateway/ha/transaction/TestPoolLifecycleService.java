@@ -160,6 +160,52 @@ class TestPoolLifecycleService
     }
 
     @Test
+    void canaryHostDomainsMustBeLowercaseDnsNamesAndNeverASuffixMapping()
+    {
+        PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+        pool.setEnabled(true);
+        assertThat(pool.getCanaryHostDomains()).isEmpty();
+        pool.setCanaryHostDomains(List.of("canary.example.test"));
+        pool.validate(true, true);
+        for (String invalid : List.of("*.example.test", "canary.example.test:8443", "Canary.example.test", "canary.example.test.", ".example.test", "")) {
+            pool.setCanaryHostDomains(List.of(invalid));
+            assertThatThrownBy(() -> pool.validate(true, true))
+                    .describedAs(invalid)
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("canaryHostDomains");
+        }
+        // A suffix mapping for the canary domain would let any client name a canary host.
+        pool.setCanaryHostDomains(List.of("canary.example.test"));
+        pool.validateHostnameSuffixes(List.of("example.test", "other.canary.example.test"));
+        assertThatThrownBy(() -> pool.validateHostnameSuffixes(List.of("Canary.Example.Test.")))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("hostnameSuffixToPool");
+        configuration.getRouting().setHostnameSuffixToPool(Map.of("canary.example.test", "pool-one"));
+        configuration.getTransactionAwareness().setPool(pool);
+        assertThatThrownBy(configuration::validate)
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("hostnameSuffixToPool");
+    }
+
+    @Test
+    void everyCanaryDomainMustQualifyUsersWhenATenantIdentitySourceIsSet()
+    {
+        PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
+        pool.setEnabled(true);
+        pool.setCanaryHostDomains(List.of("canary.example.test"));
+        // Without a tenant identity source nothing qualifies users, so the list may stay as it is.
+        pool.setHostQualificationDomains(List.of("example.test"));
+        pool.validate(true, true);
+
+        pool.setTenantIdentitySource(PoolLifecycleConfiguration.TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
+        assertThatThrownBy(() -> pool.validate(true, true))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("hostQualificationDomains");
+        pool.setHostQualificationDomains(List.of("example.test", "Canary.Example.Test"));
+        pool.validate(true, true);
+    }
+
+    @Test
     void aTenantPrincipalRestrictionIsRefusedWhenForwardedHeadersAreDisabled()
     {
         PoolLifecycleConfiguration pool = new PoolLifecycleConfiguration();
