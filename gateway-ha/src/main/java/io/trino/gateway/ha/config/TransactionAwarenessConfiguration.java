@@ -15,6 +15,8 @@ package io.trino.gateway.ha.config;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 
+import java.util.Set;
+
 import static com.fasterxml.jackson.annotation.JsonProperty.Access.WRITE_ONLY;
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -183,6 +185,7 @@ public class TransactionAwarenessConfiguration
     public void validate(DataStoreConfiguration dataStore, RoutingConfiguration routing)
     {
         pool.validate(enabled, routing == null || routing.isForwardedHeadersEnabled());
+        pool.validateHostnameSuffixes(routing == null ? Set.of() : routing.getHostnameSuffixToPool().keySet());
         if (!enabled) {
             return;
         }

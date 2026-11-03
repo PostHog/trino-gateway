@@ -174,6 +174,11 @@ public final class PoolStore
         }
     }
 
+    /**
+     * @param leadSurge number of lead slots: members of the canary revision that serve only canary
+     *         requests and sit outside {@code maxSurge} and every other main-pool count
+     * @param canaryRevision the extra build that leads run, or empty when the pool has no canary
+     */
     public record PoolSpec(
             String apiMode,
             int minServing,
@@ -181,7 +186,15 @@ public final class PoolStore
             int maxSurge,
             int maxRepair,
             String desiredRevision,
-            boolean tenantAdmissionEnabled) {}
+            boolean tenantAdmissionEnabled,
+            int leadSurge,
+            String canaryRevision)
+    {
+        public PoolSpec(String apiMode, int minServing, int desiredMembers, int maxSurge, int maxRepair, String desiredRevision, boolean tenantAdmissionEnabled)
+        {
+            this(apiMode, minServing, desiredMembers, maxSurge, maxRepair, desiredRevision, tenantAdmissionEnabled, 0, "");
+        }
+    }
 
     @JsonInclude(JsonInclude.Include.ALWAYS)
     public record PoolState(
@@ -193,18 +206,29 @@ public final class PoolStore
             int minServing,
             int desiredMembers,
             int maxSurge,
+            int leadSurge,
             int maxRepair,
             String desiredRevision,
             String admittedRevision,
             boolean tenantAdmissionEnabled,
+            String canaryRevision,
             Map<String, Long> counts,
             long servingMembers,
             long liveMembers,
             long surgeInUse,
             long repairInUse,
+            long leadInUse,
+            long canaryServing,
             long openPublications,
             List<String> blocked,
-            boolean replayed) {}
+            boolean replayed)
+    {
+        public PoolState
+        {
+            // Tolerates a recorded step result that has no such field.
+            canaryRevision = canaryRevision == null ? "" : canaryRevision;
+        }
+    }
 
     public record MemberRegistration(
             String instanceId,
@@ -216,7 +240,24 @@ public final class PoolStore
             String configRevision,
             @Nullable String repairFor,
             String nodeId,
-            String coordinatorId) {}
+            String coordinatorId,
+            boolean lead)
+    {
+        public MemberRegistration(
+                String instanceId,
+                String backendName,
+                String url,
+                String externalUrl,
+                String podUid,
+                String bootId,
+                String configRevision,
+                @Nullable String repairFor,
+                String nodeId,
+                String coordinatorId)
+        {
+            this(instanceId, backendName, url, externalUrl, podUid, bootId, configRevision, repairFor, nodeId, coordinatorId, false);
+        }
+    }
 
     /**
      * Operator-performed candidate validation receipt. The Gateway records it; it does not perform these checks.
@@ -259,6 +300,7 @@ public final class PoolStore
             @Nullable String authRevision,
             boolean repair,
             @Nullable String repairFor,
+            boolean lead,
             @Nullable String retirementKind,
             long pendingRequests,
             long openTransactions,
@@ -363,7 +405,7 @@ public final class PoolStore
     /**
      * An eligible routing candidate: ACTIVE in the authoritative store.
      */
-    public record Candidate(String backendName, UUID incarnation, String instanceId, String url) {}
+    public record Candidate(String backendName, UUID incarnation, String instanceId, String url, String configRevision, boolean lead) {}
 
     // ------------------------------------------------------------------------------------------------
     // Pool configuration
@@ -380,8 +422,10 @@ public final class PoolStore
         check(spec.minServing() >= 1 && spec.minServing() <= 1000, POOL_VALIDATION, "minServing must be between 1 and 1000");
         check(spec.desiredMembers() >= 1 && spec.desiredMembers() <= 1000, POOL_VALIDATION, "desiredMembers must be between 1 and 1000");
         check(spec.maxSurge() >= 0 && spec.maxSurge() <= 100, POOL_VALIDATION, "maxSurge must be between 0 and 100");
+        check(spec.leadSurge() >= 0 && spec.leadSurge() <= 100, POOL_VALIDATION, "leadSurge must be between 0 and 100");
         check(spec.maxRepair() >= 0 && spec.maxRepair() <= 100, POOL_VALIDATION, "maxRepair must be between 0 and 100");
         validateRevision(spec.desiredRevision(), "desiredRevision");
+        validateRevision(spec.canaryRevision(), "canaryRevision");
         check(!spec.tenantAdmissionEnabled() || verifiedTenantIdentityAvailable,
                 TENANT_IDENTITY_UNVERIFIED,
                 "Tenant admission requires a configured verified tenant identity source");
@@ -406,15 +450,18 @@ public final class PoolStore
             handle.createUpdate(
                             """
                             UPDATE pool SET epoch = :epoch, api_mode = :mode, min_serving = :minServing,
-                              desired_members = :desired, max_surge = :surge, max_repair = :repair,
+                              desired_members = :desired, max_surge = :surge, lead_surge = :leadSurge, max_repair = :repair,
                               desired_revision = :revision, tenant_admission_enabled = :tenantAdmission,
+                              canary_revision = :canaryRevision,
                               owner_identity = coalesce(:owner, owner_identity)
                             WHERE pool_id = :id
                             """)
                     .bind("owner", guard.ownerIdentity())
                     .bind("epoch", guard.controllerEpoch()).bind("mode", spec.apiMode()).bind("minServing", spec.minServing())
-                    .bind("desired", spec.desiredMembers()).bind("surge", spec.maxSurge()).bind("repair", spec.maxRepair())
+                    .bind("desired", spec.desiredMembers()).bind("surge", spec.maxSurge()).bind("leadSurge", spec.leadSurge())
+                    .bind("repair", spec.maxRepair())
                     .bind("revision", spec.desiredRevision()).bind("tenantAdmission", spec.tenantAdmissionEnabled())
+                    .bind("canaryRevision", spec.canaryRevision())
                     .bind("id", poolId).execute();
             PoolState state = poolState(handle, poolId);
             recordStep(handle, poolId, guard, state);
@@ -450,16 +497,35 @@ public final class PoolStore
             validateInstanceId(registration.repairFor());
             check(!registration.repairFor().equals(registration.instanceId()), POOL_VALIDATION, "repairFor must name another instance");
         }
+        check(!registration.lead() || registration.repairFor() == null, POOL_VALIDATION, "A lead member cannot be a repair");
         String url = trimSlashes(registration.url());
         String externalUrl = registration.externalUrl() == null || registration.externalUrl().isBlank() ? url : trimSlashes(registration.externalUrl());
         return inPool(poolId, guard, Member.class, (handle, pool) -> {
             requirePooled(pool);
             boolean repair = registration.repairFor() != null;
-            if (repair) {
+            // Only a lead may run the canary build, or canary requests and ordinary requests would share it.
+            // A canary revision that has become the desired revision is a normal revision again.
+            check(registration.lead()
+                            || pool.canaryRevision.isEmpty()
+                            || !registration.configRevision().equals(pool.canaryRevision)
+                            || pool.canaryRevision.equals(pool.desiredRevision),
+                    POOL_VALIDATION,
+                    "A main member cannot run the canary revision; register it with lead:true");
+            if (registration.lead()) {
+                // A lead has its own budget and takes no main-pool slot. It must carry the canary build it
+                // exists to serve, so it cannot be registered while the pool has no canary or for another build.
+                check(pool.leadSurge > 0, POOL_VALIDATION, "The pool has no lead slots; leadSurge is 0");
+                check(!pool.canaryRevision.isEmpty(), POOL_VALIDATION, "The pool has no canary revision; canaryRevision is empty");
+                check(registration.configRevision().equals(pool.canaryRevision), POOL_VALIDATION, "A lead must run the pool's canary revision");
+                check(countLeads(handle, poolId) < pool.leadSurge, POOL_SURGE_BUDGET, "Registering this lead would exceed the pool lead budget");
+            }
+            else if (repair) {
                 Row target = memberRow(handle, poolId, registration.repairFor())
                         .orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "The repaired instance is not a member of this pool"));
+                // A lead holds no main-pool capacity to restore, and a repair is exempt from the surge budget.
+                check(!target.lead, POOL_REPAIR_BUDGET, "A lead member is not repaired; register a new lead instead");
                 boolean departing = Set.of("DRAINING", "SEALED", "RETIRING", "RETIRED").contains(target.state);
-                boolean capacityDeficit = departing && countMembers(handle, poolId, Set.of("ACTIVE", "PREPARING")) < Math.max(pool.desiredMembers, pool.minServing);
+                boolean capacityDeficit = departing && countMainMembers(handle, poolId, Set.of("ACTIVE", "PREPARING")) < Math.max(pool.desiredMembers, pool.minServing);
                 check(Set.of("SUSPECT", "LOST").contains(target.state) || "FAILED".equals(target.retirementKind) || capacityDeficit,
                         POOL_REPAIR_BUDGET,
                         "Repair requires a failed member or a departing member with unreserved serving capacity missing");
@@ -476,7 +542,7 @@ public final class PoolStore
                         "This member already has a live repair replacement");
             }
             else {
-                long live = countMembers(handle, poolId, LIVE_PHASES) - countRepair(handle, poolId);
+                long live = countMainMembers(handle, poolId, LIVE_PHASES) - countRepair(handle, poolId);
                 check(live + 1 <= (long) Math.max(pool.desiredMembers, pool.minServing) + pool.maxSurge,
                         POOL_SURGE_BUDGET,
                         "Registering this member would exceed the pool surge budget");
@@ -486,16 +552,16 @@ public final class PoolStore
             int inserted = handle.createUpdate(
                             """
                             INSERT INTO transaction_backend (incarnation, name, current_name, backend_url, external_url, routing_group,
-                                node_id, coordinator_id, state, pool_id, instance_id, pod_uid, boot_id, config_revision, repair, repair_for)
+                                node_id, coordinator_id, state, pool_id, instance_id, pod_uid, boot_id, config_revision, repair, repair_for, lead)
                             VALUES (:incarnation, :name, :name, :url, :external, :group, :node, :coordinator, 'PREPARING',
-                                :pool, :instance, :pod, :boot, :revision, :repair, :repairFor)
+                                :pool, :instance, :pod, :boot, :revision, :repair, :repairFor, :lead)
                             ON CONFLICT DO NOTHING
                             """)
                     .bind("incarnation", incarnation).bind("name", registration.backendName()).bind("url", url).bind("external", externalUrl)
                     .bind("group", poolId).bind("node", registration.nodeId()).bind("coordinator", registration.coordinatorId())
                     .bind("pool", poolId).bind("instance", registration.instanceId()).bind("pod", registration.podUid())
                     .bind("boot", registration.bootId()).bind("revision", registration.configRevision())
-                    .bind("repair", repair).bind("repairFor", registration.repairFor())
+                    .bind("repair", repair).bind("repairFor", registration.repairFor()).bind("lead", registration.lead())
                     .execute();
             check(inserted == 1, POOL_IDENTITY_CONFLICT, "The member name, endpoint or process identity already has another identity");
             return member(handle, poolId, registration.instanceId(), pool);
@@ -539,10 +605,12 @@ public final class PoolStore
                     POOL_NOT_CERTIFIED,
                     "The receipt applies to a different configuration revision");
             Optional<Row> barrier = openPublicationRow(handle, poolId);
-            if (barrier.isPresent()) {
-                check(receipt.configRevision().equals(barrier.orElseThrow().targetRevision),
-                        POOL_PUBLICATION_BARRIER,
-                        "A member joining during a publication must acknowledge its target revision");
+            boolean joinsAtTarget = barrier.isPresent() && receipt.configRevision().equals(barrier.orElseThrow().targetRevision);
+            // A lead runs the canary build, so its configuration revision differs from a publication's
+            // target by design. It may join during the barrier, but its join is then no receipt: it stays
+            // listed as missing until the controller acknowledges for it.
+            if (barrier.isPresent() && !row.lead) {
+                check(joinsAtTarget, POOL_PUBLICATION_BARRIER, "A member joining during a publication must acknowledge its target revision");
             }
             // Freshness: a receipt already recorded for this incarnation and revision keeps its original
             // issue time, so an admission retried long after validation is refused rather than accepted
@@ -583,7 +651,7 @@ public final class PoolStore
                             WHERE incarnation = :incarnation
                             """)
                     .bind("revision", receipt.configRevision()).bind("auth", receipt.authRevision()).bind("incarnation", row.incarnation).execute();
-            if (barrier.isPresent()) {
+            if (joinsAtTarget) {
                 // A join during the barrier is itself a receipt, so it can never escape the barrier silently.
                 insertPublicationReceipt(
                         handle,
@@ -604,7 +672,8 @@ public final class PoolStore
      * recovered).
      * <p>
      * A planned drain spends serving capacity, so it is refused when it would take the pool below its
-     * minimum serving floor. A suspect drain spends none — a suspected member was already excluded
+     * minimum serving floor. A lead holds no main-pool capacity, so the floor neither gates its drain nor
+     * counts it, and a superseded lead can always be drained at once. A suspect drain spends none — a suspected member was already excluded
      * from the serving set and from new independent admissions — so the floor does not gate it and the
      * active count is not decremented on its behalf. Refusing it against the floor would block exactly
      * the cleanup a degraded pool needs.
@@ -624,8 +693,8 @@ public final class PoolStore
             check(!IRREVERSIBLE_PHASES.contains(row.state), POOL_IRREVERSIBLE, "A retiring or retired member cannot be drained");
             check(Set.of("ACTIVE", "SUSPECT").contains(row.state), POOL_PHASE, "Only an active or suspect member can be drained");
             boolean wasServing = row.state.equals("ACTIVE");
-            if (wasServing) {
-                long active = countMembers(handle, poolId, Set.of("ACTIVE"));
+            if (wasServing && !row.lead) {
+                long active = countMainMembers(handle, poolId, Set.of("ACTIVE"));
                 check(active - 1 >= pool.minServing, POOL_SERVING_FLOOR, "A planned drain cannot take the pool below its minimum serving count");
             }
             handle.createUpdate("UPDATE transaction_backend SET state = 'DRAINING', generation = generation + 1 WHERE incarnation = :id")
@@ -897,7 +966,7 @@ public final class PoolStore
             requirePooled(pool);
             check(pool.membershipGeneration == expectedMembershipGeneration, POOL_MEMBERSHIP_CHANGED, "The pool membership generation changed");
             List<String> required = activeInstanceIds(handle, poolId);
-            check(required.size() >= pool.minServing, POOL_SERVING_FLOOR, "A publication requires at least the minimum serving membership");
+            check(countMainMembers(handle, poolId, Set.of("ACTIVE")) >= pool.minServing, POOL_SERVING_FLOOR, "A publication requires at least the minimum serving membership");
             Optional<Row> existing = publicationRow(handle, publicationId);
             if (existing.isPresent()) {
                 Row row = existing.orElseThrow();
@@ -968,8 +1037,7 @@ public final class PoolStore
             check(pool.membershipGeneration == expectedMembershipGeneration && publication.membershipGeneration == expectedMembershipGeneration,
                     POOL_MEMBERSHIP_CHANGED,
                     "The pool membership generation changed during the publication");
-            List<String> active = activeInstanceIds(handle, poolId);
-            check(active.size() >= pool.minServing, POOL_SERVING_FLOOR, "The admitting membership fell below the minimum serving count");
+            check(countMainMembers(handle, poolId, Set.of("ACTIVE")) >= pool.minServing, POOL_SERVING_FLOOR, "The admitting membership fell below the minimum serving count");
             List<String> missing = missingMembers(handle, poolId, publicationId);
             check(missing.isEmpty(), POOL_RECEIPTS_INCOMPLETE, "Every active member must acknowledge the final revision");
             handle.createUpdate("UPDATE pool_publication SET phase = 'ADMITTED' WHERE publication_id = :id").bind("id", publicationId).execute();
@@ -1203,16 +1271,20 @@ public final class PoolStore
         return jdbi.withHandle(handle -> {
             List<Candidate> candidates = new ArrayList<>();
             boolean[] pooled = {false};
+            String[] canaryRevision = {""};
             handle.createQuery(
                             """
-                            SELECT p.api_mode, b.current_name, b.incarnation, b.instance_id, b.backend_url
+                            SELECT p.api_mode, p.canary_revision,
+                              b.current_name, b.incarnation, b.instance_id, b.backend_url, b.config_revision, b.lead
                             FROM pool p
                             LEFT JOIN transaction_backend b
                               ON b.pool_id = p.pool_id AND b.state = 'ACTIVE' AND b.current_name IS NOT NULL
                             WHERE p.pool_id = :pool
                             """).bind("pool", poolId)
                     .map((rs, _) -> {
+                        // Every row repeats the pool columns.
                         pooled[0] = "POOLED".equals(rs.getString("api_mode"));
+                        canaryRevision[0] = rs.getString("canary_revision");
                         String name = rs.getString("current_name");
                         return name == null
                                 ? Optional.<Candidate>empty()
@@ -1220,17 +1292,40 @@ public final class PoolStore
                                 name,
                                 rs.getObject("incarnation", UUID.class),
                                 rs.getString("instance_id"),
-                                rs.getString("backend_url")));
+                                rs.getString("backend_url"),
+                                Objects.requireNonNullElse(rs.getString("config_revision"), ""),
+                                rs.getBoolean("lead")));
                     })
                     .forEach(candidate -> candidate.ifPresent(candidates::add));
-            return new PoolRouting(pooled[0], pooled[0] ? List.copyOf(candidates) : List.of());
+            if (!pooled[0]) {
+                return new PoolRouting(false, List.of(), "");
+            }
+            return new PoolRouting(true, List.copyOf(candidates), canaryRevision[0]);
         });
     }
 
     /**
-     * An advisory routing snapshot: pool mode plus the members that were ACTIVE when it was read.
+     * An advisory routing snapshot: pool mode, the members that were ACTIVE when it was read, and the
+     * canary build of the pool.
      */
-    public record PoolRouting(boolean pooled, List<Candidate> candidates) {}
+    public record PoolRouting(boolean pooled, List<Candidate> candidates, String canaryRevision)
+    {
+        /**
+         * The same snapshot with only the members that run this revision, leads included.
+         */
+        public PoolRouting onRevision(String revision)
+        {
+            return new PoolRouting(pooled, candidates.stream().filter(candidate -> candidate.configRevision().equals(revision)).toList(), canaryRevision);
+        }
+
+        /**
+         * The same snapshot without leads, which serve only canary requests.
+         */
+        public PoolRouting withoutLeads()
+        {
+            return new PoolRouting(pooled, candidates.stream().filter(candidate -> !candidate.lead()).toList(), canaryRevision);
+        }
+    }
 
     /**
      * Candidates that are ACTIVE in the authoritative store. Cached health may only order these, and
@@ -1392,10 +1487,20 @@ public final class PoolStore
         check(member.generation == expectedGeneration, POOL_STALE_GENERATION, "The member generation changed");
     }
 
-    private static long countMembers(Handle handle, String poolId, Set<String> phases)
+    /**
+     * Counts the members of the main pool. Leads are outside every serving, surge and repair count, so
+     * an active lead can never hide a capacity deficit or spend the surge budget.
+     */
+    private static long countMainMembers(Handle handle, String poolId, Set<String> phases)
     {
-        return handle.createQuery("SELECT count(*) FROM transaction_backend WHERE pool_id = :pool AND state = ANY(:phases)")
+        return handle.createQuery("SELECT count(*) FROM transaction_backend WHERE pool_id = :pool AND NOT lead AND state = ANY(:phases)")
                 .bind("pool", poolId).bindArray("phases", String.class, phases.toArray(String[]::new)).mapTo(Long.class).one();
+    }
+
+    private static long countLeads(Handle handle, String poolId)
+    {
+        return handle.createQuery("SELECT count(*) FROM transaction_backend WHERE pool_id = :pool AND lead AND state = ANY(:phases)")
+                .bind("pool", poolId).bindArray("phases", String.class, LIVE_PHASES.toArray(String[]::new)).mapTo(Long.class).one();
     }
 
     /**
@@ -1409,6 +1514,8 @@ public final class PoolStore
      * a record that cannot prove its repair finished keeps blocking. The controller applies the same
      * rule, and it may only ever be stricter than this one: the Gateway never charges a repair the
      * controller considers finished.
+     * <p>
+     * A lead is never a repair and a repair never targets a lead, so no lead enters this count.
      */
     private static long countRepair(Handle handle, String poolId)
     {
@@ -1440,14 +1547,22 @@ public final class PoolStore
     private static PoolState poolState(Handle handle, String poolId)
     {
         Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
+        // Main pool only: the controller reads leads through leadInUse and the member list, so a lead
+        // never counts as serving capacity and its phase never blocks the main pool.
         Map<String, Long> counts = new LinkedHashMap<>();
         ALL_PHASES.forEach(phase -> counts.put(phase, 0L));
-        handle.createQuery("SELECT state, count(*) AS total FROM transaction_backend WHERE pool_id = :pool GROUP BY state")
+        handle.createQuery("SELECT state, count(*) AS total FROM transaction_backend WHERE pool_id = :pool AND NOT lead GROUP BY state")
                 .bind("pool", poolId).map((rs, _) -> Map.entry(rs.getString("state"), rs.getLong("total")))
                 .list().forEach(entry -> counts.put(entry.getKey(), entry.getValue()));
         long serving = counts.getOrDefault("ACTIVE", 0L);
         long repair = countRepair(handle, poolId);
-        long live = countMembers(handle, poolId, LIVE_PHASES) - repair;
+        long live = countMainMembers(handle, poolId, LIVE_PHASES) - repair;
+        long leadInUse = countLeads(handle, poolId);
+        // Leads and main members alike: whoever answers canary requests. Zero when the pool has no canary.
+        long canaryServing = pool.canaryRevision.isEmpty()
+                ? 0
+                : handle.createQuery("SELECT count(*) FROM transaction_backend WHERE pool_id = :pool AND state = 'ACTIVE' AND config_revision = :canary")
+                  .bind("pool", poolId).bind("canary", pool.canaryRevision).mapTo(Long.class).one();
         long openPublications = handle.createQuery("SELECT count(*) FROM pool_publication WHERE pool_id = :pool AND phase = 'OPEN'")
                 .bind("pool", poolId).mapTo(Long.class).one();
         List<String> blocked = new ArrayList<>();
@@ -1472,15 +1587,19 @@ public final class PoolStore
                 pool.minServing,
                 pool.desiredMembers,
                 pool.maxSurge,
+                pool.leadSurge,
                 pool.maxRepair,
                 pool.desiredRevision,
                 pool.admittedRevision,
                 pool.tenantAdmissionEnabled,
+                pool.canaryRevision,
                 counts,
                 serving,
                 live,
                 Math.max(0, live - Math.max(pool.desiredMembers, pool.minServing)),
                 repair,
+                leadInUse,
+                canaryServing,
                 openPublications,
                 List.copyOf(blocked),
                 false);
@@ -1514,6 +1633,7 @@ public final class PoolStore
                 row.authRevision,
                 row.repair,
                 row.repairFor,
+                row.lead,
                 row.retirementKind,
                 obligations.pendingRequests(),
                 obligations.openTransactions(),
@@ -1700,11 +1820,13 @@ public final class PoolStore
             int minServing,
             int desiredMembers,
             int maxSurge,
+            int leadSurge,
             int maxRepair,
             long membershipGeneration,
             String desiredRevision,
             String admittedRevision,
             boolean tenantAdmissionEnabled,
+            String canaryRevision,
             UUID incarnation,
             String currentName,
             String url,
@@ -1721,6 +1843,7 @@ public final class PoolStore
             String retirementKind,
             boolean repair,
             String repairFor,
+            boolean lead,
             String publicationId,
             String tenant,
             String targetRevision,
@@ -1739,11 +1862,13 @@ public final class PoolStore
                     rs.getInt("min_serving"),
                     rs.getInt("desired_members"),
                     rs.getInt("max_surge"),
+                    rs.getInt("lead_surge"),
                     rs.getInt("max_repair"),
                     rs.getLong("membership_generation"),
                     rs.getString("desired_revision"),
                     rs.getString("admitted_revision"),
                     rs.getBoolean("tenant_admission_enabled"),
+                    rs.getString("canary_revision"),
                     null,
                     null,
                     null,
@@ -1760,6 +1885,7 @@ public final class PoolStore
                     null,
                     false,
                     null,
+                    false,
                     null,
                     null,
                     null,
@@ -1781,9 +1907,11 @@ public final class PoolStore
                     0,
                     0,
                     0,
+                    0,
                     null,
                     null,
                     false,
+                    null,
                     rs.getObject("incarnation", UUID.class),
                     rs.getString("current_name"),
                     rs.getString("backend_url"),
@@ -1800,6 +1928,7 @@ public final class PoolStore
                     rs.getString("retirement_kind"),
                     rs.getBoolean("repair"),
                     rs.getString("repair_for"),
+                    rs.getBoolean("lead"),
                     null,
                     null,
                     null,
@@ -1820,10 +1949,12 @@ public final class PoolStore
                     0,
                     0,
                     0,
+                    0,
                     rs.getLong("membership_generation"),
                     null,
                     null,
                     false,
+                    null,
                     null,
                     null,
                     null,
@@ -1840,6 +1971,7 @@ public final class PoolStore
                     null,
                     false,
                     null,
+                    false,
                     rs.getString("publication_id"),
                     rs.getString("tenant"),
                     rs.getString("target_revision"),
@@ -1860,9 +1992,11 @@ public final class PoolStore
                     0,
                     0,
                     0,
+                    0,
                     null,
                     null,
                     false,
+                    null,
                     null,
                     null,
                     null,
@@ -1879,6 +2013,7 @@ public final class PoolStore
                     null,
                     false,
                     null,
+                    false,
                     null,
                     null,
                     null,
@@ -1897,11 +2032,13 @@ public final class PoolStore
                     minServing,
                     desiredMembers,
                     maxSurge,
+                    leadSurge,
                     maxRepair,
                     membershipGeneration,
                     desiredRevision,
                     admittedRevision,
                     tenantAdmissionEnabled,
+                    canaryRevision,
                     incarnation,
                     currentName,
                     url,
@@ -1918,6 +2055,7 @@ public final class PoolStore
                     retirementKind,
                     repair,
                     repairFor,
+                    lead,
                     publicationId,
                     tenant,
                     targetRevision,
@@ -2034,6 +2172,7 @@ public final class PoolStore
                     member.authRevision(),
                     member.repair(),
                     member.repairFor(),
+                    member.lead(),
                     member.retirementKind(),
                     member.pendingRequests(),
                     member.openTransactions(),
@@ -2052,15 +2191,19 @@ public final class PoolStore
                     state.minServing(),
                     state.desiredMembers(),
                     state.maxSurge(),
+                    state.leadSurge(),
                     state.maxRepair(),
                     state.desiredRevision(),
                     state.admittedRevision(),
                     state.tenantAdmissionEnabled(),
+                    state.canaryRevision(),
                     state.counts(),
                     state.servingMembers(),
                     state.liveMembers(),
                     state.surgeInUse(),
                     state.repairInUse(),
+                    state.leadInUse(),
+                    state.canaryServing(),
                     state.openPublications(),
                     state.blocked(),
                     true);

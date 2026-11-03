@@ -110,7 +110,7 @@ class TestTransactionStore
         fixtureUsername = username;
         fixturePassword = password;
         database = Jdbi.create(fixtureUrl, username, password);
-        for (String version : new String[] {"V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql", "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql", "V13__pool_tenant_principals.sql"}) {
+        for (String version : new String[] {"V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql", "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql", "V13__pool_tenant_principals.sql", "V17__pool_canary_lead.sql"}) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
                 database.useHandle(handle -> handle.createScript(sql).execute());

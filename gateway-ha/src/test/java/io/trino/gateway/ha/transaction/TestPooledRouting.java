@@ -25,8 +25,10 @@ import io.trino.gateway.ha.config.DataStoreConfiguration;
 import io.trino.gateway.ha.config.HaGatewayConfiguration;
 import io.trino.gateway.ha.config.MonitorConfiguration;
 import io.trino.gateway.ha.config.ProxyBackendConfiguration;
+import io.trino.gateway.ha.config.RoutingConfiguration;
 import io.trino.gateway.ha.handler.schema.RoutingTargetResponse;
 import io.trino.gateway.ha.router.GatewayBackendManager;
+import io.trino.gateway.ha.router.HostnameRoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingGroupSelector;
 import io.trino.gateway.ha.router.RoutingManager;
 import io.trino.gateway.ha.router.schema.RoutingSelectorResponse;
@@ -57,6 +59,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.trino.gateway.ha.util.TestcontainersUtils.createPostgreSqlContainer;
 import static java.nio.charset.StandardCharsets.UTF_8;
@@ -84,6 +87,8 @@ class TestPooledRouting
     private static final String POOL = "pool-a";
     private static final String PLAN_HASH = "c".repeat(64);
     private static final String DOMAIN = "dw.example.test";
+    private static final String CANARY_DOMAIN = "canary.example.test";
+    private static final String CANARY_HOST = "acme." + CANARY_DOMAIN;
 
     private static final String AUTHORIZATION = "Basic " + Base64.getEncoder().encodeToString("tenant:secret".getBytes(UTF_8));
 
@@ -100,6 +105,7 @@ class TestPooledRouting
     private RoutingGroupSelector selector;
     private boolean schemaCreated;
     private long epoch;
+    private int configurations;
 
     @BeforeAll
     void setupDatabase()
@@ -126,7 +132,7 @@ class TestPooledRouting
         for (String version : new String[] {
                 "V7__transaction_awareness.sql", "V8__backend_incarnation_history.sql", "V9__query_capabilities.sql",
                 "V10__drain_obligation_indexes.sql", "V11__cell_rollout_operations.sql", "V12__pool_member_lifecycle.sql",
-                "V13__pool_tenant_principals.sql",
+                "V13__pool_tenant_principals.sql", "V17__pool_canary_lead.sql",
         }) {
             try (var migration = requireNonNull(getClass().getResourceAsStream("/postgresql/" + version))) {
                 String sql = new String(migration.readAllBytes(), StandardCharsets.UTF_8);
@@ -170,6 +176,7 @@ class TestPooledRouting
         configuration.getTransactionAwareness().setAdminToken("synthetic-admin-token-for-pooled-routing-tests");
         configuration.getTransactionAwareness().getPool().setEnabled(true);
         configuration.getTransactionAwareness().getPool().setMaxPreDispatchCandidates(3);
+        configuration.getTransactionAwareness().getPool().setCanaryHostDomains(List.of(CANARY_DOMAIN));
         backendManager = mock(GatewayBackendManager.class);
         routingManager = mock(RoutingManager.class);
         httpClient = mock(HttpClient.class);
@@ -683,6 +690,185 @@ class TestPooledRouting
     }
 
     // --------------------------------------------------------------------------------------------
+    // Canary lane
+    // --------------------------------------------------------------------------------------------
+
+    @Test
+    void aCanaryHostOnlyReachesMembersOfTheCanaryRevision()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        member("old-2", true, "r-1");
+        lead("lead-1", true, "r-2");
+        lead("lead-2", true, "r-2");
+        probeSucceeds();
+        service.setRandom(new Random(7));
+
+        Set<String> canaryHosts = new HashSet<>();
+        for (int attempt = 0; attempt < 40; attempt++) {
+            canaryHosts.add(resolveAs("tenant", CANARY_HOST, Map.of()).routingDestination().clusterHost());
+        }
+        assertThat(canaryHosts).containsExactlyInAnyOrder("http://lead-1.example.test", "http://lead-2.example.test");
+
+        // Every other request spreads over the main pool and never gets a lead.
+        Set<String> ordinary = new HashSet<>();
+        for (int attempt = 0; attempt < 40; attempt++) {
+            ordinary.add(resolveAs("tenant", "acme." + DOMAIN, Map.of()).routingDestination().clusterHost());
+        }
+        assertThat(ordinary).containsExactlyInAnyOrder("http://old-1.example.test", "http://old-2.example.test");
+    }
+
+    @Test
+    void aCanaryHostIsRefusedWhileNoMemberRunsTheCanaryBuild()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", false, "r-2");
+        probeSucceeds();
+
+        expectStatus(503, "REVISION_NOT_SERVING", () -> resolveAs("tenant", CANARY_HOST, Map.of()));
+        assertThat(admissionCount()).isZero();
+        // The request never falls back to the main pool, and ordinary requests are unaffected.
+        assertThat(resolveAs("tenant", "acme." + DOMAIN, Map.of()).routingDestination().clusterHost())
+                .isEqualTo("http://old-1.example.test");
+
+        lead("lead-2", true, "r-2");
+        assertThat(resolveAs("tenant", CANARY_HOST, Map.of()).routingDestination().clusterHost()).isEqualTo("http://lead-2.example.test");
+        drain("lead-2");
+        expectStatus(503, "REVISION_NOT_SERVING", () -> resolveAs("tenant", CANARY_HOST, Map.of()));
+    }
+
+    @Test
+    void aCanaryHostWithoutACanaryRevisionRoutesLikeAnOrdinaryHost()
+    {
+        canary("");
+        member("old-1", true, "r-1");
+        probeSucceeds();
+        assertThat(resolveAs("tenant", CANARY_HOST, Map.of()).routingDestination().clusterHost()).isEqualTo("http://old-1.example.test");
+    }
+
+    @Test
+    void anOrdinaryHostNeverGetsALeadEvenWhenItIsTheOnlyActiveMember()
+    {
+        canary("r-2");
+        member("old-1", false, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+
+        expectStatus(503, "ROUTING_STATE_NOT_ACTIVE", () -> resolveAs("tenant", "acme." + DOMAIN, Map.of()));
+        assertThat(admissionCount()).isZero();
+        assertThat(resolveAs("tenant", CANARY_HOST, Map.of()).routingDestination().clusterHost()).isEqualTo("http://lead-1.example.test");
+    }
+
+    @Test
+    void onlyAHostOneLabelUnderACanaryDomainIsACanaryRequest()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+
+        // One label under the domain, however the Host is written.
+        for (String host : List.of(CANARY_HOST, "ACME." + CANARY_DOMAIN + ".", CANARY_HOST + ":8443")) {
+            assertThat(resolveAs("tenant", host, Map.of()).routingDestination().clusterHost()).describedAs(host).isEqualTo("http://lead-1.example.test");
+        }
+        // The domain itself, a name with two labels under it, and a look-alike are ordinary hosts.
+        for (String host : List.of(CANARY_DOMAIN, "a.b." + CANARY_DOMAIN, "acme." + CANARY_DOMAIN + ".other.test", "acme-" + CANARY_DOMAIN)) {
+            assertThat(resolveAs("tenant", host, Map.of()).routingDestination().clusterHost()).describedAs(host).isEqualTo("http://old-1.example.test");
+        }
+    }
+
+    @Test
+    void aForwardedHostNeverMakesAnOrdinaryRequestACanaryRequest()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+
+        Map<String, List<String>> forwarded = Map.of("X-Forwarded-Host", List.of(CANARY_HOST), "Forwarded", List.of("host=" + CANARY_HOST));
+        for (int attempt = 0; attempt < 5; attempt++) {
+            assertThat(resolveAs("tenant", "acme." + DOMAIN, forwarded).routingDestination().clusterHost()).isEqualTo("http://old-1.example.test");
+        }
+    }
+
+    @Test
+    void onlyAnExactHostEntryReachesThePoolAndTheLead()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+        // The real selector: the exact entries are the allowlist, the canary domain only marks a request.
+        RoutingConfiguration routing = new RoutingConfiguration();
+        routing.setHostnameToPool(Map.of(CANARY_HOST, POOL, "acme." + DOMAIN, POOL));
+        service.shutdown();
+        service = new TransactionAwarenessService(
+                configuration,
+                database,
+                backendManager,
+                httpClient,
+                new HostnameRoutingGroupSelector(routing),
+                new TransactionLifecycleStats());
+        service.setRoutingManager(routingManager);
+
+        assertThat(resolveAs("tenant", CANARY_HOST, Map.of()).routingDestination().clusterHost()).isEqualTo("http://lead-1.example.test");
+        assertThat(resolveAs("tenant", "acme." + DOMAIN, Map.of()).routingDestination().clusterHost()).isEqualTo("http://old-1.example.test");
+        expectStatus(421, null, () -> resolveAs("tenant", "other." + CANARY_DOMAIN, Map.of()));
+        assertThat(admissionCount()).isEqualTo(2);
+    }
+
+    @Test
+    void auxiliaryRequestsFollowTheLaneUnlessTheyContinueAPinnedBackend()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+        String ordinary = "acme." + DOMAIN;
+
+        for (int attempt = 0; attempt < 5; attempt++) {
+            assertThat(resolveAuxiliaryOn(CANARY_HOST, Optional.empty()).routingDestination().clusterHost()).isEqualTo("http://lead-1.example.test");
+            assertThat(resolveAuxiliaryOn(ordinary, Optional.empty()).routingDestination().clusterHost()).isEqualTo("http://old-1.example.test");
+        }
+        // A request that continues the work of a backend, such as an OAuth handshake, stays on it, a lead included.
+        assertThat(resolveAuxiliaryOn(ordinary, Optional.of("http://lead-1.example.test")).routingDestination().clusterHost())
+                .isEqualTo("http://lead-1.example.test");
+        assertThat(service.isPooledBackendAvailable(request("GET", "/oauth2/token/x", Map.of("Host", List.of(ordinary))), "http://lead-1.example.test")).isTrue();
+
+        drain("lead-1");
+        assertThat(resolveAuxiliaryOn(ordinary, Optional.empty()).routingDestination().clusterHost()).isEqualTo("http://old-1.example.test");
+        assertThatThrownBy(() -> resolveAuxiliaryOn(CANARY_HOST, Optional.empty())).isInstanceOfSatisfying(WebApplicationException.class, failure -> {
+            assertThat(failure.getResponse().getStatus()).isEqualTo(503);
+            assertThat(failure.getResponse().getHeaderString("X-Trino-Gateway-Error")).isEqualTo("REVISION_NOT_SERVING");
+        });
+    }
+
+    @Test
+    void aMainMemberLostBetweenSnapshotAndAdmissionNeverSendsOrdinaryWorkToALead()
+    {
+        canary("r-2");
+        member("old-1", true, "r-1");
+        lead("lead-1", true, "r-2");
+        probeSucceeds();
+        // The routing snapshot lists old-1 as ACTIVE. It is suspected after the snapshot and before the
+        // admission, while the candidates are being listed.
+        AtomicBoolean suspected = new AtomicBoolean();
+        List<ProxyBackendConfiguration> backends = backendManager.getAllBackends();
+        when(backendManager.getAllBackends()).thenAnswer(_ -> {
+            if (suspected.compareAndSet(false, true)) {
+                PoolStore.Member member = pools.member(POOL, "old-1").orElseThrow();
+                pools.suspectMember(POOL, "old-1", guard("op-suspect", "suspect"), member.generation(), "probe-failed");
+            }
+            return backends;
+        });
+
+        expectStatus(503, "ROUTING_STATE_NOT_ACTIVE", () -> resolveAs("tenant", "acme." + DOMAIN, Map.of()));
+        assertThat(suspected).isTrue();
+        assertThat(admissionCount()).isZero();
+    }
+
+    // --------------------------------------------------------------------------------------------
     // Helpers
     // --------------------------------------------------------------------------------------------
 
@@ -722,7 +908,7 @@ class TestPooledRouting
         service.shutdown();
         configuration.getTransactionAwareness().getPool()
                 .setTenantIdentitySource(io.trino.gateway.ha.config.PoolLifecycleConfiguration.TENANT_IDENTITY_TRINO_BASIC_PRINCIPAL);
-        configuration.getTransactionAwareness().getPool().setHostQualificationDomains(List.of(DOMAIN));
+        configuration.getTransactionAwareness().getPool().setHostQualificationDomains(List.of(DOMAIN, CANARY_DOMAIN));
         configuration.getTransactionAwareness().getPool().setExcludedHostLabels(List.of("internal"));
         configuration.getTransactionAwareness().validate(configuration.getDataStore());
         service = new TransactionAwarenessService(configuration, database, backendManager, httpClient, selector, new TransactionLifecycleStats());
@@ -772,6 +958,11 @@ class TestPooledRouting
         return response;
     }
 
+    private RoutingTargetResponse resolveAuxiliaryOn(String host, Optional<String> pinnedBackend)
+    {
+        return service.resolve(request("GET", "/v1/info", Map.of("Host", List.of(host))), pinnedBackend);
+    }
+
     private static void expectStatus(int status, String code, Runnable action)
     {
         assertThatThrownBy(action::run).isInstanceOfSatisfying(WebApplicationException.class, failure -> {
@@ -807,6 +998,24 @@ class TestPooledRouting
      */
     private void member(String instanceId, boolean active)
     {
+        member(instanceId, active, "r-1");
+    }
+
+    private void member(String instanceId, boolean active, String revision)
+    {
+        member(instanceId, active, revision, false);
+    }
+
+    /**
+     * Registers a lead member, which serves only canary requests, and optionally certifies it into service.
+     */
+    private void lead(String instanceId, boolean active, String revision)
+    {
+        member(instanceId, active, revision, true);
+    }
+
+    private void member(String instanceId, boolean active, String revision, boolean lead)
+    {
         PoolStore.Member member = pools.registerMember(POOL, guard("op-" + instanceId, "register"),
                 new PoolStore.MemberRegistration(
                         instanceId,
@@ -815,10 +1024,11 @@ class TestPooledRouting
                         "http://" + instanceId + ".example.test",
                         "pod-" + instanceId,
                         "boot-" + instanceId,
-                        "r-1",
+                        revision,
                         null,
                         "node-" + instanceId,
-                        "abcde"));
+                        "abcde",
+                        lead));
         if (active) {
             pools.admitMember(
                     POOL,
@@ -827,7 +1037,7 @@ class TestPooledRouting
                     member.generation(),
                     new PoolStore.ValidationReceipt(
                             "a".repeat(64),
-                            "r-1",
+                            revision,
                             "a-1",
                             "pod-" + instanceId,
                             "boot-" + instanceId,
@@ -840,6 +1050,18 @@ class TestPooledRouting
                     300);
         }
         registerBackends();
+    }
+
+    /**
+     * Sets the pool's canary build. The pool has lead slots for the leads the tests register.
+     */
+    private void canary(String canaryRevision)
+    {
+        pools.configurePool(
+                POOL,
+                guard("op-canary-" + configurations++, "configure"),
+                new PoolStore.PoolSpec("POOLED", 1, 3, 1, 1, "r-1", false, 2, canaryRevision),
+                false);
     }
 
     private void drain(String instanceId)
@@ -902,12 +1124,17 @@ class TestPooledRouting
 
     private static HttpServletRequest request(Map<String, List<String>> suppliedHeaders)
     {
+        return request("POST", "/v1/statement", suppliedHeaders);
+    }
+
+    private static HttpServletRequest request(String method, String uri, Map<String, List<String>> suppliedHeaders)
+    {
         HttpServletRequest request = mock(HttpServletRequest.class);
         Map<String, List<String>> headers = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         headers.putAll(suppliedHeaders);
         Map<String, Object> attributes = new HashMap<>();
-        when(request.getMethod()).thenReturn("POST");
-        when(request.getRequestURI()).thenReturn("/v1/statement");
+        when(request.getMethod()).thenReturn(method);
+        when(request.getRequestURI()).thenReturn(uri);
         when(request.getHeaders(anyString())).thenAnswer(call -> Collections.enumeration(headers.getOrDefault(call.getArgument(0), List.of())));
         when(request.getHeader(anyString())).thenAnswer(call -> headers.getOrDefault(call.getArgument(0), List.of()).stream().findFirst().orElse(null));
         when(request.getHeaderNames()).thenAnswer(_ -> Collections.enumeration(headers.keySet()));

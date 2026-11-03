@@ -233,6 +233,137 @@ Change the selectors and labels in the example to match your scrape setup.
   check the sample age. If a coordinator stops reporting, its last value can
   stay for that window.
 
+### Canary lane
+
+A pool can run one extra Trino build, the canary, on lead members. Only requests
+that arrive on a canary hostname reach it. Customers and every other request
+never touch a lead.
+
+#### Canary hostnames
+
+Set the domains of the canary lane in the Gateway configuration:
+
+```yaml
+transactionAwareness:
+  pool:
+    canaryHostDomains:
+      - canary.example.test
+```
+
+A request is a canary request when its `Host` is exactly one DNS label under one
+of these domains, such as `acme.canary.example.test`. The domain itself and a name
+with more labels, such as `a.b.canary.example.test`, are not canary requests. Gateway
+ignores the port, the case, and a trailing dot, as it does when it selects a
+pool. Each domain must be a lowercase DNS name without a port, a wildcard, or a
+trailing dot. The default is an empty list, which means no canary lane.
+
+The label only marks the request. A pool is still chosen by `hostnameToPool`, so
+list every canary hostname there. Those exact entries are the allowlist: a host
+without an entry returns HTTP 421 and reaches no pool. Do not add a
+`hostnameSuffixToPool` entry for the canary domain, because it would let any
+client name a canary host. Gateway refuses to start with such an entry.
+
+The coordinator must qualify users on canary hosts as it does on other hosts.
+Add the canary domain to the coordinator's host qualification domains. When a
+tenant identity source is set, add it to `hostQualificationDomains` too, so both
+sides derive the same principal. Gateway refuses to start if a canary domain is
+missing from that list.
+
+#### Pool settings
+
+Two fields of the pool configuration, set alongside `maxSurge` and
+`desiredRevision`, control the lane. Omitted fields mean `0` and an empty string.
+The pool state returned by Gateway always includes `leadSurge`, `canaryRevision`,
+`leadInUse` and `canaryServing`, and every member includes `lead`.
+
+- `canaryRevision` is the build that leads run. It has the same rules as
+  `desiredRevision`. An empty value means the pool has no canary.
+- `leadSurge` (an integer from `0` to `100`, default `0`) is the number of lead
+  slots.
+
+`canaryServing` is the number of active members whose `configRevision` equals the
+`canaryRevision`. It is `0` when the pool has no canary. It is for information:
+it adds no reason to `blocked`.
+
+#### Lead members
+
+A lead is a member registered with `"lead": true`. It serves only canary
+requests and sits outside every count of the main pool, so it neither uses the
+surge budget nor counts as serving capacity. Registration of a lead needs all of
+these:
+
+- `repairFor` is absent. A lead is never a repair, and a repair cannot target a
+  lead.
+- `leadSurge` is greater than `0`.
+- The pool's `canaryRevision` is not empty.
+- `configRevision` equals the pool's `canaryRevision`.
+- Fewer than `leadSurge` leads are in a live phase. A lead keeps its slot until
+  it is retired or lost, so a draining or suspected lead still holds one.
+
+A lead that breaks one of the first four rules returns `POOL_VALIDATION`, with a
+message for that rule. A lead that has no free slot returns `POOL_SURGE_BUDGET`.
+A registration that is not a lead uses the surge budget as before and ignores
+leads. It cannot run the `canaryRevision`: Gateway refuses it with
+`POOL_VALIDATION`, for a repair too, because canary requests and ordinary
+requests would then share the build. The exception is a `canaryRevision` that
+equals the `desiredRevision`, which is a normal revision again.
+
+The main-pool rules do not count leads, and a lead drain is never blocked by
+them: the repair capacity check, the surge budget, the minimum serving count for
+a planned drain and for a publication, and the `counts`, `servingMembers`,
+`liveMembers`, `surgeInUse` and `blocked` fields of the pool state.
+
+#### Routing
+
+These rules apply to new independent statements.
+
+- A canary request, in a pool with a `canaryRevision`, runs only on active
+  members whose `configRevision` equals that revision, leads included. If there
+  are none, it fails with HTTP 503 and `X-Trino-Gateway-Error:
+  REVISION_NOT_SERVING`. Gateway does not dispatch it to another build.
+- A canary request, in a pool without a `canaryRevision`, is routed like an
+  ordinary request.
+- An ordinary request runs only on active members that are not leads. If there
+  are none, it fails with the usual `ROUTING_STATE_NOT_ACTIVE`.
+
+Continuations, transactions, and requests that are not new statements do not
+change: a query keeps running on the member that accepted it, a lead included.
+The canary lane never grants access, because the coordinator still authenticates
+the credential. It adds no database read to a request.
+
+#### Behavior to expect
+
+- **A change of `canaryRevision`.** A canary request gets `REVISION_NOT_SERVING`
+  until a lead on the new revision is active. This usually lasts a few minutes. It
+  is on purpose: a canary request that succeeds ran on the canary build. With
+  `leadSurge` `1` the lane stays at 503 for longer: the old lead holds the only
+  slot until it is retired, and the new lead cannot register before that. With
+  `leadSurge` `2` the new lead registers at once.
+- **Publications and membership.** A lead takes part in publication receipts and
+  membership changes. An active lead must acknowledge a publication before it
+  commits. Admitting or draining a lead changes the membership generation, so an
+  open publication that expects the old generation fails with
+  `POOL_MEMBERSHIP_CHANGED` and the controller opens it again. A receipt names
+  the member's process and the publication target, not the member's
+  `configRevision`, so the controller can acknowledge for a lead as for any
+  member. The admission barrier of an open publication asks a joining member to
+  run the publication target. A lead runs the canary build and cannot, so it may
+  join during the barrier. Its join is not a receipt: it is listed as missing
+  until the controller acknowledges for it, and a main member still has to run the
+  target.
+- **Auxiliary requests.** Requests that are not new statements, such as
+  `/v1/info`, follow the same lane. On a canary host they reach only the canary
+  build, with `REVISION_NOT_SERVING` when there is none, and elsewhere they never
+  reach a lead. A request that continues the work of a given backend, such as an
+  OAuth2 handshake pinned to it, stays on that backend, a lead included.
+- **Deploy order.** The migration adds the new pool and member columns when
+  Gateway starts. Results that a new version records for pool configuration and
+  member steps carry new fields, and an older version cannot replay them: a step
+  that the controller resends to an older replica fails with `POOL_VALIDATION`.
+  Deploy the new version to every replica before the controller sets
+  `canaryRevision` or `leadSurge`, or registers a lead. Do not roll back while the
+  controller can still resend steps that the new version recorded.
+
 ### Durable transaction and query ownership
 
 PostgreSQL records the coordinator incarnation that owns a transaction or query,
