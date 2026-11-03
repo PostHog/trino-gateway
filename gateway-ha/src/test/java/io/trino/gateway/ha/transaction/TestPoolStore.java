@@ -963,6 +963,57 @@ class TestPoolStore
     }
 
     @Test
+    void drainingALeadThatCannotAcknowledgeLetsTheReopenedPublicationCommitWithoutIt()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        lead("lead-1", "r-2");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        first.openPublication(POOL, guard("op-recover-1", "open"), "pub-1", "org-1", "rev-2", membership, PLAN_HASH);
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-1", instance, "rev-2");
+        }
+        // The lead never acknowledges, so the publication waits.
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-1", guard("op-recover-1", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_RECEIPTS_INCOMPLETE));
+        assertThat(first.publication(POOL, "pub-1").orElseThrow().missingMembers()).containsExactly("lead-1");
+
+        // The operator drains the lead. The floor does not apply to a lead, and the membership change ends the attempt.
+        assertThat(drain(first, "lead-1", "drain-lead").phase()).isEqualTo("DRAINING");
+        assertThatThrownBy(() -> first.commitPublication(POOL, "pub-1", guard("op-recover-1", "commit"), membership))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_MEMBERSHIP_CHANGED));
+        first.abandonPublication(POOL, "pub-1", guard("op-recover-1", "abandon"));
+
+        long reopened = first.poolState(POOL).orElseThrow().membershipGeneration();
+        PoolStore.Publication second = first.openPublication(POOL, guard("op-recover-2", "open"), "pub-2", "org-1", "rev-2", reopened, PLAN_HASH);
+        assertThat(second.requiredMembers()).containsExactly("i-1", "i-2", "i-3");
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-2", instance, "rev-2");
+        }
+        assertThat(first.commitPublication(POOL, "pub-2", guard("op-recover-2", "commit"), reopened).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
+    void aSuspectLeadDropsOutOfTheRequiredMembers()
+    {
+        configureCanary("r-2", 1);
+        serving("i-1");
+        serving("i-2");
+        serving("i-3");
+        lead("lead-1", "r-2");
+        suspect("lead-1");
+        long membership = first.poolState(POOL).orElseThrow().membershipGeneration();
+        PoolStore.Publication opened = first.openPublication(POOL, guard("op-suspect-pub", "open"), "pub-1", "org-1", "rev-2", membership, PLAN_HASH);
+        assertThat(opened.requiredMembers()).containsExactly("i-1", "i-2", "i-3");
+        for (String instance : List.of("i-1", "i-2", "i-3")) {
+            receiptFor("pub-1", instance, "rev-2");
+        }
+        assertThat(first.commitPublication(POOL, "pub-1", guard("op-suspect-pub", "commit"), membership).phase()).isEqualTo("ADMITTED");
+    }
+
+    @Test
     void drainingALeadWhileAPublicationIsOpenFailsTheCommit()
     {
         configureCanary("r-2", 1);

@@ -364,6 +364,27 @@ the credential. It adds no database read to a request.
   `canaryRevision` or `leadSurge`, or registers a lead. Do not roll back while the
   controller can still resend steps that the new version recorded.
 
+#### When a canary lead cannot acknowledge a publication
+
+A publication commits only when every active member has acknowledged it, and an
+active lead is a member. If a lead is broken and never acknowledges, the open
+publication fails with `POOL_RECEIPTS_INCOMPLETE`, and the lead is listed as
+missing. Until the lead is dealt with, every tenant's publication in that pool
+waits, because the pool commits none of them.
+
+To recover:
+
+1. The operator removes the lead from the active members. It drains the lead
+   (`drain`), as it does when it clears or changes `canaryRevision`: changing the
+   setting alone does not remove a lead. A planned drain of a lead bypasses the
+   minimum serving count. Marking the lead suspect also removes it from the
+   active members.
+2. The change of membership releases the open attempt: a commit that expects the
+   old membership generation fails with `POOL_MEMBERSHIP_CHANGED`. The controller
+   abandons that publication and opens it again.
+3. The main members acknowledge the reopened publication, and it commits without
+   the lead.
+
 ### Durable transaction and query ownership
 
 PostgreSQL records the coordinator incarnation that owns a transaction or query,
