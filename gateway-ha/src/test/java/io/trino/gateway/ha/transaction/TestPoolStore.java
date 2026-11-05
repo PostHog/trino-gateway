@@ -2301,6 +2301,90 @@ class TestPoolStore
         }
     }
 
+    // A statement submission whose router process stopped before recording any outcome leaves a PENDING
+    // admission with no query identity. Neither the superseded proof nor query reconciliation can reach
+    // it, so it blocked the drain for as long as the member existed.
+    @Test
+    void orphanedSubmissionBlocksTheDrainUntilAnIdleReceiptSettlesIt()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        TransactionStore.Admission orphan = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        Member draining = drain(first, "i-1", "op-drain");
+        assertThat(first.member(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
+        assertThatThrownBy(() -> seal("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
+
+        // Too young: it may still be in flight, so an idle receipt does not settle it.
+        assertThat(reconcileAbandoned(second, "i-1", "young", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isZero();
+
+        age(orphan.id());
+        assertThat(reconcileAbandoned(second, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        String settled = database.withHandle(handle -> handle.createQuery("SELECT state || ':' || observation FROM transaction_admission WHERE admission_id = :id")
+                .bind("id", orphan.id()).mapTo(String.class).one());
+        assertThat(settled).isEqualTo("COMPLETE:ABANDONED");
+        // The same step replays its recorded result.
+        assertThat(reconcileAbandoned(first, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        assertThat(seal("i-1").phase()).isEqualTo("SEALED");
+    }
+
+    @Test
+    void anUnprovenUncertainAdmissionIsSettledByAnIdleReceipt()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        TransactionStore.Admission failed = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        // A response reached recording but could not be recorded, so it is never settled as superseded.
+        transactions.markUncertain(failed.id(), false);
+        assertThat(transactions.settleSupersededAdmissions(10).settled()).isEmpty();
+        Member draining = drain(first, "i-1", "op-drain");
+        age(failed.id());
+
+        assertThat(reconcileAbandoned(second, "i-1", "uncertain", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        assertThat(seal("i-1").phase()).isEqualTo("SEALED");
+    }
+
+    @Test
+    void abandonedAdmissionsAreSettledOnlyOnADrainingMemberOfTheVerifiedProcess()
+    {
+        configure(1, 1, 1, 1);
+        serving("i-keep");
+        Member active = serving("i-1");
+        TransactionStore.Admission orphan = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        age(orphan.id());
+
+        // A serving member still admits statements, so nothing it holds is settled.
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "active", active.generation(), "node-i-1", "coord-i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
+        Member draining = drain(first, "i-1", "op-drain");
+        // A receipt from another coordinator process proves nothing about this one.
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "other-process", draining.generation(), "node-i-1", "coord-other"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_IDENTITY_CONFLICT));
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "stale", draining.generation() - 1, "node-i-1", "coord-i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_GENERATION));
+        assertThat(first.member(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
+    }
+
+    // An admission inside an open transaction is not settled: the open transaction is itself an
+    // obligation, released only by its own lifecycle.
+    @Test
+    void anAdmissionOfAnOpenTransactionIsNeverSettledAsAbandoned()
+    {
+        configure(1, 3, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        TransactionStore.Admission start = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        transactions.recordResponse(start.id(), new ResponseObservation("20260918_120000_00011_abcde", "00000000-0000-0000-0000-000000000011", false, false, 120));
+        Member draining = drain(first, "i-1", "op-drain");
+        TransactionStore.Admission inTransaction = transactions.admitTransaction("00000000-0000-0000-0000-000000000011", "owner");
+        age(inTransaction.id());
+
+        assertThat(reconcileAbandoned(second, "i-1", "open-transaction", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isZero();
+        assertThat(first.member(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
+    }
+
     @Test
     void reconciliationPreservesRetentionAndRejectsAnInterveningCompletedPoll()
     {
@@ -2607,6 +2691,18 @@ class TestPoolStore
     {
         Member member = store.member(POOL, instanceId).orElseThrow();
         return store.drainMember(POOL, instanceId, new Guard(operationId, "drain", epoch, PLAN_HASH), member.generation());
+    }
+
+    private PoolStore.ReconciliationResult reconcileAbandoned(PoolStore store, String instanceId, String stepId, long generation, String nodeId, String coordinatorId)
+    {
+        return store.reconcileAbandonedAdmissions(POOL, instanceId, guard("op-abandoned", stepId), generation, nodeId, coordinatorId, 60_000);
+    }
+
+    // Moves an admission past the abandonment age, as if its request had outlived any lifetime.
+    private void age(UUID admissionId)
+    {
+        database.useHandle(handle -> handle.createUpdate("UPDATE transaction_admission SET created_at = clock_timestamp() - interval '1 hour' WHERE admission_id = :id")
+                .bind("id", admissionId).execute());
     }
 
     private Member seal(String instanceId)

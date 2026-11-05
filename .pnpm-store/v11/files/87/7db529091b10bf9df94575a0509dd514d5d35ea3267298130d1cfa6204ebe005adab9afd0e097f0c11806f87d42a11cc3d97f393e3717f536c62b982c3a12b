@@ -1,0 +1,507 @@
+import React from 'react';
+import classNames from 'classnames';
+import JsonViewerFoundation, {
+    JsonViewerOptions,
+    JsonViewerAdapter,
+} from '@douyinfe/semi-foundation/jsonViewer/foundation';
+import '@douyinfe/semi-foundation/jsonViewer/jsonViewer.scss';
+import { cssClasses } from '@douyinfe/semi-foundation/jsonViewer/constants';
+import ButtonGroup from '../button/buttonGroup';
+import Button from '../button';
+import Input from '../input';
+import DragMove from '../dragMove';
+import {
+    IconCaseSensitive,
+    IconChevronLeft,
+    IconChevronRight,
+    IconClose,
+    IconRegExp,
+    IconSearch,
+    IconWholeWord,
+} from '@douyinfe/semi-icons';
+import BaseComponent, { BaseProps } from '../_base/baseComponent';
+import { createPortal } from 'react-dom';
+import { isEqual } from "lodash";
+import LocaleConsumer from '../locale/localeConsumer';
+import { Locale } from '../locale/interface';
+
+const prefixCls = cssClasses.PREFIX;
+
+export type { JsonViewerOptions };
+export interface JsonViewerProps extends BaseProps {
+    value: string;
+    width: number | string;
+    height: number | string;
+    showSearch?: boolean;
+    className?: string;
+    style?: React.CSSProperties;
+    onChange?: (value: string) => void;
+    renderTooltip?: (value: string, el: HTMLElement) => HTMLElement;
+    options?: JsonViewerOptions;
+    /**
+     * Whether to limit the search button drag bounds within the jsonViewer container
+     * @default false
+     */
+    limitSearchButtonBounds?: boolean;
+    /**
+     * Custom render search button
+     * @param defaultSearchButton - Default search button React node
+     * @param searchControls - Search related controls and methods
+     */
+    renderSearchButton?: (
+        defaultSearchButton: React.ReactNode,
+        searchControls: {
+            showSearchBar: boolean;
+            onToggleSearchBar: () => void;
+            onSearch: (text: string, caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean) => void;
+            onPrevSearch: () => void;
+            onNextSearch: () => void;
+            onReplace: (text: string) => void;
+            onReplaceAll: (text: string) => void
+        }
+    ) => React.ReactNode
+}
+
+export interface JsonViewerState {
+    searchOptions: SearchOptions;
+    showSearchBar: boolean;
+    customRenderMap: Map<HTMLElement, React.ReactNode>
+}
+
+export interface SearchOptions {
+    caseSensitive: boolean;
+    wholeWord: boolean;
+    regex: boolean
+}
+
+class JsonViewerCom extends BaseComponent<JsonViewerProps, JsonViewerState> {
+    static defaultProps: Partial<JsonViewerProps> = {
+        width: 400,
+        height: 400,
+        value: '',
+        options: {
+            readOnly: false,
+            autoWrap: true
+        }
+    };
+
+    private editorRef: React.RefObject<HTMLDivElement>;
+    private searchInputRef: React.RefObject<HTMLInputElement>;
+    private replaceInputRef: React.RefObject<HTMLInputElement>;
+    private isComposing: boolean = false;
+    private resizeObserver: ResizeObserver | null = null;
+    private resizeRafId: number | null = null;
+    private lastObservedWidth: number | null = null;
+
+    foundation: JsonViewerFoundation;
+
+    constructor(props: JsonViewerProps) {
+        super(props);
+        this.editorRef = React.createRef();
+        this.searchInputRef = React.createRef();
+        this.replaceInputRef = React.createRef();
+        this.foundation = new JsonViewerFoundation(this.adapter);
+        this.state = {
+            searchOptions: {
+                caseSensitive: false,
+                wholeWord: false,
+                regex: false,
+            },
+            showSearchBar: false,
+            customRenderMap: new Map(),
+        };
+    }
+
+    componentDidMount() {
+        this.foundation.init();
+        this.setupResizeObserver();
+    }
+
+    private teardownResizeObserver() {
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect();
+            this.resizeObserver = null;
+        }
+        if (this.resizeRafId !== null) {
+            cancelAnimationFrame(this.resizeRafId);
+            this.resizeRafId = null;
+        }
+        this.lastObservedWidth = null;
+    }
+
+    private setupResizeObserver() {
+        // Only needed for autoWrap, since line wraps depend on container width.
+        if (!this.props.options?.autoWrap) {
+            this.teardownResizeObserver();
+            return;
+        }
+
+        const el = this.editorRef.current;
+        if (!el || typeof ResizeObserver === 'undefined') {
+            return;
+        }
+
+        // Avoid duplicated observers when re-init.
+        this.teardownResizeObserver();
+
+        this.lastObservedWidth = el.getBoundingClientRect().width;
+        this.resizeObserver = new ResizeObserver((entries) => {
+            const entry = entries && entries[0];
+            if (!entry) {
+                return;
+            }
+            const nextWidth = entry.contentRect?.width;
+            if (typeof nextWidth !== 'number') {
+                return;
+            }
+
+            // Only react to width changes, which affect wrapping.
+            if (this.lastObservedWidth !== null && Math.abs(nextWidth - this.lastObservedWidth) < 0.5) {
+                return;
+            }
+            this.lastObservedWidth = nextWidth;
+
+            // Coalesce multiple resize events.
+            if (this.resizeRafId !== null) {
+                cancelAnimationFrame(this.resizeRafId);
+            }
+            this.resizeRafId = requestAnimationFrame(() => {
+                this.resizeRafId = null;
+
+                // Clear measured heights cache when container size changes.
+                // NOTE: _view and _measuredHeights are internal implementation details.
+                const jsonViewer: any = this.foundation.jsonViewer;
+                if (jsonViewer && jsonViewer._view && jsonViewer._view._measuredHeights) {
+                    jsonViewer._view._measuredHeights = {};
+                }
+                this.foundation.jsonViewer?.layout();
+            });
+        });
+        this.resizeObserver.observe(el);
+    }
+
+    componentWillUnmount() {
+        this.teardownResizeObserver();
+        // Release the underlying editor instance to avoid leaking DOM listeners /
+        // language workers across mount cycles. componentDidUpdate's re-init path
+        // already calls dispose(); the unmount path was missing the symmetric call.
+        this.foundation.jsonViewer?.dispose?.();
+        super.componentWillUnmount();
+    }
+
+    componentDidUpdate(prevProps: JsonViewerProps): void {
+        if (!isEqual(prevProps.options, this.props.options) || this.props.value !== prevProps.value) {
+            this.foundation.jsonViewer.dispose();
+            this.foundation.init();
+            this.setupResizeObserver();
+            return;
+        }
+
+        // autoWrap toggle may require attaching/detaching observer.
+        if (prevProps.options?.autoWrap !== this.props.options?.autoWrap) {
+            this.setupResizeObserver();
+        }
+    }
+
+    get adapter(): JsonViewerAdapter<JsonViewerProps, JsonViewerState> {
+        return {
+            ...super.adapter,
+            getEditorRef: () => this.editorRef.current,
+            getSearchRef: () => this.searchInputRef.current,
+            notifyChange: value => {
+                this.props.onChange?.(value);
+            },
+            notifyHover: (value, el) => {
+                const res = this.props.renderTooltip?.(value, el);
+                return res;
+            },
+            notifyCustomRender: (customRenderMap) => {
+                this.setState({ customRenderMap });
+            },
+            setSearchOptions: (key: string) => {
+                this.setState(
+                    {
+                        searchOptions: {
+                            ...this.state.searchOptions,
+                            [key]: !this.state.searchOptions[key],
+                        },
+                    },
+                    () => {
+                        this.searchHandler();
+                    }
+                );
+            },
+            showSearchBar: () => {
+                this.setState({ showSearchBar: !this.state.showSearchBar });
+                this.setState({ searchOptions: {
+                    caseSensitive: false,
+                    wholeWord: false,
+                    regex: false,
+                } });
+            },
+        };
+    }
+
+    getValue() {
+        return this.foundation.jsonViewer.getModel().getValue();
+    }
+
+    format() {
+        this.foundation.jsonViewer.format();
+    }
+
+    search(searchText: string, caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean) {
+        this.foundation.search(searchText, caseSensitive, wholeWord, regex);
+    }
+
+    getSearchResults() {
+        return this.foundation.getSearchResults();
+    }
+
+    prevSearch(step?: number) {
+        this.foundation.prevSearch(step);
+    }
+
+    nextSearch(step?: number) {
+        this.foundation.nextSearch(step);
+    }
+
+    replace(replaceText: string) {
+        this.foundation.replace(replaceText);
+    }
+
+    replaceAll(replaceText: string) {
+        this.foundation.replaceAll(replaceText);
+    }
+
+    getStyle() {
+        const { width, height } = this.props;
+        return {
+            width,
+            height,
+        };
+    }
+
+    searchHandler = () => {
+        const value = this.searchInputRef.current?.value;
+        this.foundation.search(value);
+    };
+
+    changeSearchOptions = (key: string) => {
+        this.foundation.setSearchOptions(key);
+    };
+
+    renderSearchBox() {
+        return (
+            <div className={`${prefixCls}-search-bar-container`} style={{ position: 'absolute', top: 20, right: 20 }}>
+                {this.renderSearchBar()}
+                {this.renderReplaceBar()}
+            </div>
+        );
+    }
+
+    renderSearchOptions() {
+        const searchOptionItems = [
+            {
+                key: 'caseSensitive',
+                icon: IconCaseSensitive,
+            },
+            {
+                key: 'regex',
+                icon: IconRegExp,
+            },
+            {
+                key: 'wholeWord',
+                icon: IconWholeWord,
+            },
+        ];
+
+        return (
+            <ul className={`${prefixCls}-search-options`}>
+                {searchOptionItems.map(({ key, icon: Icon }) => (
+                    <li
+                        key={key}
+                        className={classNames(`${prefixCls}-search-options-item`, {
+                            [`${prefixCls}-search-options-item-active`]: this.state.searchOptions[key],
+                        })}
+                    >
+                        <Icon onClick={() => this.changeSearchOptions(key)} />
+                    </li>
+                ))}
+            </ul>
+        );
+    }
+
+    renderSearchBar() {
+        return (
+            <LocaleConsumer
+                componentName="JsonViewer"
+            >
+                {(locale: Locale['JsonViewer'], localeCode: Locale['code']) => (
+                    <div className={`${prefixCls}-search-bar`}>
+                        <Input
+                            placeholder={locale.search}
+                            className={`${prefixCls}-search-bar-input`}
+                            onChange={(_value, e) => {
+                                e.preventDefault();
+                                if (!this.isComposing) {
+                                    this.searchHandler();
+                                }
+                                this.searchInputRef.current?.focus();
+                            }}
+                            onCompositionStart={() => {
+                                this.isComposing = true;
+                            }}
+                            onCompositionEnd={() => {
+                                this.isComposing = false;
+                                this.searchHandler();
+                                this.searchInputRef.current?.focus();
+                            }}
+                            ref={this.searchInputRef}
+                        />
+                        {this.renderSearchOptions()}
+                        <ButtonGroup>
+                            <Button
+                                icon={<IconChevronLeft />}
+                                onClick={e => {
+                                    e.preventDefault();
+                                    this.foundation.prevSearch();
+                                }}
+                            />
+                            <Button
+                                icon={<IconChevronRight />}
+                                onClick={e => {
+                                    e.preventDefault();
+                                    this.foundation.nextSearch();
+                                }}
+                            />
+                        </ButtonGroup>
+                        <Button
+                            icon={<IconClose />}
+                            size="small"
+                            theme={'borderless'}
+                            type={'tertiary'}
+                            onClick={() => this.foundation.showSearchBar()}
+                        />
+                    </div>
+                )}
+            </LocaleConsumer>
+        );
+    }
+
+    renderReplaceBar() {
+        const { readOnly } = this.props.options;
+        return (
+            <LocaleConsumer
+                componentName="JsonViewer"
+            >
+                {(locale: Locale['JsonViewer'], localeCode: Locale['code']) => (
+                    <div className={`${prefixCls}-replace-bar`}>
+                        <Input
+                            placeholder={locale.replace}
+                            className={`${prefixCls}-replace-bar-input`}
+                            onChange={(value, e) => {
+                                e.preventDefault();
+                            }}
+                            ref={this.replaceInputRef}
+                        />
+                        <Button
+                            style={{ width: 'fit-content' }}
+                            disabled={readOnly}
+                            onClick={() => {
+                                const value = this.replaceInputRef.current?.value;
+                                this.foundation.replace(value);
+                            }}
+                        >
+                            {locale.replace}    
+                        </Button>
+                        <Button
+                            style={{ width: 'fit-content' }}
+                            disabled={readOnly}
+                            onClick={() => {
+                                const value = this.replaceInputRef.current?.value;
+                                this.foundation.replaceAll(value);
+                            }}
+                        >
+                            {locale.replaceAll}
+                        </Button>
+                    </div>
+                )}
+            </LocaleConsumer>
+        );
+    }
+    render() {
+        let isDragging = false;
+        const { width, className, style, showSearch = true, limitSearchButtonBounds, renderSearchButton, ...rest } = this.props;
+        
+        // Default search button
+        const defaultSearchButton = (
+            <DragMove
+                constrainer={limitSearchButtonBounds ? 'parent' as any : undefined}
+                onMouseDown={() => {
+                    isDragging = false;
+                }}
+                onMouseMove={() => {
+                    isDragging = true;
+                }}
+            >
+                <div style={{ position: 'absolute', top: 0, left: width }}>
+                    {!this.state.showSearchBar ? (
+                        <Button
+                            className={`${prefixCls}-search-bar-trigger`}
+                            onClick={e => {
+                                e.preventDefault();
+                                if (isDragging) {
+                                    e.stopPropagation();
+                                    e.preventDefault();
+                                    return;
+                                }
+                                this.foundation.showSearchBar();
+                            }}
+                            icon={<IconSearch />}
+                            style={{ position: 'absolute', top: 20, right: 20 }}
+                        />
+                    ) : (
+                        this.renderSearchBox()
+                    )}
+                </div>
+            </DragMove>
+        );
+
+        // Search controls for custom render
+        const searchControls = {
+            showSearchBar: this.state.showSearchBar,
+            onToggleSearchBar: () => this.foundation.showSearchBar(),
+            onSearch: (text: string, caseSensitive?: boolean, wholeWord?: boolean, regex?: boolean) => {
+                this.foundation.search(text, caseSensitive, wholeWord, regex);
+            },
+            onPrevSearch: () => this.foundation.prevSearch(),
+            onNextSearch: () => this.foundation.nextSearch(),
+            onReplace: (text: string) => this.foundation.replace(text),
+            onReplaceAll: (text: string) => this.foundation.replaceAll(text),
+        };
+
+        return (
+            <>
+                <div style={{ ...this.getStyle(), position: 'relative', ...style }} className={className} {...this.getDataAttr(rest)}>
+                    <div
+                        style={{ ...this.getStyle() }}
+                        ref={this.editorRef}
+                        className={classNames(prefixCls, `${prefixCls}-background`)}
+                    ></div>
+                    {showSearch && (
+                        renderSearchButton 
+                            ? renderSearchButton(defaultSearchButton, searchControls)
+                            : defaultSearchButton
+                    )}
+                </div>
+                {Array.from(this.state.customRenderMap.entries()).map(([key, value]) => {
+                    // key.innerHTML = '';
+                    return createPortal(value, key);
+                })}
+            </>
+        );
+    }
+}
+
+export default JsonViewerCom;

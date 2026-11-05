@@ -1,0 +1,39 @@
+import * as React from 'react';
+import { convertIcon } from '../components/Icon';
+function SvgComponent(props) {
+  return /*#__PURE__*/React.createElement("svg", Object.assign({
+    viewBox: "0 0 20 20",
+    fill: "none",
+    xmlns: "http://www.w3.org/2000/svg",
+    width: "1em",
+    height: "1em",
+    focusable: false,
+    "aria-hidden": true
+  }, props), /*#__PURE__*/React.createElement("rect", {
+    width: 8,
+    height: 8,
+    rx: 4,
+    fill: "#F0B114"
+  }), /*#__PURE__*/React.createElement("rect", {
+    y: 10,
+    width: 8,
+    height: 8,
+    rx: 4,
+    fill: "#E91E63"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: 10,
+    width: 8,
+    height: 8,
+    rx: 4,
+    fill: "#0077FA"
+  }), /*#__PURE__*/React.createElement("rect", {
+    x: 10,
+    y: 10,
+    width: 8,
+    height: 8,
+    rx: 4,
+    fill: "#00B3A1"
+  }));
+}
+const IconComponent = convertIcon(SvgComponent, 'token');
+export default IconComponent;

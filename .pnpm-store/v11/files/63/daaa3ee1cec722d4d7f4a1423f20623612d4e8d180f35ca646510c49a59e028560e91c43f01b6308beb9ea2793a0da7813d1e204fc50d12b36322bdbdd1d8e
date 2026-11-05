@@ -1,0 +1,77 @@
+import React from 'react';
+import { ValidateStatus } from '../_base/baseComponent';
+import '@douyinfe/semi-foundation/lib/cjs/input/textarea.css';
+import type { CSSProperties } from 'react';
+type OmitTextareaAttr = 'onChange' | 'onInput' | 'prefix' | 'size' | 'onFocus' | 'onBlur' | 'onKeyDown' | 'onKeyPress' | 'onKeyUp' | 'onResize';
+export type AutosizeRow = {
+    minRows?: number;
+    maxRows?: number;
+};
+export interface TextAreaProps extends Omit<React.TextareaHTMLAttributes<HTMLTextAreaElement>, OmitTextareaAttr> {
+    autosize?: boolean | AutosizeRow;
+    borderless?: boolean;
+    placeholder?: string;
+    value?: string;
+    rows?: number;
+    cols?: number;
+    maxCount?: number;
+    validateStatus?: ValidateStatus;
+    defaultValue?: string;
+    disabled?: boolean;
+    readonly?: boolean;
+    autoFocus?: boolean;
+    showCounter?: boolean;
+    showClear?: boolean;
+    onClear?: (e: React.MouseEvent<HTMLTextAreaElement>) => void;
+    onChange?: (value: string, e: React.MouseEvent<HTMLTextAreaElement>) => void;
+    onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
+    onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
+    onInput?: (e: React.MouseEvent<HTMLTextAreaElement>) => void;
+    onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+    onKeyUp?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+    onKeyPress?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+    onEnterPress?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+    onPressEnter?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+    /**
+     * Callback invoked when textarea size changes.
+     * - In `autosize` mode: triggered when autosize updates height
+     * - In native `resize` mode: triggered when user drags the resize handle
+     */
+    onResize?: (data: {
+        height: number;
+        width?: number;
+    }) => void;
+    getValueLength?: (value: string) => number;
+    forwardRef?: ((instance: HTMLTextAreaElement) => void) | React.MutableRefObject<HTMLTextAreaElement> | null;
+    disabledEnterStartNewLine?: boolean;
+    /** Whether to show line numbers */
+    showLineNumber?: boolean;
+    /** The starting line number, default is 1 */
+    lineNumberStart?: number;
+    /** Custom className for line number area */
+    lineNumberClassName?: string;
+    /** Custom style for line number area */
+    lineNumberStyle?: CSSProperties;
+    /** The style of textarea element */
+    textareaStyle?: CSSProperties;
+    /** Whether to enable composition mode. When enabled, onChange will not be triggered during IME composition, and will only be triggered once after composition ends */
+    composition?: boolean;
+    /**
+     * Whether the textarea is resizable, and in which direction.
+     * When autosize is enabled, this property will be ignored.
+     * Note: this prop only takes effect when explicitly provided.
+     */
+    resize?: 'none' | 'both' | 'horizontal' | 'vertical' | 'block' | 'inline';
+}
+export interface TextAreaState {
+    value: string;
+    isFocus: boolean;
+    isHover: boolean;
+    height: number;
+    minLength: number;
+    cachedValue?: string;
+    textareaWidth: number;
+    textareaHeight: number;
+}
+declare const ForwardTextarea: React.ForwardRefExoticComponent<Omit<TextAreaProps, "forwardRef"> & React.RefAttributes<HTMLTextAreaElement>>;
+export default ForwardTextarea;

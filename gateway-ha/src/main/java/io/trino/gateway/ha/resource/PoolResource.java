@@ -147,6 +147,19 @@ public class PoolResource
     }
 
     @POST
+    @Path("/{poolId}/members/{instanceId}/reconcile-admissions")
+    @Consumes(APPLICATION_JSON)
+    public PoolStore.ReconciliationResult reconcileAdmissions(
+            @PathParam("poolId") String poolId,
+            @PathParam("instanceId") String instanceId,
+            JsonNode body,
+            @Context HttpServletRequest request)
+    {
+        service.requireAdmin(request);
+        return service.reconcileAbandonedAdmissions(poolId, instanceId, body);
+    }
+
+    @POST
     @Path("/{poolId}/members/{instanceId}/seal")
     @Consumes(APPLICATION_JSON)
     public PoolStore.Member seal(@PathParam("poolId") String poolId, @PathParam("instanceId") String instanceId, JsonNode body, @Context HttpServletRequest request)

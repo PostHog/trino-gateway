@@ -1,0 +1,12 @@
+import React from 'react';
+import { Locale } from '../locale/interface';
+interface FooterProps {
+    prefixCls?: string;
+    locale: Locale['DatePicker'];
+    localeCode: string;
+    disabledConfirm?: boolean;
+    onCancelClick?: React.MouseEventHandler<HTMLButtonElement>;
+    onConfirmClick?: React.MouseEventHandler<HTMLButtonElement>;
+}
+export default function Footer(props?: FooterProps): React.JSX.Element;
+export {};

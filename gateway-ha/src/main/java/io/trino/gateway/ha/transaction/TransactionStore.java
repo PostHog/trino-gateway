@@ -51,6 +51,9 @@ public final class TransactionStore
             """;
 
     static final String SUPERSEDED_OBSERVATION = "SUPERSEDED";
+    // A draining member's admission settled because it can no longer carry work: its coordinator held
+    // none and it outlived any request. It matches no terminal fingerprint, so it never proves a sibling superseded.
+    static final String ABANDONED_OBSERVATION = "ABANDONED";
     // Only COMPLETE admissions require an observation. On an UNCERTAIN one it records whether a response was seen.
     static final String UNRECORDED_RESPONSE_OBSERVATION = "RESPONSE_UNRECORDED";
     static final String NO_RESPONSE_OBSERVATION = "NO_RESPONSE";

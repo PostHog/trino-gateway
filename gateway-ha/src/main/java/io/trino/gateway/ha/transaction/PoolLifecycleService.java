@@ -53,6 +53,7 @@ public class PoolLifecycleService
 
     private final PoolLifecycleConfiguration config;
     private final int terminalRetentionSeconds;
+    private final int abandonedAdmissionAgeMillis;
     private final PoolStore store;
     private final TransactionAwarenessService transactions;
     private final GatewayBackendManager backendManager;
@@ -63,6 +64,7 @@ public class PoolLifecycleService
     {
         this.config = configuration.getTransactionAwareness().getPool();
         this.terminalRetentionSeconds = configuration.getTransactionAwareness().getTerminalRetentionSeconds();
+        this.abandonedAdmissionAgeMillis = configuration.getTransactionAwareness().getAbandonedAdmissionAgeMillis();
         this.store = new PoolStore(requireNonNull(jdbi, "jdbi is null"));
         this.transactions = requireNonNull(transactions, "transactions is null");
         this.backendManager = requireNonNull(backendManager, "backendManager is null");
@@ -258,6 +260,31 @@ public class PoolLifecycleService
             throw poolError(409, "POOL_IDENTITY_CONFLICT", "The absence receipt identifies a different coordinator process");
         }
         return guarded(() -> store.reconcileQueries(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, queries, terminalRetentionSeconds));
+    }
+
+    /**
+     * Settles a draining member's admissions that can no longer carry work. The controller attests
+     * that the coordinator holds no query work; the Gateway verifies the process identity itself, and
+     * the store settles only admissions older than any request's lifetime.
+     */
+    public PoolStore.ReconciliationResult reconcileAbandonedAdmissions(String poolId, String instanceId, JsonNode body)
+    {
+        Guard guard = guard(body);
+        Optional<PoolStore.ReconciliationResult> replay = guarded(() -> store.replayedReconciliation(poolId, guard));
+        if (replay.isPresent()) {
+            return replay.orElseThrow();
+        }
+        if (!body.path("idle").asBoolean(false)) {
+            throw poolError(400, "POOL_VALIDATION", "An idle coordinator receipt is required");
+        }
+        String nodeId = text(body, "nodeId");
+        String coordinatorId = text(body, "coordinatorId");
+        PoolStore.Member member = member(poolId, instanceId);
+        JsonNode identity = probeIdentity(member.url());
+        if (!nodeId.equals(identity.path("nodeId").asText()) || !coordinatorId.equals(identity.path("coordinatorId").asText())) {
+            throw poolError(409, "POOL_IDENTITY_CONFLICT", "The idle receipt identifies a different coordinator process");
+        }
+        return guarded(() -> store.reconcileAbandonedAdmissions(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, abandonedAdmissionAgeMillis));
     }
 
     public PoolStore.Member sealMember(String poolId, String instanceId, JsonNode body)

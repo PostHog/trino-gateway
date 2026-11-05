@@ -297,7 +297,26 @@ marker, written before this rule or by an older replica during a rolling upgrade
 settle automatically; settling one requires an operator decision based on evidence
 outside the ledger. Admissions not bound
 to a query, such as submissions and transaction statements, and continuations
-without that proof keep blocking drain.
+without that proof keep blocking drain, unless a controller settles them as
+abandoned (below).
+
+A request can also leave its admission unsettled without any failure being
+recorded: the Gateway process forwarding it stops, or the database is unavailable
+when the failure is marked. Such an admission stays `PENDING` and, for a submission,
+has no query identity, so neither the superseded proof nor query reconciliation can
+reach it. On a `DRAINING` member, `POST /gateway/v1/pools/{poolId}/members/{instanceId}/reconcile-admissions`
+settles these admissions as `COMPLETE` with observation `ABANDONED`. It needs
+positive evidence on two counts together. The controller attests that the member's
+coordinator holds no query work at all: nothing submitted but not yet dispatched,
+nothing queued, running or finishing, and no results waiting to be fetched (Trino's
+`GET /v1/drain-status`). The Gateway verifies that process identity itself, as for
+query reconciliation, and settles only admissions older than
+`abandonedAdmissionAgeMillis`. That age must be at least twice the request and
+completion timeouts together, so a request still being forwarded or completed is
+never old enough to start work after the observation. Age alone never settles an
+admission. An admission of an open transaction is never settled this way: the open
+transaction is an obligation of its own. `ABANDONED` matches no terminal
+fingerprint, so it never proves a sibling superseded.
 
 An authenticated coordinator query/transaction inventory can support reconciliation,
 but a snapshot alone does not resolve a request still in flight. Reconciliation

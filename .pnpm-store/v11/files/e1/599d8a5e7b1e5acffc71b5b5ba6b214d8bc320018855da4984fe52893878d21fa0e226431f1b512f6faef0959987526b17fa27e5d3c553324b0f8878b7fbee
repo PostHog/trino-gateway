@@ -1,0 +1,26 @@
+import React from 'react';
+import { ColumnProps, GetVirtualizedListRef, RowKey } from './interface';
+import { BaseRowKeyType, BaseHeadWidth } from '@douyinfe/semi-foundation/lib/cjs/table/foundation';
+import type { ContextValue } from '../configProvider/context';
+export interface TableContextProps {
+    children?: React.ReactNode;
+    anyColumnFixed?: boolean;
+    flattenedColumns?: ColumnProps[];
+    tableWidth?: number;
+    headWidths?: BaseHeadWidth[][];
+    setHeadWidths?: (headWidth?: BaseHeadWidth[], index?: number) => void;
+    getHeadWidths?: (index?: number) => number[];
+    getCellWidths?: (flattenColumns: ColumnProps[], flattenedWidths?: number[], ignoreScrollBarKey?: boolean) => number[];
+    handleRowExpanded?: (expanded: boolean, realKey: RowKey<any>, domEvent: React.MouseEvent<HTMLElement>) => void;
+    renderExpandIcon?: (record: Record<string, any>, isNested?: boolean, groupKey?: string | number) => React.ReactNode;
+    renderSelection?: (record?: Record<string, any>, isHeader?: boolean) => React.ReactNode;
+    getVirtualizedListRef?: GetVirtualizedListRef;
+    setBodyHasScrollbar?: (bodyHasScrollbar: boolean) => void;
+    direction?: ContextValue['direction'];
+    handleRowSelection?: (rowKey: BaseRowKeyType, selected: boolean, e: React.MouseEvent) => void;
+    headerStyle?: React.CSSProperties;
+    /** Whether to highlight all related rows when hovering over a rowspan cell */
+    rowSpanHover?: boolean;
+}
+declare const TableContext: React.Context<TableContextProps>;
+export default TableContext;

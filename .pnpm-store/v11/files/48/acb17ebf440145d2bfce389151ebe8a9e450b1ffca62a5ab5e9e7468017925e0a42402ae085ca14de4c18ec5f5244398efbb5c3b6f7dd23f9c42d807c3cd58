@@ -1,0 +1,22 @@
+"use strict";
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.FormUpdaterContext = exports.FormStateContext = exports.FormApiContext = exports.ArrayFieldContext = void 0;
+var _react = _interopRequireDefault(require("react"));
+function _interopRequireDefault(e) { return e && e.__esModule ? e : { default: e }; }
+const FormStateContext = exports.FormStateContext = /*#__PURE__*/_react.default.createContext({});
+FormStateContext.displayName = 'FormState';
+const FormApiContext = exports.FormApiContext = /*#__PURE__*/_react.default.createContext({});
+FormApiContext.displayName = 'FormApi';
+const FormUpdaterContext = exports.FormUpdaterContext = /*#__PURE__*/_react.default.createContext({});
+FormUpdaterContext.displayName = 'FormUpdater';
+const ArrayFieldContext = exports.ArrayFieldContext = /*#__PURE__*/_react.default.createContext({
+  shouldUseInitValue: true,
+  // Whether the current subtree is rendered inside an <ArrayField/>.
+  // Used by withField to disable `keepState` semantics inside an ArrayField,
+  // because positional field paths (e.g. people[0].name) shift on remove,
+  // which conflicts with the "preserve unmounted state by path" model.
+  inArrayField: false
+});

@@ -1,0 +1,38 @@
+import React, { useMemo } from 'react';
+import Avatar from '../../avatar';
+import { cssClasses } from '@douyinfe/semi-foundation/lib/es/chat/constants';
+import cls from 'classnames';
+const {
+  PREFIX_CHAT_BOX
+} = cssClasses;
+const ChatBoxAvatar = /*#__PURE__*/React.memo(props => {
+  const {
+    role,
+    customRenderFunc,
+    continueSend,
+    message
+  } = props;
+  const node = useMemo(() => {
+    const {
+      avatar,
+      color
+    } = role;
+    const isAvatarString = typeof avatar === 'string';
+    return /*#__PURE__*/React.createElement(Avatar, {
+      className: cls(`${PREFIX_CHAT_BOX}-avatar`, {
+        [`${PREFIX_CHAT_BOX}-avatar-hidden`]: continueSend
+      }),
+      src: isAvatarString ? avatar : undefined,
+      size: "extra-small"
+    }, !isAvatarString ? avatar : null);
+  }, [role]);
+  if (customRenderFunc && typeof customRenderFunc === 'function') {
+    return customRenderFunc({
+      role,
+      defaultAvatar: node,
+      message: message
+    });
+  }
+  return node;
+});
+export default ChatBoxAvatar;

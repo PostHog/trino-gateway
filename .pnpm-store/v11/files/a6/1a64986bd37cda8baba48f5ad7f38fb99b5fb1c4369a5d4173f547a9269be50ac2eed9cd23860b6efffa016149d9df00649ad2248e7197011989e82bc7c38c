@@ -1,0 +1,15 @@
+import React, { ReactNode } from 'react';
+import { Message, Metadata, RenderContentProps, MarkdownRenderProps } from '../interface';
+import { MDXProps } from 'mdx/types';
+interface ChatBoxContentProps {
+    mode?: 'bubble' | 'noBubble' | 'userBubble';
+    customMarkDownComponents?: MDXProps['components'];
+    children?: string;
+    escapeHtml?: boolean;
+    role?: Metadata;
+    message?: Message;
+    customRenderFunc?: (props: RenderContentProps) => ReactNode;
+    markdownRenderProps?: MarkdownRenderProps;
+}
+declare const ChatBoxContent: (props: ChatBoxContentProps) => React.JSX.Element;
+export default ChatBoxContent;

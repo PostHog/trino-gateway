@@ -226,6 +226,27 @@ responses and cancellation acknowledgements update counters without success logs
 An executing-result 404 observation does not claim that query recovery occurred.
 This instrumentation does not add a reconciler or change any drain decision.
 
+## Abandoned admissions
+
+An admission can outlive its request without any recorded outcome: the Gateway
+process forwarding it stops, or the database is unavailable when the failure is
+marked. It then blocks its member's drain indefinitely, because no later request and
+no sweep can settle it. A controller settles such admissions on a `DRAINING` member
+with `POST /gateway/v1/pools/{poolId}/members/{instanceId}/reconcile-admissions`:
+
+```json
+{"operationId": "...", "stepId": "...", "controllerEpoch": 1, "expectedGeneration": 3,
+ "nodeId": "...", "coordinatorId": "...", "idle": true}
+```
+
+`idle` must be `true`, attesting that the coordinator reported no query work at all
+(`GET /v1/drain-status`). The Gateway checks `nodeId` and `coordinatorId` against the
+live process itself and settles only admissions older than
+`transactionAwareness.abandonedAdmissionAgeMillis` (default 900000, at least twice
+`requestTimeoutMillis` plus `completionTimeoutMillis`), excluding admissions of an
+open transaction. Settled admissions become `COMPLETE` with observation
+`ABANDONED`. The step replays its recorded result like the other pool steps.
+
 ## Superseded admissions
 
 Clients may poll one query over concurrent requests and drop the others once one

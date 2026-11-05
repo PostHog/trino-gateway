@@ -792,6 +792,57 @@ public final class PoolStore
     }
 
     /**
+     * Settles a draining member's admissions that can no longer carry work, so that a request whose
+     * router process stopped, or whose failure could not be recorded, does not block the drain forever.
+     *
+     * <p>Such an admission has no recorded outcome and may have no query identity: a statement
+     * submission learns one only from its response. The superseded proof and query reconciliation
+     * cannot reach it, so without this it remains an obligation for as long as the member exists.
+     *
+     * <p>Two pieces of evidence are required together. The controller attests that the member's
+     * coordinator process, which the caller verifies independently, holds no query work at all: nothing
+     * submitted, queued, running or finishing, and no results waiting to be fetched. And the admission
+     * is older than {@code minimumAgeMillis}, which must exceed any request's lifetime, so it cannot
+     * still be in flight and cannot start work after that observation. A member that leaves DRAINING
+     * can admit statements again, so only DRAINING qualifies. An admission of an open transaction is
+     * never settled here: the open transaction is itself an obligation, settled by its own path.
+     */
+    public ReconciliationResult reconcileAbandonedAdmissions(
+            String poolId,
+            String instanceId,
+            Guard guard,
+            long expectedGeneration,
+            String nodeId,
+            String coordinatorId,
+            long minimumAgeMillis)
+    {
+        check(minimumAgeMillis > 0, POOL_VALIDATION, "Invalid abandoned admission age");
+        return inPool(poolId, guard, ReconciliationResult.class, (handle, pool) -> {
+            requirePooled(pool);
+            Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
+            requireGeneration(row, expectedGeneration);
+            check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
+            check(Objects.equals(row.nodeId, nodeId) && Objects.equals(row.coordinatorId, coordinatorId),
+                    POOL_IDENTITY_CONFLICT,
+                    "The idle receipt identifies a different coordinator process");
+            int reconciled = handle.createUpdate(
+                            """
+                            UPDATE transaction_admission a SET state = 'COMPLETE', observation = :observation
+                            WHERE a.incarnation = :incarnation AND a.state <> 'COMPLETE'
+                              AND a.created_at < clock_timestamp() - make_interval(secs => :age)
+                              AND (a.transaction_id IS NULL OR NOT EXISTS (
+                                SELECT 1 FROM transaction_binding t WHERE t.transaction_id = a.transaction_id AND t.state = 'OPEN'))
+                            """)
+                    .bind("observation", TransactionStore.ABANDONED_OBSERVATION)
+                    .bind("incarnation", row.incarnation)
+                    .bind("age", minimumAgeMillis / 1000.0)
+                    .execute();
+            return new ReconciliationResult(reconciled);
+        });
+    }
+
+    /**
      * DRAINING to SEALED, only with zero remaining obligations.
      */
     public Member sealMember(String poolId, String instanceId, Guard guard, long expectedGeneration)

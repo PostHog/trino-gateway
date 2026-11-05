@@ -1,0 +1,18 @@
+import BaseFoundation, { DefaultAdapter } from '../base/foundation';
+export interface OverflowListAdapter extends DefaultAdapter {
+    updateStates: (state: any) => void;
+    updateVisibleState: (visible: Map<string, boolean>) => void;
+    notifyIntersect: (res: any) => void;
+    getItemSizeMap: () => Map<string, number>;
+}
+declare class OverflowListFoundation extends BaseFoundation<OverflowListAdapter> {
+    constructor(adapter: OverflowListAdapter);
+    previousY: any;
+    isScrollMode: () => boolean;
+    getOverflowItem(): Array<Array<Record<string, any>>>;
+    private _syncScrollOverflowCache;
+    handleIntersect(entries: Array<IntersectionObserverEntry>): void;
+    getReversedItems: () => any;
+    handleCollapseOverflow(): void;
+}
+export default OverflowListFoundation;
