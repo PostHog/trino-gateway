@@ -791,6 +791,89 @@ public final class PoolStore
         });
     }
 
+    // An unsettled admission of the incarnation that is not part of an open transaction (the open
+    // transaction is an obligation of its own) and is older than :age, measured by the database clock.
+    private static final String ABANDONABLE_ADMISSION =
+            """
+            a.incarnation = :incarnation AND a.state <> 'COMPLETE'
+              AND a.created_at < clock_timestamp() - make_interval(secs => :age)
+              AND (a.transaction_id IS NULL OR NOT EXISTS (
+                SELECT 1 FROM transaction_binding t WHERE t.transaction_id = a.transaction_id AND t.state = 'OPEN'))
+            """;
+
+    /**
+     * Lists a draining member's admissions that are already older than {@code minimumAgeMillis}: the
+     * candidates a following idle observation of its coordinator may settle. Listing comes first so
+     * that eligibility is fixed before the observation (see {@link #reconcileAbandonedAdmissions}).
+     */
+    public List<UUID> abandonedAdmissionCandidates(String poolId, String instanceId, long minimumAgeMillis)
+    {
+        validatePoolId(poolId);
+        check(minimumAgeMillis > 0, POOL_VALIDATION, "Invalid abandoned admission age");
+        return jdbi.inReadCommittedReadTransaction(handle -> {
+            Row pool = poolRow(handle, poolId).orElseThrow(() -> new PoolException(POOL_NOT_FOUND, "Unknown pool"));
+            requirePooled(pool);
+            Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
+            check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
+            return handle.createQuery("SELECT a.admission_id FROM transaction_admission a WHERE " + ABANDONABLE_ADMISSION + " ORDER BY a.created_at, a.admission_id LIMIT 100")
+                    .bind("incarnation", row.incarnation).bind("age", minimumAgeMillis / 1000.0)
+                    .mapTo(UUID.class).list();
+        });
+    }
+
+    /**
+     * Settles a draining member's admissions that can no longer carry work, so that a request whose
+     * router process stopped, or whose failure could not be recorded, does not block the drain forever.
+     *
+     * <p>Such an admission has no recorded outcome and may have no query identity: a statement
+     * submission learns one only from its response. The superseded proof and query reconciliation
+     * cannot reach it, so without this it remains an obligation for as long as the member exists.
+     *
+     * <p>The controller lists candidates with {@link #abandonedAdmissionCandidates}, then observes that
+     * the member's coordinator process, which the caller verifies independently, holds no query work at
+     * all: nothing submitted, queued, running or finishing, and no results waiting to be fetched. Only
+     * listed admissions are settled. Each was already older than {@code minimumAgeMillis}, which must
+     * exceed any request's lifetime, when it was listed and so before the observation: it cannot have
+     * been in flight at the observation, and cannot start work after it. An admission that becomes old
+     * enough only later is not settled by this receipt, however late the receipt is retried. Each is
+     * rechecked here, so one settled or bound to an open transaction meanwhile is left alone. A member
+     * that leaves DRAINING can admit statements again, so only DRAINING qualifies.
+     */
+    public ReconciliationResult reconcileAbandonedAdmissions(
+            String poolId,
+            String instanceId,
+            Guard guard,
+            long expectedGeneration,
+            String nodeId,
+            String coordinatorId,
+            List<UUID> admissions,
+            long minimumAgeMillis)
+    {
+        check(minimumAgeMillis > 0, POOL_VALIDATION, "Invalid abandoned admission age");
+        check(admissions != null && !admissions.isEmpty() && admissions.size() <= 100 && admissions.stream().allMatch(Objects::nonNull),
+                POOL_VALIDATION,
+                "One to 100 admission candidates are required");
+        return inPool(poolId, guard, ReconciliationResult.class, (handle, pool) -> {
+            requirePooled(pool);
+            Row row = lockedMember(handle, poolId, instanceId);
+            TransactionStore.admissionBarrier(handle, row.incarnation, true);
+            requireGeneration(row, expectedGeneration);
+            check(row.state.equals("DRAINING"), POOL_PHASE, "Only a draining member can be reconciled");
+            check(Objects.equals(row.nodeId, nodeId) && Objects.equals(row.coordinatorId, coordinatorId),
+                    POOL_IDENTITY_CONFLICT,
+                    "The idle receipt identifies a different coordinator process");
+            int reconciled = handle.createUpdate("UPDATE transaction_admission a SET state = 'COMPLETE', observation = :observation " +
+                            "WHERE a.admission_id = ANY(:admissions) AND " + ABANDONABLE_ADMISSION)
+                    .bind("observation", TransactionStore.ABANDONED_OBSERVATION)
+                    .bind("admissions", admissions.toArray(UUID[]::new))
+                    .bind("incarnation", row.incarnation)
+                    .bind("age", minimumAgeMillis / 1000.0)
+                    .execute();
+            return new ReconciliationResult(reconciled);
+        });
+    }
+
     /**
      * DRAINING to SEALED, only with zero remaining obligations.
      */

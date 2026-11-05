@@ -31,6 +31,9 @@ public class TransactionAwarenessConfiguration
     private int requestTimeoutMillis = 120000;
     private int processInfoTimeoutMillis = 5000;
     private int completionTimeoutMillis = 10000;
+    // How old an unsettled admission of a draining member must be before an idle receipt may settle it.
+    // It must exceed any request's lifetime, so such an admission cannot still be in flight.
+    private int abandonedAdmissionAgeMillis = 900000;
     private int ledgerRetentionDays = 7;
     private int ledgerRetentionBatchSize = 100;
     private int ledgerRetentionBatchPauseMillis = 500;
@@ -69,6 +72,16 @@ public class TransactionAwarenessConfiguration
     public int getRequestTimeoutMillis()
     {
         return requestTimeoutMillis;
+    }
+
+    public int getAbandonedAdmissionAgeMillis()
+    {
+        return abandonedAdmissionAgeMillis;
+    }
+
+    public void setAbandonedAdmissionAgeMillis(int abandonedAdmissionAgeMillis)
+    {
+        this.abandonedAdmissionAgeMillis = abandonedAdmissionAgeMillis;
     }
 
     public void setRequestTimeoutMillis(int requestTimeoutMillis)
@@ -213,6 +226,11 @@ public class TransactionAwarenessConfiguration
         }
         if (requestTimeoutMillis < 1 || requestTimeoutMillis > 3600000 || processInfoTimeoutMillis < 1 || processInfoTimeoutMillis > requestTimeoutMillis || completionTimeoutMillis < 1 || completionTimeoutMillis > 60000) {
             throw new IllegalArgumentException("Request, process probe, and completion timeouts must have bounded positive values");
+        }
+        // Twice a request's whole lifetime, so a request still being forwarded or completed is never
+        // old enough. An upper bound keeps a misconfiguration from silently disabling the release.
+        if ((long) abandonedAdmissionAgeMillis < 2L * ((long) requestTimeoutMillis + completionTimeoutMillis) || abandonedAdmissionAgeMillis > 86400000) {
+            throw new IllegalArgumentException("abandonedAdmissionAgeMillis must be at least twice the request and completion timeouts together, and at most 86400000");
         }
     }
 }

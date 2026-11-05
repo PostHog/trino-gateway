@@ -111,6 +111,48 @@ class TestPoolLifecycleService
     }
 
     @Test
+    void abandonedAdmissionReconciliationRequiresAnIdleReceiptAndReplaysWithoutAProbe()
+    {
+        try (var construction = mockConstruction(PoolStore.class)) {
+            PoolLifecycleService service = service(true);
+            PoolStore store = construction.constructed().getLast();
+            when(store.replayedReconciliation(anyString(), any())).thenReturn(Optional.empty());
+            // A receipt that does not attest an idle coordinator settles nothing and probes nothing.
+            expect(400, "POOL_VALIDATION", () -> service.reconcileAbandonedAdmissions("pool", "member", body(
+                    """
+                    {"operationId":"reconcile","stepId":"busy","controllerEpoch":1,"expectedGeneration":3,"nodeId":"node","coordinatorId":"abcde","idle":false}
+                    """)));
+            verifyNoInteractions(httpClient);
+            // An idle receipt names the candidates it covers; without them nothing is settled.
+            expect(400, "POOL_VALIDATION", () -> service.reconcileAbandonedAdmissions("pool", "member", body(
+                    """
+                    {"operationId":"reconcile","stepId":"unlisted","controllerEpoch":1,"expectedGeneration":3,"nodeId":"node","coordinatorId":"abcde","idle":true}
+                    """)));
+            verifyNoInteractions(httpClient);
+
+            var result = new PoolStore.ReconciliationResult(2);
+            when(store.replayedReconciliation(anyString(), any())).thenReturn(Optional.of(result));
+            assertThat(service.reconcileAbandonedAdmissions("pool", "member", body(
+                    """
+                    {"operationId":"reconcile","stepId":"idle","controllerEpoch":1}
+                    """))).isEqualTo(result);
+            verifyNoInteractions(httpClient);
+        }
+    }
+
+    @Test
+    void abandonedAdmissionAgeMustOutliveEveryRequest()
+    {
+        var transactions = configuration.getTransactionAwareness();
+        transactions.getPool().setEnabled(true);
+        transactions.setAbandonedAdmissionAgeMillis(2 * (transactions.getRequestTimeoutMillis() + transactions.getCompletionTimeoutMillis()) - 1);
+        assertThatThrownBy(() -> transactions.validate(configuration.getDataStore())).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("abandonedAdmissionAgeMillis");
+        transactions.setAbandonedAdmissionAgeMillis(2 * (transactions.getRequestTimeoutMillis() + transactions.getCompletionTimeoutMillis()));
+        transactions.validate(configuration.getDataStore());
+    }
+
+    @Test
     void disabledPoolIsRefusedAtStartup()
     {
         assertThatThrownBy(() -> service(false)).isInstanceOf(IllegalArgumentException.class)
