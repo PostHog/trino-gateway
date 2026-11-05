@@ -31,6 +31,7 @@ import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
 
 import java.util.List;
+import java.util.UUID;
 
 import static jakarta.ws.rs.core.MediaType.APPLICATION_JSON;
 import static java.util.Objects.requireNonNull;
@@ -144,6 +145,14 @@ public class PoolResource
     {
         service.requireAdmin(request);
         return service.reconcileQueries(poolId, instanceId, body);
+    }
+
+    @GET
+    @Path("/{poolId}/members/{instanceId}/abandoned-admissions")
+    public List<UUID> abandonedAdmissions(@PathParam("poolId") String poolId, @PathParam("instanceId") String instanceId, @Context HttpServletRequest request)
+    {
+        service.requireAdmin(request);
+        return service.abandonedAdmissionCandidates(poolId, instanceId);
     }
 
     @POST

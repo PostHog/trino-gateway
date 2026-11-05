@@ -37,6 +37,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.function.Supplier;
 
 import static java.util.Objects.requireNonNull;
@@ -262,10 +263,16 @@ public class PoolLifecycleService
         return guarded(() -> store.reconcileQueries(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, queries, terminalRetentionSeconds));
     }
 
+    public List<UUID> abandonedAdmissionCandidates(String poolId, String instanceId)
+    {
+        return guarded(() -> store.abandonedAdmissionCandidates(poolId, instanceId, abandonedAdmissionAgeMillis));
+    }
+
     /**
-     * Settles a draining member's admissions that can no longer carry work. The controller attests
-     * that the coordinator holds no query work; the Gateway verifies the process identity itself, and
-     * the store settles only admissions older than any request's lifetime.
+     * Settles a draining member's admissions that can no longer carry work. The controller lists the
+     * candidates, then attests that the coordinator holds no query work; the Gateway verifies the
+     * process identity itself, and the store settles only those candidates, each older than any
+     * request's lifetime.
      */
     public PoolStore.ReconciliationResult reconcileAbandonedAdmissions(String poolId, String instanceId, JsonNode body)
     {
@@ -277,6 +284,19 @@ public class PoolLifecycleService
         if (!body.path("idle").asBoolean(false)) {
             throw poolError(400, "POOL_VALIDATION", "An idle coordinator receipt is required");
         }
+        JsonNode listed = body.path("admissions");
+        if (!listed.isArray() || listed.isEmpty() || listed.size() > 100) {
+            throw poolError(400, "POOL_VALIDATION", "One to 100 admission candidates are required");
+        }
+        List<UUID> admissions = new ArrayList<>();
+        for (JsonNode admission : listed) {
+            try {
+                admissions.add(UUID.fromString(admission.asText()));
+            }
+            catch (IllegalArgumentException e) {
+                throw poolError(400, "POOL_VALIDATION", "Invalid admission candidate");
+            }
+        }
         String nodeId = text(body, "nodeId");
         String coordinatorId = text(body, "coordinatorId");
         PoolStore.Member member = member(poolId, instanceId);
@@ -284,7 +304,7 @@ public class PoolLifecycleService
         if (!nodeId.equals(identity.path("nodeId").asText()) || !coordinatorId.equals(identity.path("coordinatorId").asText())) {
             throw poolError(409, "POOL_IDENTITY_CONFLICT", "The idle receipt identifies a different coordinator process");
         }
-        return guarded(() -> store.reconcileAbandonedAdmissions(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, abandonedAdmissionAgeMillis));
+        return guarded(() -> store.reconcileAbandonedAdmissions(poolId, instanceId, guard, generation(body), nodeId, coordinatorId, admissions, abandonedAdmissionAgeMillis));
     }
 
     public PoolStore.Member sealMember(String poolId, String instanceId, JsonNode body)

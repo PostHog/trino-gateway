@@ -2316,17 +2316,49 @@ class TestPoolStore
         assertThatThrownBy(() -> seal("i-1"))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_NOT_DRAINED));
 
-        // Too young: it may still be in flight, so an idle receipt does not settle it.
-        assertThat(reconcileAbandoned(second, "i-1", "young", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isZero();
+        // Too young: it may still be in flight, so it is not even a candidate.
+        assertThat(candidates("i-1")).isEmpty();
 
         age(orphan.id());
-        assertThat(reconcileAbandoned(second, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        List<UUID> listed = candidates("i-1");
+        assertThat(listed).containsExactly(orphan.id());
+        assertThat(reconcileAbandoned(second, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1", listed).reconciled()).isEqualTo(1);
         String settled = database.withHandle(handle -> handle.createQuery("SELECT state || ':' || observation FROM transaction_admission WHERE admission_id = :id")
                 .bind("id", orphan.id()).mapTo(String.class).one());
         assertThat(settled).isEqualTo("COMPLETE:ABANDONED");
         // The same step replays its recorded result.
-        assertThat(reconcileAbandoned(first, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        assertThat(reconcileAbandoned(first, "i-1", "old", draining.generation(), "node-i-1", "coord-i-1", listed).reconciled()).isEqualTo(1);
+        assertThat(candidates("i-1")).isEmpty();
         assertThat(seal("i-1").phase()).isEqualTo("SEALED");
+    }
+
+    // Eligibility is fixed when candidates are listed, before the idle observation. An admission that
+    // becomes old enough only later may have been in flight at the observation and started work after
+    // it, so a late retry of that receipt must not settle it.
+    @Test
+    void aDelayedRetryDoesNotSettleAnAdmissionThatAgedAfterTheObservation()
+    {
+        configure(1, 3, 1, 1);
+        serving("i-keep");
+        serving("i-1");
+        TransactionStore.Admission orphan = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        TransactionStore.Admission start = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
+        transactions.recordResponse(start.id(), new ResponseObservation("20260918_120000_00021_abcde", null, false, false, 120));
+        Member draining = drain(first, "i-1", "op-drain");
+        age(orphan.id());
+        List<UUID> listed = candidates("i-1");
+        assertThat(listed).containsExactly(orphan.id());
+
+        // Admitted after the listing, then old enough by the time the receipt is retried.
+        TransactionStore.Admission later = transactions.admitQuery("20260918_120000_00021_abcde", Optional.of("owner"), Optional.empty());
+        age(later.id());
+
+        assertThat(reconcileAbandoned(second, "i-1", "late-retry", draining.generation(), "node-i-1", "coord-i-1", listed).reconciled()).isEqualTo(1);
+        String state = database.withHandle(handle -> handle.createQuery("SELECT state FROM transaction_admission WHERE admission_id = :id")
+                .bind("id", later.id()).mapTo(String.class).one());
+        assertThat(state).isEqualTo("PENDING");
+        // It becomes a candidate only through a fresh listing, which a fresh idle observation must follow.
+        assertThat(candidates("i-1")).containsExactly(later.id());
     }
 
     @Test
@@ -2342,7 +2374,7 @@ class TestPoolStore
         Member draining = drain(first, "i-1", "op-drain");
         age(failed.id());
 
-        assertThat(reconcileAbandoned(second, "i-1", "uncertain", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isEqualTo(1);
+        assertThat(reconcileAbandoned(second, "i-1", "uncertain", draining.generation(), "node-i-1", "coord-i-1", candidates("i-1")).reconciled()).isEqualTo(1);
         assertThat(seal("i-1").phase()).isEqualTo("SEALED");
     }
 
@@ -2355,19 +2387,24 @@ class TestPoolStore
         TransactionStore.Admission orphan = transactions.admitPooledMember(POOL, "backend-i-1", "owner");
         age(orphan.id());
 
-        // A serving member still admits statements, so nothing it holds is settled.
-        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "active", active.generation(), "node-i-1", "coord-i-1"))
+        // A serving member still admits statements, so nothing it holds is listed or settled.
+        assertThatThrownBy(() -> candidates("i-1"))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "active", active.generation(), "node-i-1", "coord-i-1", List.of(orphan.id())))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_PHASE));
         Member draining = drain(first, "i-1", "op-drain");
+        List<UUID> listed = candidates("i-1");
         // A receipt from another coordinator process proves nothing about this one.
-        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "other-process", draining.generation(), "node-i-1", "coord-other"))
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "other-process", draining.generation(), "node-i-1", "coord-other", listed))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_IDENTITY_CONFLICT));
-        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "stale", draining.generation() - 1, "node-i-1", "coord-i-1"))
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "stale", draining.generation() - 1, "node-i-1", "coord-i-1", listed))
                 .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_STALE_GENERATION));
+        assertThatThrownBy(() -> reconcileAbandoned(second, "i-1", "none", draining.generation(), "node-i-1", "coord-i-1", List.of()))
+                .isInstanceOfSatisfying(PoolException.class, failure -> assertThat(failure.code()).isEqualTo(POOL_VALIDATION));
         assertThat(first.member(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
     }
 
-    // An admission inside an open transaction is not settled: the open transaction is itself an
+    // An admission inside an open transaction is never a candidate: the open transaction is itself an
     // obligation, released only by its own lifecycle.
     @Test
     void anAdmissionOfAnOpenTransactionIsNeverSettledAsAbandoned()
@@ -2381,7 +2418,8 @@ class TestPoolStore
         TransactionStore.Admission inTransaction = transactions.admitTransaction("00000000-0000-0000-0000-000000000011", "owner");
         age(inTransaction.id());
 
-        assertThat(reconcileAbandoned(second, "i-1", "open-transaction", draining.generation(), "node-i-1", "coord-i-1").reconciled()).isZero();
+        assertThat(candidates("i-1")).isEmpty();
+        assertThat(reconcileAbandoned(second, "i-1", "open-transaction", draining.generation(), "node-i-1", "coord-i-1", List.of(inTransaction.id())).reconciled()).isZero();
         assertThat(first.member(POOL, "i-1").orElseThrow().pendingRequests()).isEqualTo(1);
     }
 
@@ -2693,9 +2731,14 @@ class TestPoolStore
         return store.drainMember(POOL, instanceId, new Guard(operationId, "drain", epoch, PLAN_HASH), member.generation());
     }
 
-    private PoolStore.ReconciliationResult reconcileAbandoned(PoolStore store, String instanceId, String stepId, long generation, String nodeId, String coordinatorId)
+    private PoolStore.ReconciliationResult reconcileAbandoned(PoolStore store, String instanceId, String stepId, long generation, String nodeId, String coordinatorId, List<UUID> admissions)
     {
-        return store.reconcileAbandonedAdmissions(POOL, instanceId, guard("op-abandoned", stepId), generation, nodeId, coordinatorId, 60_000);
+        return store.reconcileAbandonedAdmissions(POOL, instanceId, guard("op-abandoned", stepId), generation, nodeId, coordinatorId, admissions, 60_000);
+    }
+
+    private List<UUID> candidates(String instanceId)
+    {
+        return first.abandonedAdmissionCandidates(POOL, instanceId, 60_000);
     }
 
     // Moves an admission past the abandonment age, as if its request had outlived any lifetime.

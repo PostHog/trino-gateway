@@ -123,6 +123,12 @@ class TestPoolLifecycleService
                     {"operationId":"reconcile","stepId":"busy","controllerEpoch":1,"expectedGeneration":3,"nodeId":"node","coordinatorId":"abcde","idle":false}
                     """)));
             verifyNoInteractions(httpClient);
+            // An idle receipt names the candidates it covers; without them nothing is settled.
+            expect(400, "POOL_VALIDATION", () -> service.reconcileAbandonedAdmissions("pool", "member", body(
+                    """
+                    {"operationId":"reconcile","stepId":"unlisted","controllerEpoch":1,"expectedGeneration":3,"nodeId":"node","coordinatorId":"abcde","idle":true}
+                    """)));
+            verifyNoInteractions(httpClient);
 
             var result = new PoolStore.ReconciliationResult(2);
             when(store.replayedReconciliation(anyString(), any())).thenReturn(Optional.of(result));
